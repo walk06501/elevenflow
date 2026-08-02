@@ -1,0 +1,18 @@
+npm notice
+npm notice New major version of npm available! 10.7.0 -> 11.14.1
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v11.14.1
+npm notice To update run: npm install -g npm@11.14.1
+npm notice
+npm notice
+npm notice New major version of npm available! 10.7.0 -> 11.14.1
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v11.14.1
+npm notice To update run: npm install -g npm@11.14.1
+npm notice
+npm error code ENOSPC
+npm error syscall write
+npm error errno -4055
+npm error nospc ENOSPC: no space left on device, write
+npm error nospc There appears to be insufficient space on your system to finish.
+npm error nospc Clear up some disk space and try again.
+
+npm error A complete log of this run can be found in: C:\Users\ADMIN\AppData\Local\Temp\cursor-sandbox-cache\97fad7715c4d48ea45cfdb51799fb43a\npm\_logs\2026-05-09T06_53_14_185Z-debug-0.log

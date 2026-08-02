@@ -1,0 +1,9 @@
+node_modules/
+.vercel/
+.env
+*.env.local
+commercial.env.local
+dist/
+
+.vercel
+.env*

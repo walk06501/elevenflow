@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ElevenFlow — Quản trị user</title>
+  <style>
+    :root { --bg:#0f1219; --card:#171c28; --bd:#2a3142; --tx:#e8eaf0; --muted:#8b93a8; --err:#f87171; --ok:#4ade80; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0 auto;
+      font-family: system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--tx);
+      padding: 20px 16px 32px;
+      line-height: 1.45;
+      max-width: min(1680px, calc(100vw - 24px));
+      width: 100%;
+    }
+    h1 { font-size: 1.2rem; margin: 0 0 8px; }
+    .warn { color: var(--muted); font-size: 0.85rem; margin-bottom: 16px; max-width: 100%; }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; margin-bottom: 14px; }
+    label { display: flex; flex-direction: column; gap: 4px; font-size: 0.8rem; color: var(--muted); }
+    input { padding: 8px 10px; border-radius: 8px; border: 1px solid var(--bd); background: #12151c; color: var(--tx); min-width: 200px; }
+    button { padding: 8px 14px; border-radius: 8px; border: 1px solid var(--bd); background: #252b3a; color: var(--tx); cursor: pointer; }
+    button.primary { background: linear-gradient(135deg,#3b6ef0,#7c3af7); border: none; }
+    button.danger { border-color: #7f1d1d; color: #fecaca; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--bd);
+      border-radius: 12px;
+      padding: 16px 18px;
+      margin-top: 16px;
+      width: 100%;
+      max-width: none;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; table-layout: auto; }
+    th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--bd); vertical-align: top; }
+    th { color: var(--muted); font-weight: 600; }
+    code { font-size: 0.75rem; word-break: break-all; }
+    #log, #logLogin { white-space: pre-wrap; font-size: 0.78rem; color: var(--muted); margin-top: 10px; }
+    .err { color: var(--err); }
+    .ok { color: var(--ok); }
+    .hidden { display: none !important; }
+    .top-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+    .quota-cell { min-width: 240px; max-width: min(640px, 100%); }
+    .quota-cell .quota-line { color: var(--muted); font-size: 0.8rem; margin-bottom: 6px; }
+    .quota-cell .quota-sub code { color: var(--tx); }
+    .quota-cell input.quota-max-input { min-width: 90px; width: 110px; }
+    .quota-exp-row { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .quota-exp-row input[type="datetime-local"] { min-width: 180px; width: auto; max-width: 100%; }
+    textarea.proxy-bulk {
+      width: 100%;
+      min-height: 140px;
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 0.78rem;
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid var(--bd);
+      background: #12151c;
+      color: var(--tx);
+      resize: vertical;
+    }
+  </style>
+</head>
+<body>
+  <h1>ElevenFlow — Quản trị tài khoản</h1>
+
+  <div id="loginPanel" class="card">
+    <h2 style="margin:0 0 8px;font-size:1rem;">Đăng nhập quản trị</h2>
+    <p class="warn" style="margin-bottom:12px;">
+      Mật khẩu do bạn đặt trên Vercel (<code>ELEVENFLOW_ADMIN_PASSWORD</code>). Phiên JWT 8 giờ, lưu trong sessionStorage.
+      Base URL: cùng site thì để trống = dùng <code>window.location.origin</code>.
+    </p>
+    <div class="row">
+      <label>Base URL (tùy chọn)
+        <input id="base" type="url" placeholder="Để trống nếu mở từ cùng domain Vercel" autocomplete="off" />
+      </label>
+    </div>
+    <div class="row">
+      <label>Tài khoản
+        <input id="admUser" type="text" autocomplete="username" />
+      </label>
+      <label>Mật khẩu
+        <input id="admPass" type="password" autocomplete="current-password" />
+      </label>
+      <button type="button" class="primary" id="btnLogin">Đăng nhập</button>
+    </div>
+    <div id="logLogin"></div>
+  </div>
+
+  <div id="mainPanel" class="hidden">
+    <div class="top-actions">
+      <span class="warn" style="margin:0;">Đã đăng nhập quản trị.</span>
+      <button type="button" id="btnLogout">Đăng xuất</button>
+    </div>
+
+    <div class="card">
+      <h2 style="margin:0 0 12px;font-size:1rem;">Tạo user mới (Supabase Auth)</h2>
+      <div class="row">
+        <label>Email<input id="newEmail" type="email" /></label>
+        <label>Mật khẩu user<input id="newPass" type="text" autocomplete="off" /></label>
+        <button type="button" class="primary" id="btnCreate">Tạo (email đã xác nhận)</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 style="margin:0 0 12px;font-size:1rem;">Danh sách user</h2>
+      <p class="warn" style="margin:0 0 10px;"><strong>Một gói:</strong> mỗi user một hạn ký tự (<code>max_chars</code>). Lần đầu <strong>Lưu hạn</strong> (số &gt; 0) → tự đặt <strong>hết hạn +1 tháng</strong> kể từ lúc đó; sau mốc hết hạn user không đăng nhập / không dùng được. Bấm <strong>Gia hạn +N tháng</strong> để cộng thời gian từ ngày hết hạn hiện tại (hoặc từ hôm nay nếu đã quá hạn) và <strong>reset đếm ký tự về 0</strong>. Để trống ngày + Lưu hết hạn = bỏ khóa theo ngày (chỉ còn logic tháng dương lịch nếu không có ngày hết hạn). Migration <code>007</code> + <code>008</code>.</p>
+      <button type="button" id="btnList">Tải lại danh sách</button>
+      <div id="log"></div>
+      <table id="tbl" style="margin-top:12px;display:none;">
+        <thead><tr><th>Email</th><th>User ID</th><th>Hạn ký tự</th><th>Thiết bị</th><th>Thao tác</th></tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2 style="margin:0 0 12px;font-size:1rem;">Proxy pool (Supabase)</h2>
+      <p class="warn" style="margin:0 0 10px;">
+        <strong>Nguồn chính Webshare:</strong> bấm <strong>Đồng bộ Webshare ngay</strong> để gọi API lấy list proxy mới nhất
+        (link cấu hình ở <code>WEBSHARE_LIST_URLS</code> trên Vercel) và nạp vào pool (<code>source=webshare</code>).
+        Dòng webshare không gọi API đổi IP, không cooldown 60s → lease/xoay IP nhanh nhất, luôn được ưu tiên trước.
+        Có cron tự động 1 lần/ngày (03:00 UTC — gói Hobby Vercel giới hạn tối đa 1 lần/ngày, xem <code>vercel.json</code>).
+        Cần đồng bộ gấp/thường xuyên hơn: bấm nút này bất cứ lúc nào, hoặc trỏ cron ngoài (cron-job.org…) gọi
+        <code>POST /api/cron/sync-proxies</code> với header <code>X-Cron-Secret</code> (nâng cấp Pro để cron nội bộ chạy
+        nhiều lần/ngày). Chạy migration <code>011_webshare_backup_pool.sql</code> trên Supabase trước khi dùng nút này.
+      </p>
+      <p class="warn" style="margin:0 0 10px;">
+        <strong>Nguồn backup proxyxoay.shop:</strong> mỗi dòng dán 1 <strong>key</strong> mua từ proxyxoay.shop
+        (tuỳ chọn thêm <code>|whitelist_ip</code> nếu vendor yêu cầu, mặc định để trống). Bấm <strong>Thêm key proxyxoay</strong>
+        → server gọi thử API xoay ngay để lấy gateway host:port, lưu <code>source=proxyxoay</code>. Nguồn này xoay IP qua API
+        (có cooldown 60s), dùng khi pool Webshare cạn/không đủ. Key hết hạn/không tồn tại (server tự phát hiện lúc lease
+        hoặc bấm <strong>Recheck</strong>) sẽ <strong>tự bị xoá khỏi DB</strong>. Chạy migration <code>013</code> +
+        <code>014</code> + <code>015</code> trên Supabase trước khi dùng (migration <code>015</code> xoá hẳn nguồn 1ip.vn cũ).
+      </p>
+      <textarea id="proxyxoayKeys" class="proxy-bulk" spellcheck="false" style="min-height:60px;" placeholder="key1&#10;key2|1.2.3.4"></textarea>
+      <div class="row" style="margin-top:10px;margin-bottom:16px;">
+        <button type="button" class="primary" id="btnProxyAddXoay">Thêm key proxyxoay</button>
+      </div>
+      <p class="warn" style="margin:0 0 10px;">
+        Dòng trạng thái dưới nút: <strong>tổng số bản ghi</strong> ≠ chỉ proxy đang được app cấp phát.
+        <strong>Recheck</strong> chỉ áp dụng cho nguồn <code>proxyxoay</code> (Webshare không có API kiểm tra riêng).
+        Gia hạn gói <strong>user</strong> và gói <strong>proxy</strong> là hai việc tách nhau.
+      </p>
+      <div class="row" style="margin-top:10px;">
+        <button type="button" class="primary" id="btnProxySyncWebshare">Đồng bộ Webshare ngay</button>
+        <button type="button" id="btnProxyList">Tải danh sách proxy</button>
+        <button type="button" id="btnProxyRecheck">Recheck (proxyxoay API)</button>
+      </div>
+      <div id="proxyLog" style="margin-top:10px;"></div>
+      <table id="tblProxies" style="margin-top:12px;display:none;">
+        <thead>
+          <tr>
+            <th>ID</th><th>Label</th><th>Nguồn</th><th>HTTP</th><th>Ban</th><th>Hết hạn gói</th><th>Active</th><th>Check gần nhất</th><th>Thao tác</th>
+          </tr>
+        </thead>
+        <tbody id="tbodyProxies"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const TOKEN_KEY = "ef_admin_token";
+    const BASE_KEY = "ef_admin_base";
+
+    function log(elId, msg, cls) {
+      const el = $(elId);
+      el.innerHTML = '<span class="' + (cls || "") + '">' + msg + "</span>";
+    }
+
+    function getBase() {
+      const b = (sessionStorage.getItem(BASE_KEY) || "").trim().replace(/\/+$/, "");
+      if (b) return b;
+      if (location.protocol === "https:" || location.protocol === "http:") {
+        return location.origin.replace(/\/+$/, "");
+      }
+      throw new Error("Thiếu Base URL (mở file:// không gọi được API). Deploy lên Vercel rồi mở /admin/index.html");
+    }
+
+    async function apiLogin(username, password) {
+      const base = getBase();
+      const r = await fetch(base + "/api/admin/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.message || j.error || r.statusText || "HTTP " + r.status);
+      if (!j.token) throw new Error("Thiếu token");
+      sessionStorage.setItem(TOKEN_KEY, j.token);
+      return j.token;
+    }
+
+    async function api(path, opts) {
+      const base = getBase();
+      const tok = sessionStorage.getItem(TOKEN_KEY);
+      if (!tok) throw new Error("Hết phiên — đăng nhập lại.");
+      const r = await fetch(base + path, {
+        ...opts,
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer " + tok,
+          ...(opts && opts.headers) || {},
+        },
+      });
+      const j = await r.json().catch(() => ({}));
+      if (r.status === 401) {
+        sessionStorage.removeItem(TOKEN_KEY);
+        throw new Error("Phiên hết hạn hoặc không hợp lệ — đăng nhập lại.");
+      }
+      if (!r.ok) throw new Error(j.message || j.error || j.hint || r.statusText || "HTTP " + r.status);
+      return j;
+    }
+
+    function showLogin() {
+      $("loginPanel").classList.remove("hidden");
+      $("mainPanel").classList.add("hidden");
+    }
+    function showMain() {
+      $("loginPanel").classList.add("hidden");
+      $("mainPanel").classList.remove("hidden");
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
+    function escapeAttr(s) {
+      return String(s).replace(/"/g, "");
+    }
+
+    function isoToDatetimeLocalValue(iso) {
+      if (!iso) return "";
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return "";
+      const p = (n) => String(n).padStart(2, "0");
+      return (
+        d.getFullYear() +
+        "-" +
+        p(d.getMonth() + 1) +
+        "-" +
+        p(d.getDate()) +
+        "T" +
+        p(d.getHours()) +
+        ":" +
+        p(d.getMinutes())
+      );
+    }
+
+    async function loadUsers() {
+      log("log", "Đang tải…");
+      $("tbl").style.display = "none";
+      const { users } = await api("/api/admin/users", { method: "GET" });
+      const tb = $("tbody");
+      tb.innerHTML = "";
+      for (const u of users) {
+        const maxC = Number(u.max_chars ?? 0);
+        const usedC = Number(u.chars_used ?? 0);
+        const maxLbl = maxC === 0 ? "∞" : String(maxC);
+        const expIso = u.subscription_expires_at ? String(u.subscription_expires_at) : "";
+        const expDisp = expIso
+          ? escapeHtml(new Date(expIso).toLocaleString("vi-VN"))
+          : "—";
+        const expVal = isoToDatetimeLocalValue(expIso);
+        const qm = u.quota_month ? escapeHtml(String(u.quota_month)) : "—";
+        const tr = document.createElement("tr");
+        tr.innerHTML =
+          "<td>" + escapeHtml(u.email || "") + "</td>" +
+          "<td><code>" + escapeHtml(u.id) + "</code></td>" +
+          "<td class=\"quota-cell\">" +
+          "<div class=\"quota-line\">Đã dùng: <strong>" + escapeHtml(String(usedC)) + "</strong> / hạn: <strong>" + escapeHtml(maxLbl) + "</strong></div>" +
+          "<div class=\"quota-line quota-sub\">Tháng đếm ký tự: <code>" + qm + "</code></div>" +
+          "<div class=\"quota-line\">Hết hạn gói: <strong>" + expDisp + "</strong></div>" +
+          "<div class=\"quota-exp-row\">" +
+          "<input type=\"datetime-local\" class=\"quota-exp-input\" data-id=\"" + escapeAttr(u.id) + "\" value=\"" + escapeAttr(expVal) + "\" title=\"Để trống + Lưu = bỏ khóa theo ngày\" />" +
+          "<button type=\"button\" data-act=\"quota-save-expiry\" data-id=\"" + escapeAttr(u.id) + "\">Lưu hết hạn</button> " +
+          "<button type=\"button\" class=\"primary\" style=\"padding:6px 10px;font-size:0.75rem;\" data-act=\"quota-extend\" data-months=\"1\" data-id=\"" + escapeAttr(u.id) + "\">Gia hạn +1 tháng</button> " +
+          "<button type=\"button\" class=\"primary\" style=\"padding:6px 10px;font-size:0.75rem;\" data-act=\"quota-extend\" data-months=\"3\" data-id=\"" + escapeAttr(u.id) + "\">+3 tháng</button>" +
+          "</div>" +
+          "<input type=\"number\" min=\"0\" step=\"1\" class=\"quota-max-input\" data-id=\"" + escapeAttr(u.id) + "\" value=\"" + escapeAttr(String(maxC)) + "\" title=\"0 = không giới hạn\" /> " +
+          "<button type=\"button\" data-act=\"quota-save\" data-id=\"" + escapeAttr(u.id) + "\">Lưu hạn</button> " +
+          "<button type=\"button\" data-act=\"quota-reset-usage\" data-id=\"" + escapeAttr(u.id) + "\">Xóa đếm</button>" +
+          "</td>" +
+          "<td data-uid=\"" + escapeAttr(u.id) + "\">…</td>" +
+          "<td>" +
+          "<button type=\"button\" data-act=\"devices\" data-id=\"" + escapeAttr(u.id) + "\">Xem thiết bị</button> " +
+          "<button type=\"button\" data-act=\"reset\" data-id=\"" + escapeAttr(u.id) + "\">Reset thiết bị</button> " +
+          "<button type=\"button\" class=\"danger\" data-act=\"delete\" data-id=\"" + escapeAttr(u.id) + "\">Xóa user</button>" +
+          "</td>";
+        tb.appendChild(tr);
+      }
+      $("tbl").style.display = "table";
+      log("log", "OK — " + users.length + " user.", "ok");
+      tb.querySelectorAll("button[data-act]").forEach((btn) => {
+        btn.addEventListener("click", () =>
+          void onAction(btn.dataset.act, btn.dataset.id, btn.dataset.months)
+        );
+      });
+    }
+
+    async function onAction(act, userId, extraMonths) {
+      try {
+        if (act === "quota-extend") {
+          const months = parseInt(extraMonths || "1", 10) || 1;
+          if (
+            !confirm(
+              "Gia hạn " +
+                months +
+                " tháng: cộng từ ngày hết hạn hiện tại (hoặc từ hôm nay nếu đã quá hạn), reset đếm ký tự về 0?"
+            )
+          ) {
+            return;
+          }
+          await api("/api/admin/user-quota", {
+            method: "POST",
+            body: JSON.stringify({
+              action: "extend_subscription",
+              user_id: userId,
+              months: months,
+            }),
+          });
+          log("log", "Đã gia hạn " + months + " tháng.", "ok");
+          await loadUsers();
+        }
+        if (act === "quota-save-expiry") {
+          const inp = document.querySelector('input.quota-exp-input[data-id="' + userId + '"]');
+          if (!inp) return;
+          const v = inp.value.trim();
+          await api("/api/admin/user-quota", {
+            method: "POST",
+            body: JSON.stringify({
+              action: "set_subscription_expires",
+              user_id: userId,
+              expires_at: v === "" ? "" : new Date(v).toISOString(),
+            }),
+          });
+          log("log", "Đã cập nhật hết hạn gói.", "ok");
+          await loadUsers();
+        }
+        if (act === "quota-save") {
+          const inp = document.querySelector('input.quota-max-input[data-id="' + userId + '"]');
+          if (!inp) return;
+          const max = parseInt(inp.value, 10);
+          if (Number.isNaN(max) || max < 0) {
+            log("log", "Hạn mức phải là số ≥ 0.", "err");
+            return;
+          }
+          await api("/api/admin/user-quota", {
+            method: "POST",
+            body: JSON.stringify({ action: "set_max", user_id: userId, max_chars: max }),
+          });
+          log("log", "Đã lưu hạn ký tự.", "ok");
+          await loadUsers();
+        }
+        if (act === "quota-reset-usage") {
+          if (!confirm("Đưa bộ đếm đã dùng về 0? (Hạn max giữ nguyên.)")) return;
+          await api("/api/admin/user-quota", {
+            method: "POST",
+            body: JSON.stringify({ action: "reset_usage", user_id: userId }),
+          });
+          log("log", "Đã xóa đếm ký tự đã dùng.", "ok");
+          await loadUsers();
+        }
+        if (act === "devices") {
+          const { devices } = await api("/api/admin/devices", {
+            method: "POST",
+            body: JSON.stringify({ action: "list", user_id: userId }),
+          });
+          const cell = document.querySelector('td[data-uid="' + userId + '"]');
+          if (!cell) return;
+          if (!devices || devices.length === 0) {
+            cell.textContent = "(chưa có)";
+          } else {
+            cell.innerHTML = devices.map((d) => "<div><code>" + escapeHtml(String(d.device_fingerprint).slice(0, 24)) + "…</code> <small>" + escapeHtml(d.created_at || "") + "</small></div>").join("");
+          }
+        }
+        if (act === "reset") {
+          if (!confirm("Reset toàn bộ thiết bị của user này?")) return;
+          await api("/api/admin/devices", {
+            method: "POST",
+            body: JSON.stringify({ action: "reset_all", user_id: userId }),
+          });
+          log("log", "Đã reset thiết bị.", "ok");
+          await loadUsers();
+        }
+        if (act === "delete") {
+          if (!confirm("XÓA VĨNH VIỄN user + mọi device bind?")) return;
+          await api("/api/admin/user-delete", {
+            method: "POST",
+            body: JSON.stringify({ user_id: userId }),
+          });
+          log("log", "Đã xóa user.", "ok");
+          await loadUsers();
+        }
+      } catch (e) {
+        log("log", String(e.message || e), "err");
+      }
+    }
+
+    $("btnLogin").addEventListener("click", async () => {
+      log("logLogin", "");
+      const baseIn = $("base").value.trim().replace(/\/+$/, "");
+      sessionStorage.setItem(BASE_KEY, baseIn);
+      const u = $("admUser").value.trim();
+      const p = $("admPass").value;
+      try {
+        await apiLogin(u, p);
+        log("logLogin", "Đăng nhập thành công.", "ok");
+        $("admPass").value = "";
+        showMain();
+        await loadUsers();
+      } catch (e) {
+        log("logLogin", String(e.message || e), "err");
+      }
+    });
+
+    $("btnLogout").addEventListener("click", () => {
+      sessionStorage.removeItem(TOKEN_KEY);
+      showLogin();
+      log("logLogin", "Đã đăng xuất.", "ok");
+    });
+
+    $("btnList").addEventListener("click", () => loadUsers().catch((e) => log("log", String(e.message || e), "err")));
+
+    $("btnCreate").addEventListener("click", async () => {
+      try {
+        const email = $("newEmail").value.trim();
+        const password = $("newPass").value;
+        if (!email || !password) {
+          log("log", "Nhập email + mật khẩu user.", "err");
+          return;
+        }
+        await api("/api/admin/users", {
+          method: "POST",
+          body: JSON.stringify({ email, password, email_confirm: true }),
+        });
+        log("log", "Đã tạo user.", "ok");
+        $("newPass").value = "";
+        await loadUsers();
+      } catch (e) {
+        log("log", String(e.message || e), "err");
+      }
+    });
+
+    function fmtProxyExp(iso) {
+      if (!iso) return "— <small>(không hạn ngày)</small>";
+      return escapeHtml(new Date(iso).toLocaleString("vi-VN"));
+    }
+
+    function fmtProxyBan(p) {
+      const cnt = Number(p.ban_count || 0);
+      if (cnt === 0) return "—";
+      const until = p.banned_until ? new Date(p.banned_until) : null;
+      const cooling = until && until.getTime() > Date.now();
+      const untilTxt = until ? escapeHtml(until.toLocaleString("vi-VN")) : "";
+      return (
+        '<span style="color:' + (cooling ? "var(--err)" : "var(--muted)") + ';">' +
+        cnt + " lần" +
+        (cooling ? " · nghỉ tới " + untilTxt : "") +
+        "</span>"
+      );
+    }
+
+    function fmtProxyCheck(p) {
+      if (p.last_api_check_at == null) return "—";
+      const ok = p.last_api_check_ok ? "ok" : "fail";
+      const msg = String(p.last_api_check_msg || "").slice(0, 72);
+      return (
+        escapeHtml(ok) +
+        " · " +
+        escapeHtml(new Date(p.last_api_check_at).toLocaleString("vi-VN")) +
+        "<br/><small>" +
+        escapeHtml(msg) +
+        "</small>"
+      );
+    }
+
+    /** Giống logic pool trên server: bật + (chưa hết hạn gói hoặc không gán ngày). */
+    function proxyLeaseable(p) {
+      if (!p.is_active) return false;
+      const pkg = p.package_expires_at;
+      if (pkg == null || String(pkg).trim() === "") return true;
+      const t = new Date(String(pkg)).getTime();
+      if (Number.isNaN(t)) return true;
+      return t > Date.now();
+    }
+
+    /** @param {{ silent?: boolean }} [opts] */
+    async function loadProxies(opts) {
+      const silent = opts && opts.silent;
+      if (!silent) log("proxyLog", "Đang tải…", "");
+      $("tblProxies").style.display = "none";
+      const { proxies } = await api("/api/admin/proxies", { method: "GET" });
+      const tb = $("tbodyProxies");
+      tb.innerHTML = "";
+      for (const p of proxies) {
+        const tr = document.createElement("tr");
+        const http = p.http_host + ":" + p.http_port + " (" + (p.username || "") + ")";
+        const expIso = p.package_expires_at || "";
+        const nextActive = p.is_active ? "0" : "1";
+        const src = p.source || "?";
+        const srcBadge =
+          src === "webshare"
+            ? '<span style="color:#7c3af7;">webshare</span>'
+            : src === "proxyxoay"
+            ? '<span style="color:#f59e0b;">proxyxoay</span>'
+            : '<span style="color:var(--err);">' + escapeHtml(src) + " (lỗi thời)</span>";
+        tr.innerHTML =
+          "<td>" +
+          p.id +
+          "</td>" +
+          "<td>" +
+          escapeHtml(p.label || "") +
+          "</td>" +
+          "<td>" +
+          srcBadge +
+          "</td>" +
+          "<td><code>" +
+          escapeHtml(http) +
+          "</code></td>" +
+          "<td>" +
+          fmtProxyBan(p) +
+          "</td>" +
+          "<td>" +
+          fmtProxyExp(expIso) +
+          "</td>" +
+          "<td>" +
+          (p.is_active ? "✓" : "✗") +
+          "</td>" +
+          '<td style="max-width:280px;font-size:0.75rem;">' +
+          fmtProxyCheck(p) +
+          "</td>" +
+          "<td>" +
+          '<button type="button" data-pact="extend" data-pid="' +
+          escapeAttr(String(p.id)) +
+          '">+30 ngày</button> ' +
+          '<button type="button" data-pact="toggle" data-pid="' +
+          escapeAttr(String(p.id)) +
+          '" data-pactive="' +
+          nextActive +
+          '">' +
+          (p.is_active ? "Tắt" : "Bật") +
+          "</button> " +
+          '<button type="button" class="danger" data-pact="delete" data-pid="' +
+          escapeAttr(String(p.id)) +
+          '">Xóa</button>' +
+          "</td>";
+        tb.appendChild(tr);
+      }
+      $("tblProxies").style.display = proxies.length ? "table" : "none";
+      const total = proxies.length;
+      const active = proxies.filter((p) => p.is_active).length;
+      const leaseable = proxies.filter(proxyLeaseable).length;
+      const summary = { total, active, leaseable };
+      if (!silent) {
+        log(
+          "proxyLog",
+          "Tải xong: <strong>" +
+            total +
+            "</strong> dòng trong DB — <strong>" +
+            active +
+            "</strong> <code>is_active=true</code> — <strong>" +
+            leaseable +
+            "</strong> có thể được cấp cho app (bật + chưa quá hạn gói). " +
+            "Số <strong>" +
+            total +
+            "</strong> là <em>tổng bản ghi</em>, không phải «" +
+            total +
+            " proxy đang chạy trong pool».",
+          "ok"
+        );
+      }
+      tb.querySelectorAll("button[data-pact]").forEach((btn) => {
+        btn.addEventListener("click", () =>
+          void onProxyAction(btn.dataset.pact, btn.dataset.pid, btn.dataset.pactive)
+        );
+      });
+      return summary;
+    }
+
+    async function onProxyAction(act, idStr, pactive) {
+      const id = parseInt(idStr, 10);
+      try {
+        if (act === "extend") {
+          await api("/api/admin/proxies", {
+            method: "POST",
+            body: JSON.stringify({ action: "extend_package", proxy_id: id, days: 30 }),
+          });
+          log("proxyLog", "Đã gia hạn proxy #" + id + " +30 ngày.", "ok");
+          await loadProxies();
+        }
+        if (act === "toggle") {
+          const want = pactive === "1";
+          await api("/api/admin/proxies", {
+            method: "POST",
+            body: JSON.stringify({ action: "set_active", proxy_id: id, is_active: want }),
+          });
+          log("proxyLog", "Đã cập nhật active proxy #" + id, "ok");
+          await loadProxies();
+        }
+        if (act === "delete") {
+          if (!confirm("Xóa proxy #" + id + " vĩnh viễn?")) return;
+          await api("/api/admin/proxies", {
+            method: "POST",
+            body: JSON.stringify({ action: "delete", proxy_id: id }),
+          });
+          log("proxyLog", "Đã xóa proxy #" + id, "ok");
+          await loadProxies();
+        }
+      } catch (e) {
+        log("proxyLog", String(e.message || e), "err");
+      }
+    }
+
+    $("btnProxyList").addEventListener("click", () =>
+      loadProxies().catch((e) => log("proxyLog", String(e.message || e), "err"))
+    );
+    $("btnProxySyncWebshare").addEventListener("click", async () => {
+      log("proxyLog", "Đang gọi API Webshare lấy list mới…", "");
+      try {
+        const j = await api("/api/admin/proxies", {
+          method: "POST",
+          body: JSON.stringify({ action: "sync_webshare" }),
+        });
+        const failTxt =
+          j.urls_failed && j.urls_failed.length
+            ? " Lỗi URL: " + j.urls_failed.map((x) => x.url + " (" + x.error + ")").join("; ")
+            : "";
+        log(
+          "proxyLog",
+          "<strong>Đồng bộ Webshare:</strong> " +
+            j.urls_ok + "/" + j.urls_total + " link OK — " +
+            "tải được <strong>" + j.fetched + "</strong> proxy — " +
+            "upsert <strong>" + j.upserted + "</strong> — " +
+            "tắt <strong>" + j.deactivated_stale + "</strong> IP cũ (nhà cung cấp đã đổi)." +
+            failTxt,
+          j.ok ? "ok" : "err"
+        );
+        await loadProxies();
+      } catch (e) {
+        log("proxyLog", String(e.message || e), "err");
+      }
+    });
+    $("btnProxyRecheck").addEventListener("click", async () => {
+      log("proxyLog", "Đang recheck (có thể lâu vài chục giây)…", "");
+      try {
+        const j = await api("/api/admin/proxies", {
+          method: "POST",
+          body: JSON.stringify({ action: "recheck" }),
+        });
+        const results = j.results || [];
+        const n = results.length;
+        const apiDead = results.filter((x) => !x.alive).length;
+        const apiAlive = n - apiDead;
+        const sum = await loadProxies({ silent: true });
+        log(
+          "proxyLog",
+          "<strong>Recheck proxyxoay:</strong> đã gọi API cho <strong>" +
+            n +
+            "</strong> dòng (kể cả <code>is_active=false</code>) — " +
+            "<strong>" +
+            apiAlive +
+            "</strong> key phản hồi sống, <strong>" +
+            apiDead +
+            "</strong> fail. " +
+            "<strong>DB:</strong> " +
+            sum.total +
+            " dòng — " +
+            sum.active +
+            " đang bật — " +
+            sum.leaseable +
+            " vào pool cấp phát. " +
+            "<small>Màu xanh chỉ nghĩa không có lỗi HTTP; không đồng nghĩa cả " +
+            n +
+            " proxy đều đang được app dùng.</small>",
+          apiDead > 0 ? "err" : "ok"
+        );
+      } catch (e) {
+        log("proxyLog", String(e.message || e), "err");
+      }
+    });
+    $("btnProxyAddXoay").addEventListener("click", async () => {
+      const raw = ($("proxyxoayKeys").value || "").trim();
+      if (!raw) {
+        log("proxyLog", "Dán ít nhất 1 key proxyxoay (mỗi dòng 1 key).", "err");
+        return;
+      }
+      const keys = raw.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      log("proxyLog", "Đang thêm " + keys.length + " key proxyxoay (gọi thử API từng key)…", "");
+      try {
+        const j = await api("/api/admin/proxies", {
+          method: "POST",
+          body: JSON.stringify({ action: "add_proxyxoay_keys", keys }),
+        });
+        const errTxt = j.errors && j.errors.length ? " Lỗi: " + j.errors.join("; ") : "";
+        log(
+          "proxyLog",
+          "Đã thêm " + j.inserted_count + "/" + keys.length + " key proxyxoay." + errTxt,
+          j.errors && j.errors.length ? "err" : "ok"
+        );
+        $("proxyxoayKeys").value = "";
+        await loadProxies();
+      } catch (e) {
+        log("proxyLog", String(e.message || e), "err");
+      }
+    });
+    $("base").value = sessionStorage.getItem(BASE_KEY) || "";
+    $("admUser").value = "admin";
+
+    if (sessionStorage.getItem(TOKEN_KEY)) {
+      showMain();
+      loadUsers().catch(() => {
+        sessionStorage.removeItem(TOKEN_KEY);
+        showLogin();
+      });
+    }
+  </script>
+</body>
+</html>

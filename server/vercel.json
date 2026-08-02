@@ -1,0 +1,26 @@
+{
+  "version": 2,
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/dispatch?__segments=$1"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        { "key": "Cache-Control", "value": "no-store" }
+      ]
+    }
+  ],
+  "functions": {
+    "api/dispatch.ts": { "maxDuration": 30 }
+  },
+  "crons": [
+    {
+      "path": "/api/cron/sync-proxies",
+      "schedule": "0 3 * * *"
+    }
+  ]
+}

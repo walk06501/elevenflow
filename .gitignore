@@ -1,0 +1,16 @@
+build/bin
+node_modules
+frontend/dist
+.env
+scripts/captcha-bridge/node_modules
+scripts/captcha-bridge/.playwright-browsers
+dist/
+
+# Large binaries — download/build separately
+webview2-runtime/
+*.exe
+*.mp3
+*.dll
+output/
+logs/
+wails-build.log

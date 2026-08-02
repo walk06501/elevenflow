@@ -1,0 +1,20 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "elevenflow",
+  "outputfilename": "elevenflow",
+  "info": {
+    "companyName": "ElevenFlow",
+    "productName": "ElevenFlow",
+    "productVersion": "1.0.10",
+    "copyright": "Copyright © ElevenFlow",
+    "comments": "Text to Speech Studio (Wails + WebView2)"
+  },
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "Your Name",
+    "email": "your-email@example.com"
+  }
+}

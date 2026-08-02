@@ -1,0 +1,18 @@
+{
+  "name": "elevenflow-server",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod",
+    "check-proxies": "node scripts/check-proxies.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.43.0",
+    "jose": "^5.10.0"
+  },
+  "devDependencies": {
+    "@vercel/node": "^3.0.0",
+    "typescript": "^5.4.0"
+  }
+}
