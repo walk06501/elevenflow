@@ -69,7 +69,12 @@ const (
 	// 1 tài khoản NordVPN. NordVPN giới hạn 10 thiết bị/kết nối đồng thời;
 	// vượt trần thì server lặng lẽ không trả handshake — nhìn từ client
 	// giống hệt "server hỏng", nên retry thêm chỉ tốn thời gian và làm tình
-	// hình tệ hơn. Đặt 8 để chừa chỗ cho kết nối đang đóng dở.
+	// hình tệ hơn.
+	//
+	// Đặt 4 (không phải 8) vì còn phải cộng nordWGProbeFanOut probe đang bay
+	// cùng lúc: 4 sống + 4 đang thử = 8, vẫn dưới 10. Để 8 sống thì riêng
+	// việc thăm dò đã đẩy tài khoản lên 14 kết nối, tự gây lại đúng lỗi mà
+	// trần này sinh ra để chặn.
 	//
 	// Cần trần này vì SessionPool giữ nguyên lease của session đang rảnh
 	// (idle-close chỉ đóng cửa sổ WebView2, không đổi IP — đúng yêu cầu
@@ -78,6 +83,25 @@ const (
 	// chuyển sang nguồn khác (PIA/Surfshark/NordVPN-SOCKS5) thay vì để job
 	// chết — xem MultiVPNProvider.acquireFrom.
 	nordWGMaxLiveTunnels = 8
+
+	// nordWGProbeFanOut: số ứng viên thử CÙNG LÚC mỗi vòng (xem acquireLease).
+	// 6 là điểm cân bằng: đủ để 1 vòng ~2s gần như chắc chắn có người thắng
+	// với tỉ lệ thành công quan sát được, nhưng vẫn thấp hơn trần
+	// nordWGMaxLiveTunnels để các probe đang bay không tự đẩy tài khoản vượt
+	// giới hạn kết nối đồng thời (probe thua bị đóng ngay, nhưng có 1 khoảng
+	// ngắn chúng cùng tồn tại).
+	nordWGProbeFanOut = 4
+
+	// nordWGFailCooldown: sau khi 1 server bắt tay hỏng, bỏ qua nó trong
+	// khoảng này thay vì thử lại. Chỉ nhớ server HỎNG, cố tình KHÔNG nhớ
+	// server tốt: bắt tay được lần này không đảm bảo lần sau (xem doc của
+	// type — phụ thuộc số kết nối đồng thời của tài khoản tại thời điểm đó),
+	// nên "danh sách server tốt" sẽ nhanh chóng sai và tệ hơn round-robin.
+	//
+	// TTL cố ý ngắn (10 phút) vì lỗi bắt tay KHÔNG chắc chắn là do server:
+	// tài khoản chạm trần kết nối cũng làm mọi server im lặng y hệt. TTL dài
+	// sẽ loại oan hàng loạt server tốt chỉ vì 1 sự cố phía mình.
+	nordWGFailCooldown = 10 * time.Minute
 )
 
 // NordVPNWireGuardProvider hands out leases backed by real per-lease
@@ -123,6 +147,9 @@ type NordVPNWireGuardProvider struct {
 	nextIdx int
 	genCtr  int64
 	live    map[int64]*wgTunnel
+	// failedUntil: hostname → thời điểm được phép thử lại (xem
+	// nordWGFailCooldown). Chỉ chứa server vừa hỏng, không phải server tốt.
+	failedUntil map[string]time.Time
 
 	refreshCancel context.CancelFunc
 }
@@ -139,7 +166,11 @@ func NewNordVPNWireGuardProvider(token string) (*NordVPNWireGuardProvider, error
 	if err != nil {
 		return nil, fmt.Errorf("bad private key: %w", err)
 	}
-	p := &NordVPNWireGuardProvider{privHex: privHex, live: map[int64]*wgTunnel{}}
+	p := &NordVPNWireGuardProvider{
+		privHex:     privHex,
+		live:        map[int64]*wgTunnel{},
+		failedUntil: map[string]time.Time{},
+	}
 	if err := p.refreshServers(); err != nil {
 		return nil, fmt.Errorf("nordvpn wireguard server list: %w", err)
 	}
@@ -240,20 +271,56 @@ func (p *NordVPNWireGuardProvider) refreshServers() error {
 
 	p.mu.Lock()
 	p.servers = servers
+	// Dọn các mục phạt đã hết hạn cùng lúc refresh danh sách — nếu không,
+	// map này chỉ có thêm chứ không bao giờ bớt trong suốt đời server
+	// (nextCandidate chỉ xoá mục nó tình cờ gặp lại).
+	now := time.Now()
+	for host, until := range p.failedUntil {
+		if now.After(until) {
+			delete(p.failedUntil, host)
+		}
+	}
+	penalised := len(p.failedUntil)
 	p.mu.Unlock()
-	log.Printf("[NordVPN-WG] Loaded %d online WireGuard servers", len(servers))
+	log.Printf("[NordVPN-WG] Loaded %d online WireGuard servers (%d đang bị tạm bỏ qua do lỗi gần đây)", len(servers), penalised)
 	return nil
 }
 
-// nextCandidate returns the next server in the round-robin. Caller must
-// hold p.mu.
+// nextCandidate returns the next server in the round-robin, bỏ qua những
+// server vừa hỏng còn trong thời gian phạt (xem nordWGFailCooldown).
+// Caller must hold p.mu.
+//
+// Quét tối đa 1 vòng danh sách: nếu MỌI server đều đang bị phạt (dấu hiệu
+// sự cố diện rộng — thường là phía tài khoản mình, không phải server), thì
+// trả về ứng viên kế tiếp như bình thường thay vì báo "hết server". Thà thử
+// 1 server có thể hỏng còn hơn từ chối phục vụ hoàn toàn.
 func (p *NordVPNWireGuardProvider) nextCandidate() (wgServer, error) {
 	if len(p.servers) == 0 {
 		return wgServer{}, fmt.Errorf("no NordVPN WireGuard servers loaded")
 	}
+	now := time.Now()
+	for scanned := 0; scanned < len(p.servers); scanned++ {
+		s := p.servers[p.nextIdx%len(p.servers)]
+		p.nextIdx++
+		until, penalised := p.failedUntil[s.hostname]
+		if !penalised || now.After(until) {
+			if penalised {
+				delete(p.failedUntil, s.hostname)
+			}
+			return s, nil
+		}
+	}
 	s := p.servers[p.nextIdx%len(p.servers)]
 	p.nextIdx++
 	return s, nil
+}
+
+// noteFailure ghi nhận 1 server vừa bắt tay hỏng để bỏ qua trong
+// nordWGFailCooldown tới.
+func (p *NordVPNWireGuardProvider) noteFailure(hostname string) {
+	p.mu.Lock()
+	p.failedUntil[hostname] = time.Now().Add(nordWGFailCooldown)
+	p.mu.Unlock()
 }
 
 // tryOne attempts a full lease against one candidate: build the tunnel,
@@ -317,14 +384,21 @@ func (p *NordVPNWireGuardProvider) tryOne(s wgServer) (*wgTunnel, error) {
 	return &wgTunnel{dev: dev, socks: socksSrv}, nil
 }
 
-// acquireLease tries candidates in round-robin order until one actually
-// works — see the type doc for why this can't be shortcut with a
-// remembered "known good" list. Always tries at least nordWGMaxAcquireAttempts
-// (higher than the other two WireGuard providers — see that constant's doc
-// comment for why); past that, keeps going as long as ctx isn't done and
-// nordWGRetryUntilCtxDone is set, instead of giving up on a fixed count
-// that says nothing about the thousands of untried candidates left in a
-// pool this size (see nordWGRetryUntilCtxDone's doc comment).
+// acquireLease tìm 1 server dùng được, thử SONG SONG nhiều ứng viên mỗi
+// vòng (nordWGProbeFanOut) và lấy cái bắt tay xong TRƯỚC TIÊN, các ứng
+// viên còn lại bị đóng ngay khi xong.
+//
+// Lý do đổi từ tuần tự sang song song (2026-08-04, đo trên VPS thật): tỉ lệ
+// 1 server bất kỳ dùng được khá thấp, nên thử lần lượt mỗi cái chờ tới 2s
+// khiến việc lấy 1 kết nối mất 60-80s (quan sát thật: 30-40 lượt thử liên
+// tiếp). Cùng tỉ lệ thành công đó, thử 6 cái cùng lúc cho kết quả trong
+// ~2-4s, vì thời gian mỗi vòng bị chặn bởi 1 lần timeout chứ không phải
+// cộng dồn. Đây thuần là chuyện chờ mạng (I/O), không phải tính toán, nên
+// chạy song song gần như không tốn thêm CPU — đúng ràng buộc "không được
+// chậm, ít tốn CPU".
+//
+// Vẫn KHÔNG nhớ "server nào tốt" — xem doc của type để biết vì sao điều đó
+// không đáng tin ở NordVPN.
 func (p *NordVPNWireGuardProvider) acquireLease(ctx context.Context, emit func(string)) (Lease, error) {
 	// Chạm trần kết nối đồng thời → trả lỗi ngay, KHÔNG retry: thêm tunnel
 	// nữa chắc chắn hỏng (xem nordWGMaxLiveTunnels), để MultiVPNProvider
@@ -337,7 +411,7 @@ func (p *NordVPNWireGuardProvider) acquireLease(ctx context.Context, emit func(s
 	}
 
 	var lastErr error
-	for attempt := 0; ; attempt++ {
+	for attempt := 0; ; attempt += nordWGProbeFanOut {
 		if attempt >= nordWGMaxAcquireAttempts {
 			if !nordWGRetryUntilCtxDone {
 				break
@@ -348,19 +422,14 @@ func (p *NordVPNWireGuardProvider) acquireLease(ctx context.Context, emit func(s
 			// Past the normal ceiling and still going — let the caller know
 			// this is taking a genuinely unusual number of tries rather than
 			// silently retrying in the background with no visible signal.
-			if attempt%10 == 0 && emit != nil {
+			if attempt%(nordWGProbeFanOut*5) == 0 && emit != nil {
 				emit(fmt.Sprintf("Vẫn đang tìm server NordVPN khả dụng (đã thử %d)…", attempt))
 			}
 		}
-		p.mu.Lock()
-		s, err := p.nextCandidate()
-		p.mu.Unlock()
+
+		t, err := p.probeRound(ctx)
 		if err != nil {
-			return Lease{}, err
-		}
-		t, err := p.tryOne(s)
-		if err != nil {
-			lastErr = fmt.Errorf("%s: %w", s.hostname, err)
+			lastErr = err
 			continue
 		}
 		p.mu.Lock()
@@ -371,6 +440,82 @@ func (p *NordVPNWireGuardProvider) acquireLease(ctx context.Context, emit func(s
 		return Lease{URL: "socks5://" + t.socks.Addr(), AcquiredAt: time.Now(), Generation: gen}, nil
 	}
 	return Lease{}, fmt.Errorf("no working NordVPN WireGuard server after %d attempts (last: %v)", nordWGMaxAcquireAttempts, lastErr)
+}
+
+// probeRound thử nordWGProbeFanOut ứng viên CÙNG LÚC và trả về tunnel đầu
+// tiên dùng được. Mọi tunnel thắng-sau bị đóng ngay lập tức — bỏ sót 1 cái
+// nghĩa là rò rỉ đúng kiểu đã làm hỏng cả nguồn NordVPN hôm nay (xem
+// MultiVPNProvider.Release), nên hàm này luôn dọn hết phần thừa, kể cả khi
+// tunnel về muộn sau khi đã có người thắng.
+func (p *NordVPNWireGuardProvider) probeRound(ctx context.Context) (*wgTunnel, error) {
+	type probeResult struct {
+		tunnel *wgTunnel
+		err    error
+	}
+
+	candidates := make([]wgServer, 0, nordWGProbeFanOut)
+	p.mu.Lock()
+	for i := 0; i < nordWGProbeFanOut; i++ {
+		s, err := p.nextCandidate()
+		if err != nil {
+			p.mu.Unlock()
+			return nil, err
+		}
+		candidates = append(candidates, s)
+	}
+	p.mu.Unlock()
+
+	results := make(chan probeResult, len(candidates))
+	for _, s := range candidates {
+		go func(s wgServer) {
+			t, err := p.tryOne(s)
+			if err != nil {
+				p.noteFailure(s.hostname)
+				results <- probeResult{err: fmt.Errorf("%s: %w", s.hostname, err)}
+				return
+			}
+			results <- probeResult{tunnel: t}
+		}(s)
+	}
+
+	// Nhận kết quả đầu tiên thành công; phần còn lại vẫn phải nhận đủ để
+	// đóng, nên việc dọn dẹp chạy nền chứ không chặn caller (mỗi probe đã tự
+	// giới hạn bởi timeout handshake, không treo vô hạn).
+	var (
+		winner  *wgTunnel
+		lastErr error
+		got     int
+	)
+	for got = 0; got < len(candidates); got++ {
+		r := <-results
+		if r.err != nil {
+			lastErr = r.err
+			continue
+		}
+		winner = r.tunnel
+		got++
+		break
+	}
+
+	if remaining := len(candidates) - got; remaining > 0 {
+		go func(n int) {
+			for i := 0; i < n; i++ {
+				r := <-results
+				if r.tunnel != nil {
+					r.tunnel.socks.Close()
+					r.tunnel.dev.Close()
+				}
+			}
+		}(remaining)
+	}
+
+	if winner == nil {
+		if lastErr == nil {
+			lastErr = fmt.Errorf("không ứng viên nào phản hồi")
+		}
+		return nil, lastErr
+	}
+	return winner, nil
 }
 
 func (p *NordVPNWireGuardProvider) Acquire(ctx context.Context, workerID int, emit func(string)) (Lease, error) {
