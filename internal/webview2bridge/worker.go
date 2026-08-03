@@ -135,8 +135,15 @@ func (w *worker) run(ctx context.Context) {
 		// Giải phóng slot proxy ngay khi worker thoát — nếu không, worker khác
 		// đang MarkUnhealthyAndRotate/LeaseWithWait có thể deadlock vì lease vẫn
 		// giữ trên DB tới tận Shutdown() (wg chỉ về khi mọi worker return).
+		//
+		// Truyền w.currentLease chứ KHÔNG phải Lease{} rỗng: các provider
+		// WireGuard đóng tunnel theo Lease.Generation, nên lease rỗng
+		// (Generation=0) không đóng được gì — tunnel rò rỉ tới khi tài khoản
+		// VPN chạm trần kết nối đồng thời (xem MultiVPNProvider.Release).
+		// Provider cũ dựa trên workerID (PoolProvider) không dùng tới tham số
+		// này nên vẫn hoạt động như trước.
 		if w.pool != nil && w.pool.proxyProvider != nil {
-			w.pool.proxyProvider.Release(w.id, Lease{})
+			w.pool.proxyProvider.Release(w.id, w.currentLease)
 		}
 	}()
 

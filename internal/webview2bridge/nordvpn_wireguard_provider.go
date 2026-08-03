@@ -64,6 +64,20 @@ const (
 	// out upstream) must still stop retrying, or a dead run would spin
 	// forever burning VPS CPU for no one.
 	nordWGRetryUntilCtxDone = true
+
+	// nordWGMaxLiveTunnels: trần CỨNG số tunnel WireGuard mở đồng thời trên
+	// 1 tài khoản NordVPN. NordVPN giới hạn 10 thiết bị/kết nối đồng thời;
+	// vượt trần thì server lặng lẽ không trả handshake — nhìn từ client
+	// giống hệt "server hỏng", nên retry thêm chỉ tốn thời gian và làm tình
+	// hình tệ hơn. Đặt 8 để chừa chỗ cho kết nối đang đóng dở.
+	//
+	// Cần trần này vì SessionPool giữ nguyên lease của session đang rảnh
+	// (idle-close chỉ đóng cửa sổ WebView2, không đổi IP — đúng yêu cầu
+	// "chỉ đổi khi bị ban"), nên với 50 session, về lý thuyết có thể có tới
+	// 50 tunnel mở cùng lúc. Chạm trần thì trả lỗi NGAY để MultiVPNProvider
+	// chuyển sang nguồn khác (PIA/Surfshark/NordVPN-SOCKS5) thay vì để job
+	// chết — xem MultiVPNProvider.acquireFrom.
+	nordWGMaxLiveTunnels = 8
 )
 
 // NordVPNWireGuardProvider hands out leases backed by real per-lease
@@ -312,6 +326,16 @@ func (p *NordVPNWireGuardProvider) tryOne(s wgServer) (*wgTunnel, error) {
 // that says nothing about the thousands of untried candidates left in a
 // pool this size (see nordWGRetryUntilCtxDone's doc comment).
 func (p *NordVPNWireGuardProvider) acquireLease(ctx context.Context, emit func(string)) (Lease, error) {
+	// Chạm trần kết nối đồng thời → trả lỗi ngay, KHÔNG retry: thêm tunnel
+	// nữa chắc chắn hỏng (xem nordWGMaxLiveTunnels), để MultiVPNProvider
+	// đưa job sang nguồn khác thay vì đốt thời gian ở đây.
+	p.mu.Lock()
+	liveN := len(p.live)
+	p.mu.Unlock()
+	if liveN >= nordWGMaxLiveTunnels {
+		return Lease{}, fmt.Errorf("đã đạt trần %d kết nối NordVPN WireGuard đồng thời", nordWGMaxLiveTunnels)
+	}
+
 	var lastErr error
 	for attempt := 0; ; attempt++ {
 		if attempt >= nordWGMaxAcquireAttempts {

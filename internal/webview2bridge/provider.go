@@ -39,6 +39,14 @@ type Lease struct {
 	AcquiredAt time.Time
 	// Generation tăng mỗi lần rotation toàn cục, dùng để detect "lease cũ".
 	Generation int64
+
+	// owner: provider ĐÃ CẤP lease này, do MultiVPNProvider gán khi nó bọc
+	// nhiều nguồn VPN. Bắt buộc phải có vì Generation chỉ duy nhất TRONG
+	// PHẠM VI 1 provider — mỗi provider tự đếm từ 1, nên gen=3 của NordVPN
+	// và gen=3 của PIA là 2 tunnel hoàn toàn khác nhau. Không có trường này
+	// thì Release/MarkUnhealthyAndRotate của MultiVPNProvider không thể biết
+	// phải gọi provider nào để đóng đúng tunnel (xem multi_vpn_provider.go).
+	owner ProxyProvider
 }
 
 // Equal so sánh URL của 2 lease — quyết định rotation đã xảy ra chưa.
