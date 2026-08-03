@@ -81,21 +81,31 @@ func main() {
 	// together are meant to carry most of the system's traffic, with
 	// PIA/Surfshark still in the mix for resilience and IP diversity, not
 	// eliminated.
-	// Trọng số chỉnh lại theo đo thật trên VPS (2026-08-04), thay cho ước
-	// lượng ban đầu "Nord nhiều server nhất nên gánh nhiều nhất":
+	// Trọng số chỉnh theo đo thật trên VPS (2026-08-04). Tiêu chí là tích
+	// của HAI thứ, thiếu một trong hai đều vô dụng: (a) chịu được nhiều kết
+	// nối ĐỒNG THỜI, (b) có nhiều IP KHÁC NHAU — ElevenLabs gắn cờ
+	// detected_unusual_activity khi cùng vài IP gọi liên tục, nên nguồn ít
+	// IP không thể gánh tải chính dù nó ổn định đến đâu.
 	//
-	//   - NordVPN-SOCKS5 là nguồn ĐÁNG TIN NHẤT: chịu được nhiều kết nối
-	//     đồng thời và tải xong trang trong ~2-14s. Nó mới là đường để
-	//     NordVPN gánh phần lớn hệ thống.
-	//   - NordVPN-WireGuard tuy có 8500+ server nhưng chỉ giữ được ĐÚNG 1
+	//   - PIA-WireGuard (4): nguồn DUY NHẤT đạt cả hai. Mỗi lease tự sinh
+	//     cặp khoá X25519 mới rồi đăng ký riêng (xem addKey), nên các kết
+	//     nối độc lập thật sự — không tranh nhau như hai nguồn dùng chung 1
+	//     khoá tĩnh bên dưới — trên 361 server.
+	//   - Surfshark (2): 137 server, nhưng dùng CHUNG 1 khoá tĩnh nên nhiều
+	//     kết nối song song nhiều khả năng cũng tranh đường dữ liệu như
+	//     NordVPN-WG. Giữ mức vừa phải, chưa có số đo riêng để khẳng định.
+	//   - NordVPN-SOCKS5 (1): ổn định và nhanh nhất (~2-14s tải xong trang)
+	//     nhưng chỉ có 12 host cố định. Dồn tải vào đây sẽ tự chuốc lấy
+	//     cờ "hoạt động bất thường" — dùng như đường dự phòng đáng tin, chứ
+	//     KHÔNG phải nguồn gánh chính.
+	//   - NordVPN-WireGuard (1): 8500+ server nhưng chỉ giữ được ĐÚNG 1
 	//     đường dữ liệu trên mỗi khoá tài khoản (xem nordWGMaxConcurrentConns),
-	//     nên số server lớn KHÔNG quy đổi thành sức chứa. Để trọng số cao
-	//     chỉ khiến job liên tục nhận tunnel chết rồi phải đổi lại. Giữ 1
-	//     để vẫn có thêm IP đa dạng, không hơn.
+	//     nên số server lớn KHÔNG quy đổi thành sức chứa. Giữ 1 để vẫn góp
+	//     IP đa dạng khi rảnh.
 	const (
-		nordSOCKS5Weight = 4
+		nordSOCKS5Weight = 1
 		nordWGWeight     = 1
-		piaWGWeight      = 2
+		piaWGWeight      = 4
 		surfsharkWeight  = 2
 	)
 
