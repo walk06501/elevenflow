@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -32,6 +33,11 @@ type wgTunnel struct {
 	dev   *device.Device
 	socks *localSOCKS5Server
 }
+
+// errNordWGNoSlots: tài khoản đã dùng hết số kết nối WireGuard đồng thời
+// cho phép (xem nordWGMaxConcurrentConns). Là lỗi "thử nguồn khác đi", KHÔNG
+// phải "server này hỏng" — nên không được retry trong nội bộ provider.
+var errNordWGNoSlots = errors.New("hết slot kết nối NordVPN WireGuard")
 
 const (
 	wgHandshakeTimeout      = 3 * time.Second
@@ -65,16 +71,17 @@ const (
 	// forever burning VPS CPU for no one.
 	nordWGRetryUntilCtxDone = true
 
-	// nordWGMaxLiveTunnels: trần CỨNG số tunnel WireGuard mở đồng thời trên
-	// 1 tài khoản NordVPN. NordVPN giới hạn 10 thiết bị/kết nối đồng thời;
-	// vượt trần thì server lặng lẽ không trả handshake — nhìn từ client
-	// giống hệt "server hỏng", nên retry thêm chỉ tốn thời gian và làm tình
-	// hình tệ hơn.
+	// nordWGMaxConcurrentConns: trần CỨNG cho TỔNG số kết nối WireGuard tồn
+	// tại cùng lúc trên 1 tài khoản NordVPN — tính CẢ tunnel đang phục vụ
+	// LẪN probe đang dò. NordVPN giới hạn ~10 kết nối đồng thời; vượt trần
+	// thì server lặng lẽ không trả handshake, nhìn từ client giống hệt
+	// "server hỏng", nên càng retry càng tệ.
 	//
-	// Đặt 4 (không phải 8) vì còn phải cộng nordWGProbeFanOut probe đang bay
-	// cùng lúc: 4 sống + 4 đang thử = 8, vẫn dưới 10. Để 8 sống thì riêng
-	// việc thăm dò đã đẩy tài khoản lên 14 kết nối, tự gây lại đúng lỗi mà
-	// trần này sinh ra để chặn.
+	// Cưỡng chế bằng semaphore (trường slots) chứ KHÔNG phải bằng cách đếm
+	// map tunnel đang sống: cách đếm đó bỏ sót probe đang bay, nên nhiều
+	// session cùng dò một lúc vẫn vượt trần dễ dàng — quan sát thật
+	// (2026-08-04): 3 session cùng dò × 4 probe = 12 kết nối, và MỌI
+	// handshake hỏng cho tới khi chúng thôi chồng lấn.
 	//
 	// Cần trần này vì SessionPool giữ nguyên lease của session đang rảnh
 	// (idle-close chỉ đóng cửa sổ WebView2, không đổi IP — đúng yêu cầu
@@ -82,14 +89,11 @@ const (
 	// 50 tunnel mở cùng lúc. Chạm trần thì trả lỗi NGAY để MultiVPNProvider
 	// chuyển sang nguồn khác (PIA/Surfshark/NordVPN-SOCKS5) thay vì để job
 	// chết — xem MultiVPNProvider.acquireFrom.
-	nordWGMaxLiveTunnels = 8
+	nordWGMaxConcurrentConns = 8
 
 	// nordWGProbeFanOut: số ứng viên thử CÙNG LÚC mỗi vòng (xem acquireLease).
-	// 6 là điểm cân bằng: đủ để 1 vòng ~2s gần như chắc chắn có người thắng
-	// với tỉ lệ thành công quan sát được, nhưng vẫn thấp hơn trần
-	// nordWGMaxLiveTunnels để các probe đang bay không tự đẩy tài khoản vượt
-	// giới hạn kết nối đồng thời (probe thua bị đóng ngay, nhưng có 1 khoảng
-	// ngắn chúng cùng tồn tại).
+	// Số probe thực tế còn bị chặn thêm bởi số slot còn trống, nên giá trị
+	// này là mức TRẦN mong muốn cho 1 vòng, không phải cam kết cứng.
 	nordWGProbeFanOut = 4
 
 	// nordWGFailCooldown: sau khi 1 server bắt tay hỏng, bỏ qua nó trong
@@ -151,6 +155,14 @@ type NordVPNWireGuardProvider struct {
 	// nordWGFailCooldown). Chỉ chứa server vừa hỏng, không phải server tốt.
 	failedUntil map[string]time.Time
 
+	// slots giới hạn TỔNG số kết nối WireGuard tồn tại cùng lúc trên tài
+	// khoản — tính CẢ tunnel đang sống LẪN probe đang dò. Đây là điểm mấu
+	// chốt: chỉ đếm tunnel sống là không đủ, vì nhiều session có thể cùng
+	// dò một lúc (mỗi session bắn nordWGProbeFanOut probe), nên 3 session
+	// dò song song đã là 12 kết nối — vượt trần ~10 của NordVPN và làm
+	// TOÀN BỘ handshake im lặng hỏng, đúng triệu chứng quan sát được.
+	slots chan struct{}
+
 	refreshCancel context.CancelFunc
 }
 
@@ -170,6 +182,7 @@ func NewNordVPNWireGuardProvider(token string) (*NordVPNWireGuardProvider, error
 		privHex:     privHex,
 		live:        map[int64]*wgTunnel{},
 		failedUntil: map[string]time.Time{},
+		slots:       make(chan struct{}, nordWGMaxConcurrentConns),
 	}
 	if err := p.refreshServers(); err != nil {
 		return nil, fmt.Errorf("nordvpn wireguard server list: %w", err)
@@ -195,6 +208,7 @@ func (p *NordVPNWireGuardProvider) Close() {
 	for _, t := range live {
 		t.socks.Close()
 		t.dev.Close()
+		<-p.slots
 	}
 }
 
@@ -400,14 +414,12 @@ func (p *NordVPNWireGuardProvider) tryOne(s wgServer) (*wgTunnel, error) {
 // Vẫn KHÔNG nhớ "server nào tốt" — xem doc của type để biết vì sao điều đó
 // không đáng tin ở NordVPN.
 func (p *NordVPNWireGuardProvider) acquireLease(ctx context.Context, emit func(string)) (Lease, error) {
-	// Chạm trần kết nối đồng thời → trả lỗi ngay, KHÔNG retry: thêm tunnel
-	// nữa chắc chắn hỏng (xem nordWGMaxLiveTunnels), để MultiVPNProvider
-	// đưa job sang nguồn khác thay vì đốt thời gian ở đây.
-	p.mu.Lock()
-	liveN := len(p.live)
-	p.mu.Unlock()
-	if liveN >= nordWGMaxLiveTunnels {
-		return Lease{}, fmt.Errorf("đã đạt trần %d kết nối NordVPN WireGuard đồng thời", nordWGMaxLiveTunnels)
+	// Không còn slot nào trống → trả lỗi ngay, KHÔNG chờ và KHÔNG retry:
+	// mở thêm kết nối lúc này chắc chắn hỏng (xem nordWGMaxConcurrentConns),
+	// và chờ ở đây chỉ làm job đứng im trong khi 3 nguồn VPN khác đang rảnh.
+	// Trả lỗi để MultiVPNProvider chuyển nguồn là nhanh nhất cho người dùng.
+	if len(p.slots) >= nordWGMaxConcurrentConns {
+		return Lease{}, fmt.Errorf("đã đạt trần %d kết nối NordVPN WireGuard đồng thời", nordWGMaxConcurrentConns)
 	}
 
 	var lastErr error
@@ -429,6 +441,14 @@ func (p *NordVPNWireGuardProvider) acquireLease(ctx context.Context, emit func(s
 
 		t, err := p.probeRound(ctx)
 		if err != nil {
+			// Hết slot: KHÔNG thử lại ở đây. Vòng lặp này không có độ trễ
+			// giữa các lần (mỗi vòng bình thường tự tốn ~2s vì chờ handshake),
+			// nên quay lại ngay khi không dò được gì sẽ quay tít đốt CPU.
+			// Trả lỗi để MultiVPNProvider chuyển sang nguồn VPN khác — nhanh
+			// hơn cho người dùng và không lãng phí CPU của VPS.
+			if errors.Is(err, errNordWGNoSlots) {
+				return Lease{}, err
+			}
 			lastErr = err
 			continue
 		}
@@ -453,12 +473,33 @@ func (p *NordVPNWireGuardProvider) probeRound(ctx context.Context) (*wgTunnel, e
 		err    error
 	}
 
-	candidates := make([]wgServer, 0, nordWGProbeFanOut)
+	// Chỉ dò được bấy nhiêu ứng viên như số slot giành được — mỗi probe giữ
+	// 1 slot suốt thời gian nó tồn tại (xem nordWGMaxConcurrentConns).
+	// Giành slot không chặn: hết slot thì vòng này dò ít hơn, còn hơn là
+	// đứng chờ trong khi vẫn còn nguồn VPN khác dùng được.
+	acquired := 0
+grab:
+	for acquired < nordWGProbeFanOut {
+		select {
+		case p.slots <- struct{}{}:
+			acquired++
+		default:
+			break grab // hết slot — dò với số ứng viên đang có
+		}
+	}
+	if acquired == 0 {
+		return nil, errNordWGNoSlots
+	}
+
+	candidates := make([]wgServer, 0, acquired)
 	p.mu.Lock()
-	for i := 0; i < nordWGProbeFanOut; i++ {
+	for i := 0; i < acquired; i++ {
 		s, err := p.nextCandidate()
 		if err != nil {
 			p.mu.Unlock()
+			for j := 0; j < acquired; j++ {
+				<-p.slots
+			}
 			return nil, err
 		}
 		candidates = append(candidates, s)
@@ -471,9 +512,12 @@ func (p *NordVPNWireGuardProvider) probeRound(ctx context.Context) (*wgTunnel, e
 			t, err := p.tryOne(s)
 			if err != nil {
 				p.noteFailure(s.hostname)
+				<-p.slots // probe hỏng → trả slot ngay
 				results <- probeResult{err: fmt.Errorf("%s: %w", s.hostname, err)}
 				return
 			}
+			// Probe thắng thì GIỮ nguyên slot (tunnel sống tiếp tục chiếm 1
+			// kết nối); probe thua sẽ trả slot lúc bị đóng ở dưới.
 			results <- probeResult{tunnel: t}
 		}(s)
 	}
@@ -502,8 +546,12 @@ func (p *NordVPNWireGuardProvider) probeRound(ctx context.Context) (*wgTunnel, e
 			for i := 0; i < n; i++ {
 				r := <-results
 				if r.tunnel != nil {
+					// Probe thắng-sau: đóng tunnel VÀ trả slot nó đang giữ.
+					// Bỏ sót bước trả slot ở đây sẽ làm số slot khả dụng rò rỉ
+					// dần về 0 và khoá hẳn nguồn NordVPN-WG.
 					r.tunnel.socks.Close()
 					r.tunnel.dev.Close()
+					<-p.slots
 				}
 			}
 		}(remaining)
@@ -551,6 +599,7 @@ func (p *NordVPNWireGuardProvider) closeLease(gen int64) {
 	if ok {
 		t.socks.Close()
 		t.dev.Close()
+		<-p.slots // trả lại slot kết nối tunnel này đang giữ
 	}
 }
 
