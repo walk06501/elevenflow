@@ -56,7 +56,7 @@ const (
 	// instead of exhausting attempts and forcing the caller to fall back
 	// to a whole different provider (which starts the process over).
 	nordWGHandshakeTimeout   = 2 * time.Second
-	nordWGMaxAcquireAttempts = 10
+	nordWGMaxAcquireAttempts = 5
 
 	// nordWGRetryUntilCtxDone: when true, acquireLease keeps cycling through
 	// candidates past nordWGMaxAcquireAttempts instead of giving up — with
@@ -69,7 +69,13 @@ const (
 	// count — a request that's already been abandoned (ctx cancelled/timed
 	// out upstream) must still stop retrying, or a dead run would spin
 	// forever burning VPS CPU for no one.
-	nordWGRetryUntilCtxDone = true
+	// Tắt (2026-08-04): thử mãi chỉ đúng khi lỗi là "server này xui, cái
+	// khác sẽ được". Đo thật cho thấy KHÔNG phải vậy với NordVPN — trần 1
+	// đường dữ liệu/khoá nghĩa là khi 1 session khác đang giữ tunnel Nord,
+	// MỌI server đều hỏng như nhau, thử 8500 cái cũng vô ích (quan sát:
+	// 60+ lượt liên tiếp). Bỏ cuộc sớm rồi để MultiVPNProvider chuyển sang
+	// PIA/Surfshark/NordVPN-SOCKS5 nhanh hơn hẳn cho người dùng.
+	nordWGRetryUntilCtxDone = false
 
 	// nordWGMaxConcurrentConns: trần CỨNG cho TỔNG số kết nối WireGuard tồn
 	// tại cùng lúc trên 1 tài khoản NordVPN — tính CẢ tunnel đang phục vụ
@@ -89,12 +95,25 @@ const (
 	// 50 tunnel mở cùng lúc. Chạm trần thì trả lỗi NGAY để MultiVPNProvider
 	// chuyển sang nguồn khác (PIA/Surfshark/NordVPN-SOCKS5) thay vì để job
 	// chết — xem MultiVPNProvider.acquireFrom.
-	nordWGMaxConcurrentConns = 8
+	// Đặt 1 sau khi đo trên VPS thật (2026-08-04): NordVPN chỉ giữ được ĐÚNG
+	// MỘT đường dữ liệu WireGuard trên 1 khoá tài khoản. Bằng chứng: tunnel
+	// vượt qua bài tự kiểm tra (handshake + 1 GET thật) nhưng rồi WebView2
+	// KHÔNG tải nổi trang, luôn timeout 30s — vì tới lúc đó 1 tunnel khác
+	// vừa lập xong đã chiếm mất đường dữ liệu; cùng lúc đó NordVPN-SOCKS5
+	// tải trang trong ~2s. Nhiều tunnel Nord song song không chỉ vô ích mà
+	// còn phá lẫn nhau, nên trần ở đây là 1 chứ không phải "10 thiết bị"
+	// như tài liệu NordVPN gợi ý.
+	nordWGMaxConcurrentConns = 1
 
 	// nordWGProbeFanOut: số ứng viên thử CÙNG LÚC mỗi vòng (xem acquireLease).
-	// Số probe thực tế còn bị chặn thêm bởi số slot còn trống, nên giá trị
-	// này là mức TRẦN mong muốn cho 1 vòng, không phải cam kết cứng.
-	nordWGProbeFanOut = 4
+	//
+	// PHẢI là 1 với NordVPN. Dò song song là cách đúng cho PIA/Surfshark
+	// (mỗi kết nối độc lập), nhưng với NordVPN thì các probe TỰ GIẾT NHAU:
+	// mỗi handshake mới đá văng đường dữ liệu của probe trước, nên hầu hết
+	// probe trượt bài kiểm tra và tỉ lệ thành công TỤT khi tăng số probe.
+	// Đây là bài học ngược đời từ đo thật: fan-out 4 làm nguồn này tệ đi,
+	// không phải nhanh lên.
+	nordWGProbeFanOut = 1
 
 	// nordWGFailCooldown: sau khi 1 server bắt tay hỏng, bỏ qua nó trong
 	// khoảng này thay vì thử lại. Chỉ nhớ server HỎNG, cố tình KHÔNG nhớ

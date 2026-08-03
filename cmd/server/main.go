@@ -81,11 +81,22 @@ func main() {
 	// together are meant to carry most of the system's traffic, with
 	// PIA/Surfshark still in the mix for resilience and IP diversity, not
 	// eliminated.
+	// Trọng số chỉnh lại theo đo thật trên VPS (2026-08-04), thay cho ước
+	// lượng ban đầu "Nord nhiều server nhất nên gánh nhiều nhất":
+	//
+	//   - NordVPN-SOCKS5 là nguồn ĐÁNG TIN NHẤT: chịu được nhiều kết nối
+	//     đồng thời và tải xong trang trong ~2-14s. Nó mới là đường để
+	//     NordVPN gánh phần lớn hệ thống.
+	//   - NordVPN-WireGuard tuy có 8500+ server nhưng chỉ giữ được ĐÚNG 1
+	//     đường dữ liệu trên mỗi khoá tài khoản (xem nordWGMaxConcurrentConns),
+	//     nên số server lớn KHÔNG quy đổi thành sức chứa. Để trọng số cao
+	//     chỉ khiến job liên tục nhận tunnel chết rồi phải đổi lại. Giữ 1
+	//     để vẫn có thêm IP đa dạng, không hơn.
 	const (
-		nordSOCKS5Weight = 2
-		nordWGWeight     = 3
-		piaWGWeight      = 1
-		surfsharkWeight  = 1
+		nordSOCKS5Weight = 4
+		nordWGWeight     = 1
+		piaWGWeight      = 2
+		surfsharkWeight  = 2
 	)
 
 	var vpnProviders []webview2bridge.ProxyProvider
