@@ -51,6 +51,19 @@ const (
 	// to a whole different provider (which starts the process over).
 	nordWGHandshakeTimeout   = 2 * time.Second
 	nordWGMaxAcquireAttempts = 10
+
+	// nordWGRetryUntilCtxDone: when true, acquireLease keeps cycling through
+	// candidates past nordWGMaxAcquireAttempts instead of giving up — with
+	// 8500+ servers, a bad run of 10 consecutive misses (observed live,
+	// 2026-08-03: 10/10 failed with "no handshake within 2s" — looked like
+	// either a genuinely bad stretch of the round-robin or the whole source
+	// being unhealthy, e.g. Windows Firewall dropping inbound UDP replies
+	// for a freshly-replaced binary) says nothing about the 8490 servers
+	// never tried. Bounded by the caller's context instead of a fixed
+	// count — a request that's already been abandoned (ctx cancelled/timed
+	// out upstream) must still stop retrying, or a dead run would spin
+	// forever burning VPS CPU for no one.
+	nordWGRetryUntilCtxDone = true
 )
 
 // NordVPNWireGuardProvider hands out leases backed by real per-lease
@@ -291,13 +304,30 @@ func (p *NordVPNWireGuardProvider) tryOne(s wgServer) (*wgTunnel, error) {
 }
 
 // acquireLease tries candidates in round-robin order until one actually
-// works, up to nordWGMaxAcquireAttempts (higher than the other two
-// WireGuard providers — see that constant's doc comment for why) — see
-// the type doc for why this can't be shortcut with a remembered "known
-// good" list.
-func (p *NordVPNWireGuardProvider) acquireLease() (Lease, error) {
+// works — see the type doc for why this can't be shortcut with a
+// remembered "known good" list. Always tries at least nordWGMaxAcquireAttempts
+// (higher than the other two WireGuard providers — see that constant's doc
+// comment for why); past that, keeps going as long as ctx isn't done and
+// nordWGRetryUntilCtxDone is set, instead of giving up on a fixed count
+// that says nothing about the thousands of untried candidates left in a
+// pool this size (see nordWGRetryUntilCtxDone's doc comment).
+func (p *NordVPNWireGuardProvider) acquireLease(ctx context.Context, emit func(string)) (Lease, error) {
 	var lastErr error
-	for attempt := 0; attempt < nordWGMaxAcquireAttempts; attempt++ {
+	for attempt := 0; ; attempt++ {
+		if attempt >= nordWGMaxAcquireAttempts {
+			if !nordWGRetryUntilCtxDone {
+				break
+			}
+			if err := ctx.Err(); err != nil {
+				return Lease{}, fmt.Errorf("acquire cancelled after %d attempts: %w (last: %v)", attempt, err, lastErr)
+			}
+			// Past the normal ceiling and still going — let the caller know
+			// this is taking a genuinely unusual number of tries rather than
+			// silently retrying in the background with no visible signal.
+			if attempt%10 == 0 && emit != nil {
+				emit(fmt.Sprintf("Vẫn đang tìm server NordVPN khả dụng (đã thử %d)…", attempt))
+			}
+		}
 		p.mu.Lock()
 		s, err := p.nextCandidate()
 		p.mu.Unlock()
@@ -323,7 +353,7 @@ func (p *NordVPNWireGuardProvider) Acquire(ctx context.Context, workerID int, em
 	if emit != nil {
 		emit("Đang tìm server NordVPN (WireGuard) khả dụng…")
 	}
-	return p.acquireLease()
+	return p.acquireLease(ctx, emit)
 }
 
 func (p *NordVPNWireGuardProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, emit func(string)) (Lease, error) {
@@ -331,7 +361,7 @@ func (p *NordVPNWireGuardProvider) MarkUnhealthyAndRotate(ctx context.Context, w
 	if emit != nil {
 		emit("Đang đổi sang server NordVPN (WireGuard) khác…")
 	}
-	return p.acquireLease()
+	return p.acquireLease(ctx, emit)
 }
 
 // Release tears down the actual tunnel and local listener this lease

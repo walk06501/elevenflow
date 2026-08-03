@@ -354,8 +354,19 @@ func (w *worker) processChunkOnce(ctx context.Context, chunk Chunk) (subtitles.A
 	w.navDone.Store(false)
 
 	// Navigate fresh mỗi chunk: tránh state hCaptcha cũ + đảm bảo cookies session.
+	//
+	// navTimeout = 30s (đã giảm từ 2 phút, 2026-08-04): dữ liệu thật từ VPS
+	// cho thấy 1 kết nối khoẻ tải xong trang + hCaptcha trong ~10-15s; lease
+	// nào không tải nổi trang thật trong khoảng đó gần như chắc chắn chết —
+	// xác nhận sống nhờ 1 lần GET nhẹ tới api.ipify.org lúc Acquire() không
+	// đủ chứng minh nó chịu nổi tải trang thật (nhiều connection + tải nặng
+	// hơn hẳn 1 GET). Giữ 2 phút khiến 4 job liên tiếp trong 1 lần test thật
+	// treo tròn ~2 phút mỗi job trên đúng lỗi này trước khi mới rotate —
+	// với pool 8500+ server, phát hiện nhanh (30s) rồi thử candidate khác
+	// LUÔN tốt hơn đợi lâu trên 1 candidate gần như chắc chắn hỏng.
+	const navTimeout = 30 * time.Second
 	w.chromium.Navigate("https://elevenlabs.io/")
-	if !w.waitNav(2 * time.Minute) {
+	if !w.waitNav(navTimeout) {
 		// Nav timeout = proxy / TCP / TLS chết → transient, retry path.
 		return subtitles.Alignment{}, fmt.Errorf("%w: navigation timeout", errTransient)
 	}

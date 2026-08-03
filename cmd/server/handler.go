@@ -289,7 +289,11 @@ func (h *Handler) HandleHealth(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	inflight := cap(h.concurrencySem) - len(h.concurrencySem)
+	// Acquire pushes into concurrencySem, Release pops — len() is the count
+	// currently held, i.e. the real inflight number (this was inverted
+	// before: cap-len is the FREE slot count, not inflight, so an idle
+	// server always read "inflight: max_concurrent").
+	inflight := len(h.concurrencySem)
 
 	resp := map[string]any{
 		"status":          "ok",
