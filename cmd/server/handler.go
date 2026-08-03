@@ -25,7 +25,9 @@ import (
 type Handler struct {
 	config         *Config
 	proxyClient    *proxyserver.Client
-	concurrencySem chan struct{} // Limits total inflight synthesis calls
+	vpnProvider    webview2bridge.ProxyProvider // NordVPN today; built once in main.go, nil if no token configured
+	sessionPool    *webview2bridge.SessionPool  // opt-in persistent pool (Config.UsePersistentPool); nil = use webview2bridge.Run per request as before
+	concurrencySem chan struct{}                // Limits total inflight synthesis calls
 }
 
 // SynthesizeRequest is the JSON body for POST /synthesize and /synthesize-srt.
@@ -94,13 +96,10 @@ func (h *Handler) HandleSynthesize(forceSRT bool) http.HandlerFunc {
 			req.ExportSRT = true
 		}
 
-		// Resolve workers: cap to server config
-		workers := req.MaxWorkers
-		if workers <= 0 || workers > h.config.MaxWorkers {
-			workers = h.config.MaxWorkers
-		}
-		if workers < buildinfo.MinTTSWorkers {
-			workers = buildinfo.MinTTSWorkers
+		// Resolve workers: strictly cap to 1 worker per request to keep CPU ultra low
+		workers := h.config.MaxWorkers
+		if req.MaxWorkers > 0 && req.MaxWorkers <= h.config.MaxWorkers {
+			workers = req.MaxWorkers
 		}
 
 		// Create temp directory for this request's output files
@@ -111,46 +110,78 @@ func (h *Handler) HandleSynthesize(forceSRT bool) http.HandlerFunc {
 		}
 		defer os.RemoveAll(tmpDir) // Cleanup after response
 
-		// Create proxy provider (same as app.go newProvider)
-		var provider webview2bridge.ProxyProvider
-		if h.proxyClient != nil {
-			if buildinfo.SharedProxyLease {
-				provider = webview2bridge.NewPoolProviderShared(h.proxyClient)
-			} else {
-				provider = webview2bridge.NewPoolProvider(h.proxyClient)
+		emit := func(workerID int, chunkID int, phase, message string, done, total int) {
+			reqID := r.Header.Get("X-Request-Id")
+			log.Printf("[%s] worker=%d chunk=%d phase=%s msg=%s (%d/%d)",
+				reqID, workerID, chunkID, phase, message, done, total)
+		}
+
+		var chunkResults []webview2bridge.ChunkResult
+		var synthErr error
+
+		if h.sessionPool != nil {
+			// Persistent pool path (Config.UsePersistentPool): reuses a fixed
+			// set of already-open WebView2 sessions shared across every
+			// request — see SessionPool's doc comment. No per-request
+			// Provider/DataRoot here; the pool owns its own proxy provider
+			// and browser-profile root for its whole lifetime.
+			chunkResults, synthErr = h.sessionPool.Synthesize(
+				r.Context(), req.Text, h.config.ChunkMaxChars, tmpDir, "output",
+				webview2bridge.TTSParams{
+					Model:           req.ModelID,
+					LanguageCode:    req.LanguageCode,
+					Speed:           req.Speed,
+					Stability:       req.Stability,
+					SimilarityBoost: req.SimilarityBoost,
+					Style:           req.Style,
+					UseSpeakerBoost: req.UseSpeakerBoost,
+					ExportSRT:       req.ExportSRT,
+				},
+				req.VoiceID, emit,
+			)
+		} else {
+			// Proxy provider: NordVPN (or, later, another VPN provider behind the
+			// same ProxyProvider interface) exclusively when one is configured —
+			// built once at startup, see main.go, never re-fetched or silently
+			// swapped mid-request. The old pool provider is only reached here
+			// when no VPN provider is configured at all (local/dev runs).
+			provider := h.vpnProvider
+			if provider == nil && h.proxyClient != nil {
+				if buildinfo.SharedProxyLease {
+					provider = webview2bridge.NewPoolProviderShared(h.proxyClient)
+				} else {
+					provider = webview2bridge.NewPoolProvider(h.proxyClient)
+				}
 			}
-		}
 
-		// Build WebView2 bridge config — reuses the entire hCaptcha + ElevenLabs
-		// pipeline from the desktop app
-		cfg := webview2bridge.Config{
-			NumWorkers:       workers,
-			SharedProxyLease: buildinfo.SharedProxyLease,
-			MaxChars:         h.config.ChunkMaxChars,
-			OutputDir:        tmpDir,
-			OutputFileStem:   "output",
-			Voice:            req.VoiceID,
-			Model:            req.ModelID,
-			LanguageCode:     req.LanguageCode,
-			Speed:            req.Speed,
-			Stability:        req.Stability,
-			SimilarityBoost:  req.SimilarityBoost,
-			Style:            req.Style,
-			UseSpeakerBoost:  req.UseSpeakerBoost,
-			ExportSRT:        req.ExportSRT,
-			Provider:         provider,
-			Emit: func(workerID int, chunkID int, phase, message string, done, total int) {
-				reqID := r.Header.Get("X-Request-Id")
-				log.Printf("[%s] worker=%d chunk=%d phase=%s msg=%s (%d/%d)",
-					reqID, workerID, chunkID, phase, message, done, total)
-			},
-		}
+			// Build WebView2 bridge config — reuses the entire hCaptcha + ElevenLabs
+			// pipeline from the desktop app
+			cfg := webview2bridge.Config{
+				NumWorkers:       workers,
+				SharedProxyLease: buildinfo.SharedProxyLease,
+				MaxChars:         h.config.ChunkMaxChars,
+				OutputDir:        tmpDir,
+				OutputFileStem:   "output",
+				Voice:            req.VoiceID,
+				Model:            req.ModelID,
+				LanguageCode:     req.LanguageCode,
+				Speed:            req.Speed,
+				Stability:        req.Stability,
+				SimilarityBoost:  req.SimilarityBoost,
+				Style:            req.Style,
+				UseSpeakerBoost:  req.UseSpeakerBoost,
+				DataRoot:         filepath.Join(tmpDir, "wv2profiles"),
+				ExportSRT:        req.ExportSRT,
+				Provider:         provider,
+				Emit:             emit,
+			}
 
-		// Run synthesis — this is the core call that spawns WebView2 instances,
-		// solves hCaptcha, calls ElevenLabs API, and writes audio chunks
-		chunkResults, err := webview2bridge.Run(r.Context(), req.Text, cfg)
-		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"synthesis failed: %v"}`, err), http.StatusInternalServerError)
+			// Run synthesis — this is the core call that spawns WebView2 instances,
+			// solves hCaptcha, calls ElevenLabs API, and writes audio chunks
+			chunkResults, synthErr = webview2bridge.Run(r.Context(), req.Text, cfg)
+		}
+		if synthErr != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"synthesis failed: %v"}`, synthErr), http.StatusInternalServerError)
 			return
 		}
 
@@ -260,14 +291,19 @@ func (h *Handler) HandleHealth(w http.ResponseWriter, r *http.Request) {
 
 	inflight := cap(h.concurrencySem) - len(h.concurrencySem)
 
+	resp := map[string]any{
+		"status":          "ok",
+		"workers_per_req": h.config.MaxWorkers,
+		"max_concurrent":  h.config.MaxConcurrent,
+		"inflight":        inflight,
+		"proxy_pool_size": poolSize,
+	}
+	if h.sessionPool != nil {
+		resp["persistent_pool_active_sessions"] = h.sessionPool.ActiveSessions()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"status":            "ok",
-		"workers_per_req":   h.config.MaxWorkers,
-		"max_concurrent":    h.config.MaxConcurrent,
-		"inflight":          inflight,
-		"proxy_pool_size":   poolSize,
-	})
+	json.NewEncoder(w).Encode(resp)
 }
 
 // HandleModels returns supported ElevenLabs models with their language lists.

@@ -46,6 +46,23 @@ type Config struct {
 	ExportSRT bool
 }
 
+// TTSParams gói toàn bộ tham số TTS trước đây nằm cố định trên Config (mỗi
+// Pool chỉ phục vụ 1 request/batch). Cần tách riêng để SessionPool (xem
+// session_pool.go) — nhiều session sống xuyên suốt, phục vụ NHIỀU request
+// đồng thời, có thể khác model/ngôn ngữ/giọng mỗi request — không thể gửi
+// qua Pool.cfg chung nữa vì đó là state của cả Pool, không phải của 1 chunk.
+type TTSParams struct {
+	Model           string
+	LanguageCode    string
+	Speed           float64
+	Stability       float64
+	SimilarityBoost float64
+	Style           float64
+	UseSpeakerBoost bool
+	Sitekey         string
+	ExportSRT       bool
+}
+
 // Pool điều phối N worker tiêu thụ chunks chia sẻ qua channel.
 type Pool struct {
 	cfg           Config
@@ -307,6 +324,23 @@ func (p *Pool) requestFor(c Chunk) TTSRequest {
 	voice := strings.TrimSpace(c.Voice)
 	if voice == "" {
 		voice = p.cfg.Voice
+	}
+	// c.Params non-nil = SessionPool path (mỗi chunk mang theo config riêng
+	// của request nó thuộc về). nil = Run/RunChunks cũ, dùng chung Pool.cfg.
+	if c.Params != nil {
+		return TTSRequest{
+			VoiceID:         voice,
+			ModelID:         c.Params.Model,
+			LanguageCode:    c.Params.LanguageCode,
+			Text:            c.Text,
+			Speed:           c.Params.Speed,
+			Stability:       c.Params.Stability,
+			SimilarityBoost: c.Params.SimilarityBoost,
+			Style:           c.Params.Style,
+			UseSpeakerBoost: c.Params.UseSpeakerBoost,
+			Sitekey:         c.Params.Sitekey,
+			ExportSRT:       c.Params.ExportSRT,
+		}
 	}
 	return TTSRequest{
 		VoiceID:         voice,

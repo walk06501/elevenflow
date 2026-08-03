@@ -3,6 +3,7 @@ package webview2bridge
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 // LocalProxy là HTTP CONNECT proxy chạy in-process. Hỗ trợ HTTPS (CONNECT)
@@ -55,7 +58,7 @@ func (p *LocalProxy) SetUpstream(rawURL string) error {
 	if err != nil {
 		return fmt.Errorf("parse upstream: %w", err)
 	}
-	if u.Scheme != "http" && u.Scheme != "https" {
+	if u.Scheme != "http" && u.Scheme != "https" && u.Scheme != "socks5" {
 		return fmt.Errorf("unsupported upstream scheme: %s", u.Scheme)
 	}
 	p.mu.Lock()
@@ -105,6 +108,23 @@ func (p *LocalProxy) handle(client net.Conn) {
 }
 
 func (p *LocalProxy) handleConnect(client net.Conn, br *bufio.Reader, req *http.Request, upstream *url.URL) {
+	if upstream.Scheme == "socks5" {
+		// SOCKS5's CONNECT already tunnels straight to the real target — no
+		// separate HTTP CONNECT request to write, unlike the http/https
+		// upstream case below.
+		upConn, err := dialSOCKS5(upstream, req.URL.Host)
+		if err != nil {
+			writeStatus(client, 502, "socks5 dial: "+err.Error())
+			return
+		}
+		defer upConn.Close()
+		if _, err := client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+			return
+		}
+		bidiPipe(client, br, upConn, bufio.NewReader(upConn))
+		return
+	}
+
 	upConn, err := dialUpstream(upstream)
 	if err != nil {
 		writeStatus(client, 502, "upstream dial: "+err.Error())
@@ -146,6 +166,33 @@ func (p *LocalProxy) handleConnect(client net.Conn, br *bufio.Reader, req *http.
 }
 
 func (p *LocalProxy) handlePlain(client net.Conn, req *http.Request, upstream *url.URL) {
+	if upstream.Scheme == "socks5" {
+		// A SOCKS5 dialer connects straight to the origin, so this writes a
+		// direct-to-origin request (Write), not a forward-proxy one
+		// (WriteProxy) — there's no intermediate HTTP proxy to address it to.
+		upConn, err := dialSOCKS5(upstream, req.URL.Host)
+		if err != nil {
+			writeStatus(client, 502, "socks5 dial: "+err.Error())
+			return
+		}
+		defer upConn.Close()
+
+		req.Header.Del("Proxy-Authorization")
+		if err := req.Write(upConn); err != nil {
+			writeStatus(client, 502, "write upstream: "+err.Error())
+			return
+		}
+		upBr := bufio.NewReader(upConn)
+		resp, err := http.ReadResponse(upBr, req)
+		if err != nil {
+			writeStatus(client, 502, "read upstream: "+err.Error())
+			return
+		}
+		defer resp.Body.Close()
+		_ = resp.Write(client)
+		return
+	}
+
 	upConn, err := dialUpstream(upstream)
 	if err != nil {
 		writeStatus(client, 502, "upstream dial: "+err.Error())
@@ -175,6 +222,24 @@ func (p *LocalProxy) handlePlain(client net.Conn, req *http.Request, upstream *u
 	_ = resp.Write(client)
 }
 
+// dialSOCKS5 opens a connection to targetHostPort through the SOCKS5
+// server described by upstream (host + optional embedded user:pass),
+// performing the full SOCKS5 handshake. The returned conn is already a
+// direct tunnel to the target — no further proxy protocol to speak.
+func dialSOCKS5(upstream *url.URL, targetHostPort string) (net.Conn, error) {
+	var auth *proxy.Auth
+	if upstream.User != nil {
+		user := upstream.User.Username()
+		pass, _ := upstream.User.Password()
+		auth = &proxy.Auth{User: user, Password: pass}
+	}
+	dialer, err := proxy.SOCKS5("tcp", upstream.Host, auth, &net.Dialer{Timeout: 30 * time.Second})
+	if err != nil {
+		return nil, err
+	}
+	return dialer.Dial("tcp", targetHostPort)
+}
+
 func dialUpstream(u *url.URL) (net.Conn, error) {
 	host := u.Host
 	if !strings.Contains(host, ":") {
@@ -185,6 +250,18 @@ func dialUpstream(u *url.URL) (net.Conn, error) {
 		}
 	}
 	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	if u.Scheme == "https" {
+		// scheme=https means the proxy *itself* is only reachable over TLS
+		// (e.g. PIA's proxy on :443) — the CONNECT/plain-HTTP request below
+		// then rides inside that TLS session. A plain TCP dial here would
+		// hand the proxy raw HTTP bytes on a TLS-only port and just hang or
+		// get dropped, since there'd be no handshake to unwrap them.
+		hostname := host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			hostname = h
+		}
+		return tls.DialWithDialer(dialer, "tcp", host, &tls.Config{ServerName: hostname})
+	}
 	return dialer.DialContext(context.Background(), "tcp", host)
 }
 

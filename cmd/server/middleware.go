@@ -33,6 +33,12 @@ func AuthMiddleware(secret string, next http.Handler) http.Handler {
 		}
 		if secret != "" {
 			reqSecret := r.Header.Get("X-Api-Secret")
+			if reqSecret == "" {
+				auth := r.Header.Get("Authorization")
+				if len(auth) > 7 && (auth[:7] == "Bearer " || auth[:7] == "bearer ") {
+					reqSecret = auth[7:]
+				}
+			}
 			if reqSecret != secret {
 				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 				return

@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/wailsapp/go-webview2/pkg/edge"
@@ -25,6 +27,14 @@ type Chunk struct {
 	Voice      string // voice ID riêng cho chunk (mode hội thoại); rỗng → dùng Config.Voice
 	Text       string // ≤ MaxChars characters
 	OutputPath string // đường dẫn .mp3 sẽ ghi
+
+	// Params mang toàn bộ tham số TTS (model/language/speed/...) riêng cho
+	// chunk này. nil = lấy từ Pool.cfg (đường Run/RunChunks hiện có — cả batch
+	// dùng chung 1 config). Non-nil bắt buộc trong SessionPool (persistent
+	// pool dùng chung nhiều session cho NHIỀU request khác nhau đồng thời,
+	// có thể khác model/ngôn ngữ/giọng — không thể gửi qua Pool.cfg chung
+	// được nữa vì đó là state per-Pool, không phải per-chunk).
+	Params *TTSParams
 }
 
 // ChunkResult tổng kết 1 chunk sau khi worker xử lý xong (hoặc bỏ).
@@ -67,6 +77,35 @@ type worker struct {
 	pendingInfo atomic.Pointer[string]
 	navDone     atomic.Bool
 	processFail atomic.Bool
+
+	// overrideEmit/overrideTotal: chỉ set bởi SessionPool (session.go) — 1
+	// session goroutine sống xuyên suốt nhiều request, nên progress callback
+	// (gắn với X-Request-Id của HTTP request đang xử lý) phải đổi theo TỪNG
+	// job chứ không cố định như Pool.emitFn (per-batch, immutable). Chỉ
+	// goroutine sở hữu worker này ghi/đọc 2 field này (không share giữa
+	// goroutine) nên không cần mutex. nil = dùng w.pool.emit/w.pool.totalChunks
+	// như cũ (đường Run/RunChunks hiện có).
+	overrideEmit  EmitFn
+	overrideTotal int
+}
+
+// emit định tuyến progress event: ưu tiên overrideEmit (SessionPool, xem
+// session.go) nếu có, ngược lại dùng w.pool.emit như đường Run/RunChunks cũ.
+func (w *worker) emit(workerID, chunkID int, phase, message string, done, total int) {
+	if w.overrideEmit != nil {
+		w.overrideEmit(workerID, chunkID, phase, message, done, w.overrideTotal)
+		return
+	}
+	w.pool.emit(workerID, chunkID, phase, message, done, total)
+}
+
+// total trả tổng số chunk để hiển thị progress — theo request đang xử lý
+// (overrideTotal, SessionPool) nếu có, ngược lại theo cả batch (Pool.totalChunks).
+func (w *worker) total() int {
+	if w.overrideEmit != nil {
+		return w.overrideTotal
+	}
+	return w.pool.totalChunks
 }
 
 func newWorker(id int, pool *Pool, chunks <-chan Chunk, results chan<- ChunkResult, dataDir string, visible bool) *worker {
@@ -104,14 +143,14 @@ func (w *worker) run(ctx context.Context) {
 	if err := w.acquireProxyAndSpawn(ctx); err != nil {
 		// Chỉ 1 slot proxy: worker phụ hết thời gian chờ lease — bình thường, không báo lỗi đỏ.
 		if w.id >= 1 && errors.Is(err, context.DeadlineExceeded) {
-			w.pool.emit(w.id, -1, "rotate",
+			w.emit(w.id, -1, "rotate",
 				"Chỉ đủ một kết nối đồng thời — luồng phụ dừng, batch chạy một luồng.",
-				-1, w.pool.totalChunks)
+				-1, w.total())
 			return
 		}
-		w.pool.emit(w.id, -1, "error",
+		w.emit(w.id, -1, "error",
 			"Không khởi động được — các dòng còn lại vẫn được xử lý.",
-			-1, w.pool.totalChunks)
+			-1, w.total())
 		return
 	}
 
@@ -134,9 +173,9 @@ func (w *worker) run(ctx context.Context) {
 			// Worker chết (spawn fail không retry được) → exit, để chunks còn
 			// lại trong chan cho worker khác. KHÔNG ngấu nghiến rồi fail tất.
 			if w.chromium == nil {
-				w.pool.emit(w.id, -1, "error",
+				w.emit(w.id, -1, "error",
 					"Dừng do không mở lại được cửa sổ — các dòng còn lại vẫn được xử lý.",
-					-1, w.pool.totalChunks)
+					-1, w.total())
 				return
 			}
 		}
@@ -173,9 +212,9 @@ func (w *worker) processChunkWithRetry(ctx context.Context, chunk Chunk) ChunkRe
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		res.Attempts = attempt
-		w.pool.emit(w.id, chunk.ID, "tts",
+		w.emit(w.id, chunk.ID, "tts",
 			fmt.Sprintf("Đang xử lý dòng %d (thử %d/%d)…", chunk.ID+1, attempt, maxAttempts),
-			-1, w.pool.totalChunks)
+			-1, w.total())
 
 		align, err := w.processChunkOnce(ctx, chunk)
 		if err == nil {
@@ -220,14 +259,14 @@ func (w *worker) processChunkWithRetry(ctx context.Context, chunk Chunk) ChunkRe
 // respawn. Trả error khi rotate fail hoặc spawn fail (lúc đó worker.chromium
 // = nil, run() loop sẽ exit để worker khác xử lý chunks còn lại).
 func (w *worker) rotateAndRespawn(ctx context.Context, chunkID int, reason string) error {
-	w.pool.emit(w.id, chunkID, "rotate",
+	w.emit(w.id, chunkID, "rotate",
 		fmt.Sprintf("Đang đổi kết nối (%s)…", reason),
-		-1, w.pool.totalChunks)
+		-1, w.total())
 	w.teardownWebView2()
 	oldLease := w.currentLease
 	newLease, rotErr := w.pool.proxyProvider.MarkUnhealthyAndRotate(ctx, w.id, oldLease, func(msg string) {
-		w.pool.emit(w.id, chunkID, "rotate",
-			msg, -1, w.pool.totalChunks)
+		w.emit(w.id, chunkID, "rotate",
+			msg, -1, w.total())
 	})
 	if rotErr != nil {
 		return fmt.Errorf("rotate lỗi: %w", rotErr)
@@ -343,8 +382,8 @@ func (w *worker) processChunkOnce(ctx context.Context, chunk Chunk) (subtitles.A
 		if info := w.pendingInfo.Swap(nil); info != nil {
 			text, skip := FriendlyBridgeInfo(*info)
 			if !skip {
-				w.pool.emit(w.id, chunk.ID, "tts",
-					text, -1, w.pool.totalChunks)
+				w.emit(w.id, chunk.ID, "tts",
+					text, -1, w.total())
 			}
 		}
 		if respPtr := w.pendingResp.Swap(nil); respPtr != nil {
@@ -406,7 +445,7 @@ func (w *worker) waitNav(timeout time.Duration) bool {
 // acquireProxyAndSpawn: lần đầu lấy proxy + tạo WV2 instance + LocalProxy.
 func (w *worker) acquireProxyAndSpawn(ctx context.Context) error {
 	lease, err := w.pool.proxyProvider.Acquire(ctx, w.id, func(msg string) {
-		w.pool.emit(w.id, -1, "rotate", msg, -1, w.pool.totalChunks)
+		w.emit(w.id, -1, "rotate", msg, -1, w.total())
 	})
 	if err != nil {
 		return fmt.Errorf("acquire proxy: %w", err)
@@ -429,9 +468,9 @@ func (w *worker) spawnWebView2WithRetry(ctx context.Context, attempts int) error
 			return nil
 		} else {
 			lastErr = err
-			w.pool.emit(w.id, -1, "rotate",
+			w.emit(w.id, -1, "rotate",
 				fmt.Sprintf("Đang thử mở lại cửa sổ (%d/%d)…", i, attempts),
-				-1, w.pool.totalChunks)
+				-1, w.total())
 			if i < attempts {
 				time.Sleep(time.Duration(2*i) * time.Second) // 2s, 4s
 			}
@@ -527,9 +566,9 @@ func (w *worker) spawnWebView2() error {
 	}
 	chromium.SetErrorCallback(func(e error) {
 		_ = e
-		w.pool.emit(w.id, -1, "error",
+		w.emit(w.id, -1, "error",
 			"Trình duyệt báo lỗi (sẽ thử lại nếu cần)",
-			-1, w.pool.totalChunks)
+			-1, w.total())
 	})
 
 	chromium.MessageCallback = w.onMessage
@@ -598,27 +637,71 @@ func (w *worker) teardownWebView2() {
 
 	// Async cleanup dataDir cũ: msedgewebview2.exe có thể còn handle vài giây.
 	// Goroutine retry RemoveAll → giải phóng disk SỚM thay vì đợi cuối batch.
+	// Nếu sau 30s vẫn chưa tự thoát (đúng hạn chế đã ghi ở trên — ShuttingDown()
+	// chỉ set flag, không đảm bảo child process thực sự exit), ép thoát bằng
+	// tay thay vì bỏ cuộc: bỏ cuộc để lại process treo vĩnh viễn, đây chính là
+	// nguyên nhân msedgewebview2.exe tích lũy hàng chục cái theo thời gian.
 	if w.activeDataDir != "" {
 		old := w.activeDataDir
 		w.activeDataDir = ""
-		go cleanupDataDirAsync(old)
+		go func() {
+			if cleanupDataDirAsync(old) {
+				return
+			}
+			killOrphanedWebView2Processes(old)
+			_ = os.RemoveAll(old)
+		}()
 	}
 }
 
 // cleanupDataDirAsync xóa user-data-dir cũ với retry. Edge child process
 // thường giữ file lock 1-3s sau khi parent gọi ShuttingDown(); poll đến
-// 30s là dư cho mọi trường hợp bình thường.
-func cleanupDataDirAsync(dir string) {
+// 30s là dư cho mọi trường hợp bình thường. Trả false nếu hết hạn mà vẫn
+// chưa xóa được — dấu hiệu child process chưa thoát, gọi tiếp
+// killOrphanedWebView2Processes.
+func cleanupDataDirAsync(dir string) bool {
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		if err := os.RemoveAll(dir); err == nil {
-			return
+			return true
 		}
 		if time.Now().After(deadline) {
-			return
+			return false
 		}
 		time.Sleep(2 * time.Second)
 	}
+}
+
+// killOrphanedWebView2Processes force-kills any msedgewebview2.exe process
+// still holding dataDir open after the 30s graceful-exit window —
+// teardownWebView2's ShuttingDown() call only sets a flag (the embedded
+// go-webview2 version doesn't expose a real Release/Close), so the child
+// process is never guaranteed to actually exit on its own. Left unhandled,
+// these accumulate indefinitely (observed: 18+ stray msedgewebview2.exe
+// processes after a session of testing), each one a live Chromium
+// instance holding real memory/handles.
+//
+// Matched by command line rather than a tracked PID: each spawn's
+// --user-data-dir is already unique (see spawnWebView2), so grep'ing for
+// it can only ever match processes that belonged to this dead session,
+// never a different worker's still-live one. PowerShell/CIM is used
+// instead of a raw Win32 call because reading another process's full
+// command line isn't exposed by golang.org/x/sys/windows without an
+// extra syscall dependency this package doesn't otherwise need.
+func killOrphanedWebView2Processes(dataDir string) {
+	if dataDir == "" {
+		return
+	}
+	escaped := strings.ReplaceAll(dataDir, "'", "''")
+	script := fmt.Sprintf(
+		`Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" | `+
+			`Where-Object { $_.CommandLine -like '*%s*' } | `+
+			`ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,
+		escaped,
+	)
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	_ = cmd.Run()
 }
 
 // freeDiskBytes trả số byte free trên ổ chứa path. Dùng GetDiskFreeSpaceEx
