@@ -284,6 +284,9 @@ func (p *NordVPNWireGuardProvider) refreshServers() error {
 				Value string `json:"value"`
 			} `json:"metadata"`
 		} `json:"technologies"`
+		Groups []struct {
+			Title string `json:"title"`
+		} `json:"groups"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		return err
@@ -291,6 +294,25 @@ func (p *NordVPNWireGuardProvider) refreshServers() error {
 	var servers []wgServer
 	for _, s := range raw {
 		if s.Status != "online" {
+			continue
+		}
+		// Double VPN / Onion Over VPN: real NordVPN groups, chain 2 hops for
+		// extra privacy at the cost of real latency — same trade-off as
+		// ProtonVPN's Secure Core, which live testing (2026-08-05) showed
+		// can miss a probe deadline tuned for single-hop servers despite a
+		// perfectly healthy tunnel. Small slice of the pool (149/8803,
+		// ~1.7%, measured same day) — not the main source of this
+		// provider's low per-server success rate (see file doc comment),
+		// but no reason to spend an attempt on a server that is guaranteed
+		// slower than this provider actually wants.
+		skip := false
+		for _, g := range s.Groups {
+			if g.Title == "Double VPN" || g.Title == "Onion Over VPN" {
+				skip = true
+				break
+			}
+		}
+		if skip {
 			continue
 		}
 		var pubKey string
