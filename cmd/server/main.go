@@ -105,11 +105,16 @@ func main() {
 	//     rankedGoodKeysLocked). Vẫn là nguồn yếu nhất trong 4, giữ trọng số
 	//     thấp; nhiều tài khoản (ELEVEN_NORDVPN_TOKENS) mới thực sự tăng
 	//     được sức chứa, không phải tăng weight.
+	//   - ProtonVPN-WireGuard (1): mới thêm (2026-08-05), CHƯA đo được dưới
+	//     tải đồng thời (chưa có tài khoản thật để test cmd/testconcurrency
+	//     -provider proton). Giữ trọng số thấp nhất cho tới khi đo — nâng
+	//     lên sau khi có số liệu thật, đừng đoán.
 	const (
 		nordSOCKS5Weight = 1
 		nordWGWeight     = 1
 		piaWGWeight      = 6
 		surfsharkWeight  = 2
+		protonWGWeight   = 1
 	)
 
 	var vpnProviders []webview2bridge.ProxyProvider
@@ -177,6 +182,17 @@ func main() {
 			vpnProviders = append(vpnProviders, surfshark)
 		}
 		log.Printf("Surfshark WireGuard proxy source active (weight %d)", surfsharkWeight)
+	}
+	if cfg.ProtonUsername != "" && cfg.ProtonPassword != "" && cfg.ProtonWireGuard {
+		protonWG, err := webview2bridge.NewProtonVPNWireGuardProvider(cfg.ProtonUsername, cfg.ProtonPassword)
+		if err != nil {
+			log.Printf("ProtonVPN WireGuard provider init failed: %v", err)
+		} else {
+			for i := 0; i < protonWGWeight; i++ {
+				vpnProviders = append(vpnProviders, protonWG)
+			}
+			log.Printf("ProtonVPN WireGuard proxy source active (weight %d, opt-in, unmeasured under concurrency — see doc comment)", protonWGWeight)
+		}
 	}
 	// Combined round-robin when more than one VPN source is configured —
 	// every configured source contributes leases instead of only the

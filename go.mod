@@ -11,7 +11,12 @@ require (
 
 require (
 	git.sr.ht/~jackmordaunt/go-toast/v2 v2.0.3 // indirect
+	github.com/ProtonMail/bcrypt v0.0.0-20210511135022-227b4adcab57 // indirect
+	github.com/ProtonMail/go-crypto v1.1.5 // indirect
+	github.com/ProtonMail/go-srp v0.0.7 // indirect
 	github.com/bep/debounce v1.2.1 // indirect
+	github.com/cloudflare/circl v1.3.7 // indirect
+	github.com/cronokirby/saferith v0.33.0 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	github.com/google/btree v1.1.2 // indirect

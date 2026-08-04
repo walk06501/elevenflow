@@ -34,6 +34,9 @@ type Config struct {
 	NordVPNWireGuard bool   // ELEVEN_NORDVPN_WIREGUARD: also add the WireGuard-tunnel-based NordVPN source (opt-in — heavier per-lease than the SOCKS5 source, see NordVPNWireGuardProvider's doc comment)
 	PIAWireGuard     bool   // ELEVEN_PIA_WIREGUARD: also add the WireGuard-tunnel-based PIA source (opt-in — same reasoning as NordVPNWireGuard, see PIAWireGuardProvider's doc comment)
 	SurfsharkKey     string // ELEVEN_SURFSHARK_PRIVATE_KEY: Surfshark account's own WireGuard private key (base64) — same key the Surfshark app itself uses, not fetched from any API
+	ProtonUsername   string // ELEVEN_PROTON_USERNAME: ProtonVPN account username (2FA must be OFF — no interactive prompt in a server process)
+	ProtonPassword   string // ELEVEN_PROTON_PASSWORD: ProtonVPN account password
+	ProtonWireGuard  bool   // ELEVEN_PROTON_WIREGUARD: also add the WireGuard-tunnel-based ProtonVPN source (opt-in, unmeasured under concurrency — see ProtonVPNWireGuardProvider's doc comment)
 
 	// UsePersistentPool switches HandleSynthesize from the old per-request
 	// spawn-then-teardown Run() to webview2bridge.SessionPool — a fixed set
@@ -97,6 +100,9 @@ func LoadConfig() *Config {
 		NordVPNWireGuard: getEnv("ELEVEN_NORDVPN_WIREGUARD", "") == "true",
 		PIAWireGuard:     getEnv("ELEVEN_PIA_WIREGUARD", "") == "true",
 		SurfsharkKey:     getEnv("ELEVEN_SURFSHARK_PRIVATE_KEY", ""),
+		ProtonUsername:   getEnv("ELEVEN_PROTON_USERNAME", ""),
+		ProtonPassword:   getEnv("ELEVEN_PROTON_PASSWORD", ""),
+		ProtonWireGuard:  getEnv("ELEVEN_PROTON_WIREGUARD", "") == "true",
 
 		UsePersistentPool:              getEnv("ELEVEN_PERSISTENT_POOL", "") == "true",
 		PersistentPoolSessions:         getEnvInt("ELEVEN_PERSISTENT_POOL_SESSIONS", 0),

@@ -29,10 +29,12 @@ type acquirer interface {
 }
 
 func main() {
-	providerName := flag.String("provider", "", "\"pia\" or \"surfshark\"")
+	providerName := flag.String("provider", "", "\"pia\", \"surfshark\", or \"proton\"")
 	user := flag.String("user", os.Getenv("ELEVEN_PIA_USERNAME"), "PIA username (provider=pia)")
 	pass := flag.String("pass", os.Getenv("ELEVEN_PIA_PASSWORD"), "PIA password (provider=pia)")
 	key := flag.String("key", os.Getenv("ELEVEN_SURFSHARK_PRIVATE_KEY"), "Surfshark private key (provider=surfshark)")
+	protonUser := flag.String("proton-user", os.Getenv("ELEVEN_PROTON_USERNAME"), "ProtonVPN username (provider=proton)")
+	protonPass := flag.String("proton-pass", os.Getenv("ELEVEN_PROTON_PASSWORD"), "ProtonVPN password (provider=proton)")
 	count := flag.Int("count", 10, "how many leases to acquire concurrently, same account")
 	hold := flag.Duration("hold", 5*time.Second, "keep each successful lease open this long before releasing")
 	flag.Parse()
@@ -52,8 +54,14 @@ func main() {
 		}
 		fmt.Println("Building SurfsharkWireGuardProvider...")
 		p, err = webview2bridge.NewSurfsharkWireGuardProvider(*key)
+	case "proton":
+		if *protonUser == "" || *protonPass == "" {
+			log.Fatal("need -proton-user/-proton-pass or ELEVEN_PROTON_USERNAME/ELEVEN_PROTON_PASSWORD")
+		}
+		fmt.Println("Building ProtonVPNWireGuardProvider (SRP login + certificate registration)...")
+		p, err = webview2bridge.NewProtonVPNWireGuardProvider(*protonUser, *protonPass)
 	default:
-		log.Fatal("need -provider pia|surfshark")
+		log.Fatal("need -provider pia|surfshark|proton")
 	}
 	if err != nil {
 		log.Fatalf("provider init failed: %v", err)
