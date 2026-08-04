@@ -284,9 +284,6 @@ func (p *NordVPNWireGuardProvider) refreshServers() error {
 				Value string `json:"value"`
 			} `json:"metadata"`
 		} `json:"technologies"`
-		Groups []struct {
-			Title string `json:"title"`
-		} `json:"groups"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		return err
@@ -296,25 +293,19 @@ func (p *NordVPNWireGuardProvider) refreshServers() error {
 		if s.Status != "online" {
 			continue
 		}
-		// Double VPN / Onion Over VPN: real NordVPN groups, chain 2 hops for
-		// extra privacy at the cost of real latency — same trade-off as
-		// ProtonVPN's Secure Core, which live testing (2026-08-05) showed
-		// can miss a probe deadline tuned for single-hop servers despite a
-		// perfectly healthy tunnel. Small slice of the pool (149/8803,
-		// ~1.7%, measured same day) — not the main source of this
-		// provider's low per-server success rate (see file doc comment),
-		// but no reason to spend an attempt on a server that is guaranteed
-		// slower than this provider actually wants.
-		skip := false
-		for _, g := range s.Groups {
-			if g.Title == "Double VPN" || g.Title == "Onion Over VPN" {
-				skip = true
-				break
-			}
-		}
-		if skip {
-			continue
-		}
+		// Double VPN / Onion Over VPN (2-hop groups, ~149/8803 servers,
+		// ~1.7%) were considered for exclusion here on the strength of
+		// ProtonVPN's Secure Core finding (2026-08-05: confirmed via real
+		// rx/tx byte counts that a 2-hop server's tunnel was healthy, just
+		// slower than a shared timeout tuned for single-hop). Deliberately
+		// NOT excluded: unlike Proton, this provider's dominant failure
+		// mode is the account-level connection cap (see file doc comment),
+		// not per-server latency, so there is no actual evidence these
+		// specific groups behave differently here — and rankedGoodKeysLocked
+		// already down-weights whatever performs badly from real traffic,
+		// so a hard categorical exclusion would only cost IP diversity
+		// (which main.go's weight comment explicitly values) for an
+		// unproven benefit.
 		var pubKey string
 		for _, t := range s.Technologies {
 			if t.Identifier != "wireguard_udp" {
