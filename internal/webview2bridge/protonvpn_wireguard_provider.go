@@ -180,6 +180,14 @@ func (p *ProtonVPNWireGuardProvider) apiCall(method, path string, body, out any)
 	}
 	req.Header.Set("x-pm-appversion", protonAppVersion)
 	req.Header.Set("Accept", "application/vnd.protonmail.v1+json")
+	// Go's http.Client sends "Go-http-client/1.1" by default when no
+	// User-Agent is set — an immediate automation tell to Proton's fraud
+	// detection (confirmed live 2026-08-05: first-ever login attempt from
+	// a VPS IP was rejected as "unusual activity", HTTP 422, on an account
+	// with normal prior web-login history — an IP + client-fingerprint
+	// signal, not an account-level block). Matches the official Linux
+	// client's real UA string.
+	req.Header.Set("User-Agent", "ProtonVPN/4.9.0 (Linux; Ubuntu/24.04)")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
