@@ -99,9 +99,6 @@ func main() {
 			detail = fmt.Sprintf("%.1fs", r.elapsed.Seconds())
 		} else {
 			detail = r.err.Error()
-			if len(detail) > 120 {
-				detail = detail[:120]
-			}
 		}
 		fmt.Printf("  [%d] %-4s %s\n", r.idx, status, detail)
 	}

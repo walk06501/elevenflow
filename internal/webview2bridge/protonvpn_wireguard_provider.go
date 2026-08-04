@@ -461,8 +461,25 @@ func (p *ProtonVPNWireGuardProvider) tryOne(s protonServer) (*wgTunnel, error) {
 	client := &http.Client{Transport: &http.Transport{DialContext: tnet.DialContext}, Timeout: wgProbeTimeout}
 	resp, err := client.Get("https://api.ipify.org?format=json")
 	if err != nil {
+		// Temporary diagnostic (2026-08-05): distinguish "zero bytes ever
+		// crossed the tunnel" (points at a wrong/unauthorised key — see
+		// this file's doc comment) from "some bytes then a reset" (points
+		// elsewhere, e.g. MTU). rx_bytes/tx_bytes come straight from
+		// wireguard-go's own IpcGet, not guessed.
+		counters := "counters unavailable"
+		if info, ierr := dev.IpcGet(); ierr == nil {
+			var parts []string
+			for _, line := range strings.Split(info, "\n") {
+				if strings.HasPrefix(line, "rx_bytes=") || strings.HasPrefix(line, "tx_bytes=") {
+					parts = append(parts, line)
+				}
+			}
+			if len(parts) > 0 {
+				counters = strings.Join(parts, " ")
+			}
+		}
 		dev.Close()
-		return nil, fmt.Errorf("data path check failed: %w", err)
+		return nil, fmt.Errorf("data path check failed: %w [%s]", err, counters)
 	}
 	resp.Body.Close()
 
