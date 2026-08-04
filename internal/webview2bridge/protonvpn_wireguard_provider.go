@@ -101,6 +101,16 @@ const (
 	protonAppVersion = "linux-vpn@4.9.0"
 
 	protonCertDuration = "365 days"
+
+	// protonProbeTimeout: the other 3 WireGuard providers share
+	// wgProbeTimeout (3s), tuned for their own typical server latency.
+	// Proton's own server pool includes higher-latency routes even after
+	// excluding Secure Core (protonFeatureSecureCore) — first live test
+	// (2026-08-05) missed the shared 3s deadline despite a real, healthy
+	// data path (tx=14392 rx=14088 bytes, not a key problem). A wider
+	// budget here rather than widening the shared constant, since that
+	// constant is already proven correct for NordVPN/PIA/Surfshark.
+	protonProbeTimeout = 8 * time.Second
 )
 
 // ToX25519 converts an Ed25519 private key (32-byte seed form, as returned
@@ -356,15 +366,27 @@ func (p *ProtonVPNWireGuardProvider) registerCertificate(pubPEM string) error {
 type protonLogicalsResp struct {
 	Code           int `json:"Code"`
 	LogicalServers []struct {
-		Name    string `json:"Name"`
-		Status  int    `json:"Status"`
-		Servers []struct {
+		Name     string `json:"Name"`
+		Status   int    `json:"Status"`
+		Features int    `json:"Features"`
+		Servers  []struct {
 			Status          int    `json:"Status"`
 			EntryIP         string `json:"EntryIP"`
 			X25519PublicKey string `json:"X25519PublicKey"`
 		} `json:"Servers"`
 	} `json:"LogicalServers"`
 }
+
+// protonFeatureSecureCore: bit 1 of LogicalServer.Features (confirmed
+// against github.com/hatemosphere/protonvpn-wg-confgen's api package,
+// matching the community-documented bit layout). Secure Core routes
+// through 2 hops for extra privacy at the cost of real latency — first
+// live test (2026-08-05, server "SE-FR#1", an entry/exit-country-mismatch
+// name typical of Secure Core) came back with a WireGuard handshake and
+// real bidirectional bytes (tx=14392 rx=14088, ruling out a bad key) but
+// still missed the 3s HTTP probe deadline. Excluded here since this
+// provider wants many fast exit IPs, not the privacy trade-off.
+const protonFeatureSecureCore = 1
 
 func (p *ProtonVPNWireGuardProvider) refreshServers() error {
 	var resp protonLogicalsResp
@@ -378,7 +400,7 @@ func (p *ProtonVPNWireGuardProvider) refreshServers() error {
 
 	var servers []protonServer
 	for _, logical := range resp.LogicalServers {
-		if logical.Status != 1 {
+		if logical.Status != 1 || logical.Features&protonFeatureSecureCore != 0 {
 			continue
 		}
 		for _, s := range logical.Servers {
@@ -393,7 +415,7 @@ func (p *ProtonVPNWireGuardProvider) refreshServers() error {
 		}
 	}
 	if len(servers) == 0 {
-		return fmt.Errorf("no online servers in logicals response")
+		return fmt.Errorf("no online non-SecureCore servers in logicals response")
 	}
 
 	p.mu.Lock()
@@ -458,7 +480,7 @@ func (p *ProtonVPNWireGuardProvider) tryOne(s protonServer) (*wgTunnel, error) {
 		return nil, fmt.Errorf("no handshake within %s", wgHandshakeTimeout)
 	}
 
-	client := &http.Client{Transport: &http.Transport{DialContext: tnet.DialContext}, Timeout: wgProbeTimeout}
+	client := &http.Client{Transport: &http.Transport{DialContext: tnet.DialContext}, Timeout: protonProbeTimeout}
 	resp, err := client.Get("https://api.ipify.org?format=json")
 	if err != nil {
 		// Temporary diagnostic (2026-08-05): distinguish "zero bytes ever
