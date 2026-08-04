@@ -162,17 +162,32 @@ const (
 // in a map by Lease.Generation rather than workerID for the same reason
 // those two providers avoid workerID: it repeats across concurrent
 // requests once the provider is shared, so it can't be used as a key.
+// keyStat: số lần thử/thành công tích luỹ thật cho 1 public key (1 backend
+// thật — xem doc comment ở đầu file: 8803 server chỉ có 224 public key
+// khác nhau, và cùng key nghĩa là cùng backend). Học dần từ traffic thật
+// trong suốt vòng đời tiến trình, KHÔNG lưu đĩa — quán tính trong 1 lần
+// chạy dài là đủ để tự ưu tiên đúng nhóm tốt, không cần bền qua restart.
+type keyStat struct {
+	attempts  int
+	successes int
+}
+
 type NordVPNWireGuardProvider struct {
 	privHex string
 
 	mu      sync.Mutex
 	servers []wgServer
+	// byKey: public key → toàn bộ hostname mang key đó (xem tryOne/probeRound).
+	// Dựng lại mỗi lần refreshServers() chạy, cùng lúc với `servers`.
+	byKey   map[string][]wgServer
 	nextIdx int
 	genCtr  int64
 	live    map[int64]*wgTunnel
 	// failedUntil: hostname → thời điểm được phép thử lại (xem
 	// nordWGFailCooldown). Chỉ chứa server vừa hỏng, không phải server tốt.
 	failedUntil map[string]time.Time
+	// keyStats: public key → thống kê thật đã tích luỹ (xem keyStat).
+	keyStats map[string]*keyStat
 
 	// slots giới hạn TỔNG số kết nối WireGuard tồn tại cùng lúc trên tài
 	// khoản — tính CẢ tunnel đang sống LẪN probe đang dò. Đây là điểm mấu
@@ -201,6 +216,7 @@ func NewNordVPNWireGuardProvider(token string) (*NordVPNWireGuardProvider, error
 		privHex:     privHex,
 		live:        map[int64]*wgTunnel{},
 		failedUntil: map[string]time.Time{},
+		keyStats:    map[string]*keyStat{},
 		slots:       make(chan struct{}, nordWGMaxConcurrentConns),
 	}
 	if err := p.refreshServers(); err != nil {
@@ -302,8 +318,14 @@ func (p *NordVPNWireGuardProvider) refreshServers() error {
 	}
 	sort.Slice(servers, func(i, j int) bool { return servers[i].load < servers[j].load })
 
+	byKey := map[string][]wgServer{}
+	for _, s := range servers {
+		byKey[s.pubHex] = append(byKey[s.pubHex], s)
+	}
+
 	p.mu.Lock()
 	p.servers = servers
+	p.byKey = byKey
 	// Dọn các mục phạt đã hết hạn cùng lúc refresh danh sách — nếu không,
 	// map này chỉ có thêm chứ không bao giờ bớt trong suốt đời server
 	// (nextCandidate chỉ xoá mục nó tình cờ gặp lại).
@@ -319,9 +341,41 @@ func (p *NordVPNWireGuardProvider) refreshServers() error {
 	return nil
 }
 
+// bestKeyLocked trả về public key có thành tích thật tốt nhất đã tích luỹ
+// được, hoặc "" nếu chưa key nào đủ dữ liệu. Ngưỡng cố tình khắt khe
+// (>=5 lần thử, >=70% thành công) để vài lần may mắn đầu tiên không đủ
+// đẩy 1 key tầm thường lên — key nào chưa đủ dữ liệu thì KHÔNG bị phạt gì
+// cả, chỉ đơn giản là rơi xuống round-robin bình thường bên dưới (chính là
+// cách thăm dò/khám phá key mới diễn ra một cách tự nhiên).
+// Caller must hold p.mu.
+func (p *NordVPNWireGuardProvider) bestKeyLocked() string {
+	const minAttempts = 5
+	const minSuccessRate = 0.7
+	best := ""
+	bestRate := minSuccessRate
+	for key, st := range p.keyStats {
+		if st.attempts < minAttempts {
+			continue
+		}
+		rate := float64(st.successes) / float64(st.attempts)
+		if rate > bestRate {
+			bestRate = rate
+			best = key
+		}
+	}
+	return best
+}
+
 // nextCandidate returns the next server in the round-robin, bỏ qua những
 // server vừa hỏng còn trong thời gian phạt (xem nordWGFailCooldown).
 // Caller must hold p.mu.
+//
+// Trước tiên thử tìm 1 hostname còn dùng được thuộc public key đã chứng
+// minh đáng tin qua traffic thật (bestKeyLocked) — key nào đã đủ dữ liệu và
+// tỉ lệ thành công cao thì được ưu tiên, vì đó chính là dấu hiệu backend
+// thật phía sau nó chịu được tải/kết nối ổn định (xem doc comment đầu file
+// về 224 public key = 224 backend thật). Nếu không có key nào đủ tốt, hoặc
+// mọi hostname của key đó đang bị phạt, rơi xuống round-robin thường như cũ.
 //
 // Quét tối đa 1 vòng danh sách: nếu MỌI server đều đang bị phạt (dấu hiệu
 // sự cố diện rộng — thường là phía tài khoản mình, không phải server), thì
@@ -332,6 +386,21 @@ func (p *NordVPNWireGuardProvider) nextCandidate() (wgServer, error) {
 		return wgServer{}, fmt.Errorf("no NordVPN WireGuard servers loaded")
 	}
 	now := time.Now()
+
+	if best := p.bestKeyLocked(); best != "" {
+		for _, s := range p.byKey[best] {
+			until, penalised := p.failedUntil[s.hostname]
+			if !penalised || now.After(until) {
+				if penalised {
+					delete(p.failedUntil, s.hostname)
+				}
+				return s, nil
+			}
+		}
+		// Mọi hostname của key tốt nhất đang bị phạt hết — rơi xuống
+		// round-robin thường bên dưới thay vì chờ.
+	}
+
 	for scanned := 0; scanned < len(p.servers); scanned++ {
 		s := p.servers[p.nextIdx%len(p.servers)]
 		p.nextIdx++
@@ -354,6 +423,24 @@ func (p *NordVPNWireGuardProvider) noteFailure(hostname string) {
 	p.mu.Lock()
 	p.failedUntil[hostname] = time.Now().Add(nordWGFailCooldown)
 	p.mu.Unlock()
+}
+
+// noteKeyResult tích luỹ 1 kết quả thật (thành công hay thất bại) vào thống
+// kê của public key đó — đây là dữ liệu bestKeyLocked dùng để quyết định key
+// nào đáng ưu tiên. Chỉ cộng dồn trong bộ nhớ suốt vòng đời tiến trình, cố
+// tình KHÔNG lưu đĩa (xem doc comment của keyStat).
+func (p *NordVPNWireGuardProvider) noteKeyResult(pubHex string, ok bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	st, exists := p.keyStats[pubHex]
+	if !exists {
+		st = &keyStat{}
+		p.keyStats[pubHex] = st
+	}
+	st.attempts++
+	if ok {
+		st.successes++
+	}
 }
 
 // tryOne attempts a full lease against one candidate: build the tunnel,
@@ -531,10 +618,12 @@ grab:
 			t, err := p.tryOne(s)
 			if err != nil {
 				p.noteFailure(s.hostname)
+				p.noteKeyResult(s.pubHex, false)
 				<-p.slots // probe hỏng → trả slot ngay
 				results <- probeResult{err: fmt.Errorf("%s: %w", s.hostname, err)}
 				return
 			}
+			p.noteKeyResult(s.pubHex, true)
 			// Probe thắng thì GIỮ nguyên slot (tunnel sống tiếp tục chiếm 1
 			// kết nối); probe thua sẽ trả slot lúc bị đóng ở dưới.
 			results <- probeResult{tunnel: t}
