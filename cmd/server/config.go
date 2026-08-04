@@ -10,17 +10,25 @@ import (
 
 // Config holds all server configuration, loaded from environment variables.
 type Config struct {
-	Port             string // ELEVEN_SERVER_PORT: HTTP listen port (default: 8080)
-	Secret           string // ELEVEN_SERVER_SECRET: API auth secret
-	MaxWorkers       int    // ELEVEN_MAX_WORKERS: WebView2 instances per request (default: 3)
-	MaxConcurrent    int    // ELEVEN_MAX_CONCURRENT: Total inflight synthesis requests (default: 50)
-	OutputDir        string // ELEVEN_OUTPUT_DIR: Temp directory for audio output (default: ./output)
-	ChunkMaxChars    int    // ELEVEN_CHUNK_MAX_CHARS: Max characters per chunk (default: 600)
-	ServerURL        string // ELEVENFLOW_SERVER_URL: Proxy lease Vercel server
-	AppSecret        string // ELEVENFLOW_APP_SECRET: Proxy lease auth secret
-	UserEmail        string // ELEVEN_USER_EMAIL: Proxy server account email
-	UserPassword     string // ELEVEN_USER_PASSWORD: Proxy server account password
-	NordVPNToken     string // ELEVEN_NORDVPN_TOKEN: NordVPN Access Token
+	Port          string   // ELEVEN_SERVER_PORT: HTTP listen port (default: 8080)
+	Secret        string   // ELEVEN_SERVER_SECRET: API auth secret
+	MaxWorkers    int      // ELEVEN_MAX_WORKERS: WebView2 instances per request (default: 3)
+	MaxConcurrent int      // ELEVEN_MAX_CONCURRENT: Total inflight synthesis requests (default: 50)
+	OutputDir     string   // ELEVEN_OUTPUT_DIR: Temp directory for audio output (default: ./output)
+	ChunkMaxChars int      // ELEVEN_CHUNK_MAX_CHARS: Max characters per chunk (default: 600)
+	ServerURL     string   // ELEVENFLOW_SERVER_URL: Proxy lease Vercel server
+	AppSecret     string   // ELEVENFLOW_APP_SECRET: Proxy lease auth secret
+	UserEmail     string   // ELEVEN_USER_EMAIL: Proxy server account email
+	UserPassword  string   // ELEVEN_USER_PASSWORD: Proxy server account password
+	NordVPNToken  string   // ELEVEN_NORDVPN_TOKEN: NordVPN Access Token (first/only account)
+	NordVPNTokens []string // ELEVEN_NORDVPN_TOKENS: comma-separated, one per NordVPN account.
+	// Each account's WireGuard key sustains exactly 1 concurrent data path
+	// (see nordvpn_wireguard_provider.go's nordWGMaxConcurrentConns doc) —
+	// there is no way to get more concurrent NordVPN-WG slots than accounts.
+	// N accounts here means N separate NordVPNWireGuardProvider instances in
+	// main.go, each with its own token/key/slot, giving N total slots instead
+	// of 1. Falls back to [NordVPNToken] when unset, so a single-account
+	// setup needs no config change.
 	PIAUsername      string // ELEVEN_PIA_USERNAME: Private Internet Access account username
 	PIAPassword      string // ELEVEN_PIA_PASSWORD: Private Internet Access account password
 	NordVPNWireGuard bool   // ELEVEN_NORDVPN_WIREGUARD: also add the WireGuard-tunnel-based NordVPN source (opt-in — heavier per-lease than the SOCKS5 source, see NordVPNWireGuardProvider's doc comment)
@@ -83,6 +91,7 @@ func LoadConfig() *Config {
 		UserEmail:        getEnv("ELEVEN_USER_EMAIL", ""),
 		UserPassword:     getEnv("ELEVEN_USER_PASSWORD", ""),
 		NordVPNToken:     getEnv("ELEVEN_NORDVPN_TOKEN", ""),
+		NordVPNTokens:    getEnvTokenList("ELEVEN_NORDVPN_TOKENS", getEnv("ELEVEN_NORDVPN_TOKEN", "")),
 		PIAUsername:      getEnv("ELEVEN_PIA_USERNAME", ""),
 		PIAPassword:      getEnv("ELEVEN_PIA_PASSWORD", ""),
 		NordVPNWireGuard: getEnv("ELEVEN_NORDVPN_WIREGUARD", "") == "true",
@@ -100,6 +109,32 @@ func getEnv(key, fallback string) string {
 		return val
 	}
 	return fallback
+}
+
+// getEnvTokenList parses a comma-separated env var into a token list,
+// trimming whitespace and dropping empty entries. Falls back to `fallback`
+// (the legacy singular var's raw value) when the plural var is unset — and
+// ALSO comma-splits that fallback, not just wraps it whole, because in
+// practice a second account gets pasted onto the singular var (comma and
+// all) at least as often as into the plural one. Splitting both the same
+// way means whichever var the value landed in, it parses correctly.
+func getEnvTokenList(key, fallback string) []string {
+	val, ok := os.LookupEnv(key)
+	source := val
+	if !ok || strings.TrimSpace(val) == "" {
+		source = fallback
+	}
+	if strings.TrimSpace(source) == "" {
+		return nil
+	}
+	var out []string
+	for _, tok := range strings.Split(source, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok != "" {
+			out = append(out, tok)
+		}
+	}
+	return out
 }
 
 func getEnvInt(key string, fallback int) int {

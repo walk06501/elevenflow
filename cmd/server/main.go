@@ -110,15 +110,19 @@ func main() {
 	)
 
 	var vpnProviders []webview2bridge.ProxyProvider
-	if cfg.NordVPNToken != "" {
-		nord, err := webview2bridge.NewNordVPNProvider(cfg.NordVPNToken)
+	if len(cfg.NordVPNTokens) > 0 {
+		// SOCKS5 source: fixed shared hosts, not per-account connection-
+		// limited like WireGuard (see below), so it gets no benefit from
+		// multiple accounts — first token only.
+		nordToken := cfg.NordVPNTokens[0]
+		nord, err := webview2bridge.NewNordVPNProvider(nordToken)
 		if err != nil {
 			log.Fatalf("NordVPN provider init failed: %v", err)
 		}
 		for i := 0; i < nordSOCKS5Weight; i++ {
 			vpnProviders = append(vpnProviders, nord)
 		}
-		log.Printf("NordVPN Proxy active with Token: %s... (weight %d)", cfg.NordVPNToken[:8], nordSOCKS5Weight)
+		log.Printf("NordVPN Proxy active with Token: %s... (weight %d)", safePrefix(nordToken, 8), nordSOCKS5Weight)
 	}
 	// PIA's plain HTTPS-proxy source (PIAProvider, the 44 fixed
 	// serverlist.piaservers.net/proxy hosts) was tried and dropped
@@ -127,15 +131,29 @@ func main() {
 	// fast and reliable once its addKey call was fixed to match PIA's own
 	// reference implementation. Left out entirely rather than disabled by
 	// config, since there's no reason to keep a known-bad source wired in.
-	if cfg.NordVPNToken != "" && cfg.NordVPNWireGuard {
-		nordWG, err := webview2bridge.NewNordVPNWireGuardProvider(cfg.NordVPNToken)
-		if err != nil {
-			log.Fatalf("NordVPN WireGuard provider init failed: %v", err)
+	if len(cfg.NordVPNTokens) > 0 && cfg.NordVPNWireGuard {
+		// One NordVPNWireGuardProvider instance per account token: each
+		// instance owns its own private key and its own 1-slot semaphore
+		// (nordWGMaxConcurrentConns — confirmed by hand, real handshake
+		// tests, that a NordVPN account's WireGuard key sustains exactly 1
+		// concurrent data path regardless of server or VPS hardware). N
+		// accounts therefore means N independent slots, not 1 shared
+		// across all of them — the whole reason to add more than one.
+		nordWGInit := 0
+		for _, tok := range cfg.NordVPNTokens {
+			nordWG, err := webview2bridge.NewNordVPNWireGuardProvider(tok)
+			if err != nil {
+				log.Printf("NordVPN WireGuard provider init failed for token %s...: %v", safePrefix(tok, 8), err)
+				continue
+			}
+			for i := 0; i < nordWGWeight; i++ {
+				vpnProviders = append(vpnProviders, nordWG)
+			}
+			nordWGInit++
 		}
-		for i := 0; i < nordWGWeight; i++ {
-			vpnProviders = append(vpnProviders, nordWG)
+		if nordWGInit > 0 {
+			log.Printf("NordVPN WireGuard proxy source active: %d account(s), %d concurrent slot(s) total (weight %d each, opt-in, heavier per-lease — see doc comment)", nordWGInit, nordWGInit, nordWGWeight)
 		}
-		log.Printf("NordVPN WireGuard proxy source active (weight %d, opt-in, heavier per-lease — see doc comment)", nordWGWeight)
 	}
 	if cfg.PIAUsername != "" && cfg.PIAPassword != "" && cfg.PIAWireGuard {
 		piaWG, err := webview2bridge.NewPIAWireGuardProvider(cfg.PIAUsername, cfg.PIAPassword)
@@ -247,6 +265,15 @@ func main() {
 		sessionPool.Close()
 	}
 	log.Println("Server stopped.")
+}
+
+// safePrefix returns the first n bytes of s for logging (never the full
+// secret), without panicking when s is shorter than n.
+func safePrefix(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
 
 func registerRoutes(mux *http.ServeMux, cfg *Config, proxyClient *proxyserver.Client, vpnProvider webview2bridge.ProxyProvider, sessionPool *webview2bridge.SessionPool, concurrencySem chan struct{}) {
