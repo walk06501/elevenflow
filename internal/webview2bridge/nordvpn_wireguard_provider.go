@@ -341,41 +341,52 @@ func (p *NordVPNWireGuardProvider) refreshServers() error {
 	return nil
 }
 
-// bestKeyLocked trả về public key có thành tích thật tốt nhất đã tích luỹ
-// được, hoặc "" nếu chưa key nào đủ dữ liệu. Ngưỡng cố tình khắt khe
-// (>=5 lần thử, >=70% thành công) để vài lần may mắn đầu tiên không đủ
-// đẩy 1 key tầm thường lên — key nào chưa đủ dữ liệu thì KHÔNG bị phạt gì
-// cả, chỉ đơn giản là rơi xuống round-robin bình thường bên dưới (chính là
-// cách thăm dò/khám phá key mới diễn ra một cách tự nhiên).
+// rankedGoodKeysLocked trả về MỌI public key đã đủ dữ liệu và đạt ngưỡng
+// đáng tin (>=5 lần thử, >=70% thành công), xếp từ tỉ lệ thành công cao
+// xuống thấp — không chỉ 1 key tốt nhất. Lý do: thực tế đo được không chỉ
+// có 1 key tốt (scan tay tìm ra ~10 key khác nhau, lớn nhỏ khác nhau), nên
+// nếu chỉ nhớ đúng 1 key, lúc key đó đang bị phạt tạm thời sẽ lãng phí toàn
+// bộ key tốt còn lại và rơi thẳng về ngẫu nhiên trên cả 8803 server. Ngưỡng
+// cố tình khắt khe để vài lần may mắn đầu tiên không đủ đẩy 1 key tầm
+// thường lên — key nào chưa đủ dữ liệu thì KHÔNG bị phạt gì cả, chỉ đơn
+// giản là rơi xuống round-robin bình thường bên dưới (chính là cách thăm
+// dò/khám phá key mới diễn ra một cách tự nhiên).
 // Caller must hold p.mu.
-func (p *NordVPNWireGuardProvider) bestKeyLocked() string {
+func (p *NordVPNWireGuardProvider) rankedGoodKeysLocked() []string {
 	const minAttempts = 5
 	const minSuccessRate = 0.7
-	best := ""
-	bestRate := minSuccessRate
+	type scored struct {
+		key  string
+		rate float64
+	}
+	var good []scored
 	for key, st := range p.keyStats {
 		if st.attempts < minAttempts {
 			continue
 		}
 		rate := float64(st.successes) / float64(st.attempts)
-		if rate > bestRate {
-			bestRate = rate
-			best = key
+		if rate >= minSuccessRate {
+			good = append(good, scored{key, rate})
 		}
 	}
-	return best
+	sort.Slice(good, func(i, j int) bool { return good[i].rate > good[j].rate })
+	out := make([]string, len(good))
+	for i, g := range good {
+		out[i] = g.key
+	}
+	return out
 }
 
 // nextCandidate returns the next server in the round-robin, bỏ qua những
 // server vừa hỏng còn trong thời gian phạt (xem nordWGFailCooldown).
 // Caller must hold p.mu.
 //
-// Trước tiên thử tìm 1 hostname còn dùng được thuộc public key đã chứng
-// minh đáng tin qua traffic thật (bestKeyLocked) — key nào đã đủ dữ liệu và
-// tỉ lệ thành công cao thì được ưu tiên, vì đó chính là dấu hiệu backend
-// thật phía sau nó chịu được tải/kết nối ổn định (xem doc comment đầu file
-// về 224 public key = 224 backend thật). Nếu không có key nào đủ tốt, hoặc
-// mọi hostname của key đó đang bị phạt, rơi xuống round-robin thường như cũ.
+// Trước tiên thử lần lượt các public key đã chứng minh đáng tin qua traffic
+// thật (rankedGoodKeysLocked, xếp tốt dần), mỗi key thử hostname còn dùng
+// được (chưa bị phạt) của nó — không chỉ đúng 1 key tốt nhất, vì thực tế đo
+// được có nhiều key tốt cùng lúc (xem doc comment của rankedGoodKeysLocked).
+// Chỉ khi TOÀN BỘ key tốt đều không còn hostname dùng được (mọi key tốt
+// cùng lúc bị phạt hết — hiếm) mới rơi xuống round-robin thường như cũ.
 //
 // Quét tối đa 1 vòng danh sách: nếu MỌI server đều đang bị phạt (dấu hiệu
 // sự cố diện rộng — thường là phía tài khoản mình, không phải server), thì
@@ -387,8 +398,8 @@ func (p *NordVPNWireGuardProvider) nextCandidate() (wgServer, error) {
 	}
 	now := time.Now()
 
-	if best := p.bestKeyLocked(); best != "" {
-		for _, s := range p.byKey[best] {
+	for _, key := range p.rankedGoodKeysLocked() {
+		for _, s := range p.byKey[key] {
 			until, penalised := p.failedUntil[s.hostname]
 			if !penalised || now.After(until) {
 				if penalised {
@@ -397,8 +408,8 @@ func (p *NordVPNWireGuardProvider) nextCandidate() (wgServer, error) {
 				return s, nil
 			}
 		}
-		// Mọi hostname của key tốt nhất đang bị phạt hết — rơi xuống
-		// round-robin thường bên dưới thay vì chờ.
+		// Mọi hostname của key này đang bị phạt hết — thử key tốt kế tiếp
+		// thay vì rơi thẳng xuống round-robin ngay.
 	}
 
 	for scanned := 0; scanned < len(p.servers); scanned++ {

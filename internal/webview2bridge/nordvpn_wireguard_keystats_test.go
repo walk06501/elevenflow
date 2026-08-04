@@ -1,63 +1,78 @@
 package webview2bridge
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
-func TestBestKeyLocked(t *testing.T) {
+func TestRankedGoodKeysLocked(t *testing.T) {
 	cases := []struct {
 		name  string
 		stats map[string]*keyStat
-		want  string
+		want  []string
 	}{
 		{
 			name:  "no data at all",
 			stats: map[string]*keyStat{},
-			want:  "",
+			want:  nil,
 		},
 		{
 			name: "not enough attempts yet, even at 100%",
 			stats: map[string]*keyStat{
 				"a": {attempts: 4, successes: 4},
 			},
-			want: "",
+			want: nil,
 		},
 		{
 			name: "enough attempts but below the success threshold",
 			stats: map[string]*keyStat{
 				"a": {attempts: 10, successes: 6}, // 60%, below the 70% bar
 			},
-			want: "",
+			want: nil,
 		},
 		{
 			name: "exactly meets both thresholds",
 			stats: map[string]*keyStat{
 				"a": {attempts: 5, successes: 4}, // 80%
 			},
-			want: "a",
+			want: []string{"a"},
 		},
 		{
-			name: "picks the higher success rate, not the higher attempt count",
+			name: "ranks by success rate, not attempt count, highest first",
 			stats: map[string]*keyStat{
 				"a": {attempts: 100, successes: 75}, // 75%
 				"b": {attempts: 10, successes: 9},   // 90%
 			},
-			want: "b",
+			want: []string{"b", "a"},
 		},
 		{
-			name: "a key below the bar never wins over one that qualifies",
+			name: "a key below the bar is excluded even if another qualifies",
 			stats: map[string]*keyStat{
 				"a": {attempts: 3, successes: 3}, // 100% but too few attempts
 				"b": {attempts: 5, successes: 4},  // 80%, qualifies
 			},
-			want: "b",
+			want: []string{"b"},
+		},
+		{
+			name: "multiple qualifying keys are all returned, ranked",
+			stats: map[string]*keyStat{
+				"low":  {attempts: 10, successes: 7},  // 70%, right at the bar
+				"mid":  {attempts: 10, successes: 8},  // 80%
+				"high": {attempts: 10, successes: 10}, // 100%
+			},
+			want: []string{"high", "mid", "low"},
 		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			p := &NordVPNWireGuardProvider{keyStats: c.stats}
-			got := p.bestKeyLocked()
-			if got != c.want {
-				t.Errorf("bestKeyLocked() = %q, want %q", got, c.want)
+			got := p.rankedGoodKeysLocked()
+			if len(got) == 0 && len(c.want) == 0 {
+				return // both empty: nil vs []string{} is not a meaningful difference here
+			}
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("rankedGoodKeysLocked() = %v, want %v", got, c.want)
 			}
 		})
 	}
