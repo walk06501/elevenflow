@@ -75,37 +75,40 @@ func main() {
 	// Weights below bias MultiVPNProvider's round-robin (see that type —
 	// it just cycles a slice in order, so appending a provider N times
 	// gives it N/total of the picks, no changes needed there) toward
-	// NordVPN: at 8500+ servers it dwarfs PIA's (~360) and Surfshark's
-	// (~140) pools, and empirically (2026-08-03 testing) both NordVPN
-	// paths were also the fastest/most reliable of the four — the two
-	// together are meant to carry most of the system's traffic, with
-	// PIA/Surfshark still in the mix for resilience and IP diversity, not
-	// eliminated.
-	// Trọng số chỉnh theo đo thật trên VPS (2026-08-04). Tiêu chí là tích
-	// của HAI thứ, thiếu một trong hai đều vô dụng: (a) chịu được nhiều kết
-	// nối ĐỒNG THỜI, (b) có nhiều IP KHÁC NHAU — ElevenLabs gắn cờ
-	// detected_unusual_activity khi cùng vài IP gọi liên tục, nên nguồn ít
-	// IP không thể gánh tải chính dù nó ổn định đến đâu.
+	// Trọng số chỉnh theo đo thật trên VPS (2026-08-05, cmd/testconcurrency
+	// — 30 lease đồng thời, cùng 1 tài khoản/khoá mỗi nguồn). Tiêu chí là
+	// tích của HAI thứ, thiếu một trong hai đều vô dụng: (a) chịu được
+	// nhiều kết nối ĐỒNG THỜI, (b) có nhiều IP KHÁC NHAU — ElevenLabs gắn
+	// cờ detected_unusual_activity khi cùng vài IP gọi liên tục, nên nguồn
+	// ít IP không thể gánh tải chính dù nó ổn định đến đâu.
 	//
-	//   - PIA-WireGuard (4): nguồn DUY NHẤT đạt cả hai. Mỗi lease tự sinh
-	//     cặp khoá X25519 mới rồi đăng ký riêng (xem addKey), nên các kết
-	//     nối độc lập thật sự — không tranh nhau như hai nguồn dùng chung 1
-	//     khoá tĩnh bên dưới — trên 361 server.
-	//   - Surfshark (2): 137 server, nhưng dùng CHUNG 1 khoá tĩnh nên nhiều
-	//     kết nối song song nhiều khả năng cũng tranh đường dữ liệu như
-	//     NordVPN-WG. Giữ mức vừa phải, chưa có số đo riêng để khẳng định.
+	//   - PIA-WireGuard (6): đo được 30/30 thành công, nhanh nhất (phần lớn
+	//     1-2.5s/lease). Mỗi lease tự sinh cặp khoá X25519 mới rồi đăng ký
+	//     riêng (xem addKey), nên các kết nối độc lập thật sự trên 361+
+	//     server — nguồn đáng tin cậy nhất trong 4 nguồn, gánh phần lớn tải.
+	//   - Surfshark (2): CŨNG đo được 30/30 thành công dù dùng CHUNG 1 khoá
+	//     tĩnh (giống NordVPN-WG về kiến trúc) — bác bỏ giả thuyết cũ rằng
+	//     dùng chung khoá tĩnh ắt bị tranh đường dữ liệu như NordVPN; đó là
+	//     giới hạn RIÊNG của backend NordVPN, không phải quy luật chung của
+	//     WireGuard. Nhưng độ trễ tăng rõ rệt khi tải cao (7-11s sau lease
+	//     thứ ~13, có thể do chỉ ~140 host cố định), nên giữ trọng số vừa
+	//     phải, không dồn tải đột biến vào đây.
 	//   - NordVPN-SOCKS5 (1): ổn định và nhanh nhất (~2-14s tải xong trang)
 	//     nhưng chỉ có 12 host cố định. Dồn tải vào đây sẽ tự chuốc lấy
 	//     cờ "hoạt động bất thường" — dùng như đường dự phòng đáng tin, chứ
 	//     KHÔNG phải nguồn gánh chính.
-	//   - NordVPN-WireGuard (1): 8500+ server nhưng chỉ giữ được ĐÚNG 1
-	//     đường dữ liệu trên mỗi khoá tài khoản (xem nordWGMaxConcurrentConns),
-	//     nên số server lớn KHÔNG quy đổi thành sức chứa. Giữ 1 để vẫn góp
-	//     IP đa dạng khi rảnh.
+	//   - NordVPN-WireGuard (1): 8500+ server nhưng mỗi tài khoản chỉ giữ
+	//     được ĐÚNG 1 đường dữ liệu trên phần lớn server (xem
+	//     nordWGMaxConcurrentConns) — trừ một số cụm hạ tầng cho đa phiên
+	//     thật (đã dò ra bằng cmd/scanwgpools, và NordVPNWireGuardProvider
+	//     giờ tự học ưu tiên các cụm đó qua traffic thật, xem
+	//     rankedGoodKeysLocked). Vẫn là nguồn yếu nhất trong 4, giữ trọng số
+	//     thấp; nhiều tài khoản (ELEVEN_NORDVPN_TOKENS) mới thực sự tăng
+	//     được sức chứa, không phải tăng weight.
 	const (
 		nordSOCKS5Weight = 1
 		nordWGWeight     = 1
-		piaWGWeight      = 4
+		piaWGWeight      = 6
 		surfsharkWeight  = 2
 	)
 
