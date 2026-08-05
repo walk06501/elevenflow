@@ -20,6 +20,21 @@ type Config struct {
 	AppSecret     string   // ELEVENFLOW_APP_SECRET: Proxy lease auth secret
 	UserEmail     string   // ELEVEN_USER_EMAIL: Proxy server account email
 	UserPassword  string   // ELEVEN_USER_PASSWORD: Proxy server account password
+
+	// PortalAPIURL: web-portal's own API base (e.g. https://sonicvoice.pro/api),
+	// NOT this server's own ELEVENFLOW_SERVER_URL/AppSecret above (that's the
+	// separate Vercel proxy-lease backend). When set, VPN account credentials
+	// (below) are fetched from web-portal's GET /v1/eleven/vpn-accounts at
+	// startup — authenticated with this server's own Secret, the same shared
+	// secret web-portal's worker already sends for /synthesize — instead of
+	// being read from this file. See loadVPNAccounts (portal_vpn_accounts.go).
+	PortalAPIURL string // ELEVEN_PORTAL_API_URL
+
+	// Everything below is now SEED / FALLBACK ONLY: authoritative until
+	// PortalAPIURL is set and reachable, after which web-portal's admin
+	// console (VPN (ElevenFlow) tab) is where accounts are actually managed
+	// — edits here are only consulted again if the portal call itself fails
+	// at startup (network down, portal down), never once it has succeeded.
 	NordVPNToken  string   // ELEVEN_NORDVPN_TOKEN: NordVPN Access Token (first/only account)
 	NordVPNTokens []string // ELEVEN_NORDVPN_TOKENS: comma-separated, one per NordVPN account.
 	// Each account's WireGuard key sustains exactly 1 concurrent data path
@@ -93,6 +108,7 @@ func LoadConfig() *Config {
 		AppSecret:        getEnv("ELEVENFLOW_APP_SECRET", proxyserver.DefaultAppSecret),
 		UserEmail:        getEnv("ELEVEN_USER_EMAIL", ""),
 		UserPassword:     getEnv("ELEVEN_USER_PASSWORD", ""),
+		PortalAPIURL:     getEnv("ELEVEN_PORTAL_API_URL", ""),
 		NordVPNToken:     getEnv("ELEVEN_NORDVPN_TOKEN", ""),
 		NordVPNTokens:    getEnvTokenList("ELEVEN_NORDVPN_TOKENS", getEnv("ELEVEN_NORDVPN_TOKEN", "")),
 		PIAUsername:      getEnv("ELEVEN_PIA_USERNAME", ""),

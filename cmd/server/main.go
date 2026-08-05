@@ -105,32 +105,52 @@ func main() {
 	//     rankedGoodKeysLocked). Vẫn là nguồn yếu nhất trong 4, giữ trọng số
 	//     thấp; nhiều tài khoản (ELEVEN_NORDVPN_TOKENS) mới thực sự tăng
 	//     được sức chứa, không phải tăng weight.
-	//   - ProtonVPN-WireGuard (1): mới thêm (2026-08-05), CHƯA đo được dưới
-	//     tải đồng thời (chưa có tài khoản thật để test cmd/testconcurrency
-	//     -provider proton). Giữ trọng số thấp nhất cho tới khi đo — nâng
-	//     lên sau khi có số liệu thật, đừng đoán.
+	//   - ProtonVPN-WireGuard (3): đo được 30/30 thành công (2026-08-05) SAU
+	//     KHI sửa 1 lỗi tự gây ra: refreshServers() từng liệt kê nhiều tên
+	//     "logical" server trỏ chung 1 EntryIP vật lý (vd SK#1..SK#8 cùng
+	//     1 IP) làm nhiều goroutine tự dồn vào đúng 1 endpoint cùng lúc và
+	//     timeout handshake lẫn nhau — fix bằng khử trùng lặp theo EntryIP
+	//     khi build candidate list (xem doc comment refreshServers). Sau
+	//     fix, latency điển hình 5.7-8.5s/lease — chậm hơn PIA rõ rệt
+	//     (1-2.5s) nên KHÔNG đặt ngang PIA, nhưng đáng tin hơn Surfshark
+	//     (nhiều EntryIP hơn hẳn ~140 host cố định của Surfshark) nên đặt
+	//     cao hơn Surfshark một chút.
 	const (
 		nordSOCKS5Weight = 1
 		nordWGWeight     = 1
 		piaWGWeight      = 6
 		surfsharkWeight  = 2
-		protonWGWeight   = 1
+		protonWGWeight   = 3
 	)
 
+	// See loadVPNAccounts (portal_vpn_accounts.go): web-portal's admin
+	// console (VPN (ElevenFlow) tab) is the source of truth for every
+	// account below, fetched once here at startup; .env only kicks in as a
+	// fallback if that fetch itself fails. Every init failure below is now
+	// log-and-skip, not Fatalf — the whole point of a remote UI managing
+	// these is that a bad credential entered there must not take the whole
+	// server down on the next restart.
+	vpnAccounts := loadVPNAccounts(cfg)
+	nordAccounts := vpnAccounts["nordvpn"]
+	piaAccounts := vpnAccounts["pia"]
+	surfsharkAccounts := vpnAccounts["surfshark"]
+	protonAccounts := vpnAccounts["proton"]
+
 	var vpnProviders []webview2bridge.ProxyProvider
-	if len(cfg.NordVPNTokens) > 0 {
+	if len(nordAccounts) > 0 {
 		// SOCKS5 source: fixed shared hosts, not per-account connection-
 		// limited like WireGuard (see below), so it gets no benefit from
-		// multiple accounts — first token only.
-		nordToken := cfg.NordVPNTokens[0]
+		// multiple accounts — first account only.
+		nordToken := nordAccounts[0].Secret
 		nord, err := webview2bridge.NewNordVPNProvider(nordToken)
 		if err != nil {
-			log.Fatalf("NordVPN provider init failed: %v", err)
+			log.Printf("NordVPN provider init failed, skipping: %v", err)
+		} else {
+			for i := 0; i < nordSOCKS5Weight; i++ {
+				vpnProviders = append(vpnProviders, nord)
+			}
+			log.Printf("NordVPN Proxy active with Token: %s... (weight %d)", safePrefix(nordToken, 8), nordSOCKS5Weight)
 		}
-		for i := 0; i < nordSOCKS5Weight; i++ {
-			vpnProviders = append(vpnProviders, nord)
-		}
-		log.Printf("NordVPN Proxy active with Token: %s... (weight %d)", safePrefix(nordToken, 8), nordSOCKS5Weight)
 	}
 	// PIA's plain HTTPS-proxy source (PIAProvider, the 44 fixed
 	// serverlist.piaservers.net/proxy hosts) was tried and dropped
@@ -139,19 +159,19 @@ func main() {
 	// fast and reliable once its addKey call was fixed to match PIA's own
 	// reference implementation. Left out entirely rather than disabled by
 	// config, since there's no reason to keep a known-bad source wired in.
-	if len(cfg.NordVPNTokens) > 0 && cfg.NordVPNWireGuard {
-		// One NordVPNWireGuardProvider instance per account token: each
-		// instance owns its own private key and its own 1-slot semaphore
+	if len(nordAccounts) > 0 && cfg.NordVPNWireGuard {
+		// One NordVPNWireGuardProvider instance per account: each instance
+		// owns its own private key and its own 1-slot semaphore
 		// (nordWGMaxConcurrentConns — confirmed by hand, real handshake
 		// tests, that a NordVPN account's WireGuard key sustains exactly 1
 		// concurrent data path regardless of server or VPS hardware). N
 		// accounts therefore means N independent slots, not 1 shared
 		// across all of them — the whole reason to add more than one.
 		nordWGInit := 0
-		for _, tok := range cfg.NordVPNTokens {
-			nordWG, err := webview2bridge.NewNordVPNWireGuardProvider(tok)
+		for _, a := range nordAccounts {
+			nordWG, err := webview2bridge.NewNordVPNWireGuardProvider(a.Secret)
 			if err != nil {
-				log.Printf("NordVPN WireGuard provider init failed for token %s...: %v", safePrefix(tok, 8), err)
+				log.Printf("NordVPN WireGuard provider init failed for %s...: %v", safePrefix(a.Secret, 8), err)
 				continue
 			}
 			for i := 0; i < nordWGWeight; i++ {
@@ -163,35 +183,55 @@ func main() {
 			log.Printf("NordVPN WireGuard proxy source active: %d account(s), %d concurrent slot(s) total (weight %d each, opt-in, heavier per-lease — see doc comment)", nordWGInit, nordWGInit, nordWGWeight)
 		}
 	}
-	if cfg.PIAUsername != "" && cfg.PIAPassword != "" && cfg.PIAWireGuard {
-		piaWG, err := webview2bridge.NewPIAWireGuardProvider(cfg.PIAUsername, cfg.PIAPassword)
-		if err != nil {
-			log.Fatalf("PIA WireGuard provider init failed: %v", err)
+	if len(piaAccounts) > 0 && cfg.PIAWireGuard {
+		piaInit := 0
+		for _, a := range piaAccounts {
+			piaWG, err := webview2bridge.NewPIAWireGuardProvider(a.Username, a.Secret)
+			if err != nil {
+				log.Printf("PIA WireGuard provider init failed for %s, skipping: %v", a.Username, err)
+				continue
+			}
+			for i := 0; i < piaWGWeight; i++ {
+				vpnProviders = append(vpnProviders, piaWG)
+			}
+			piaInit++
 		}
-		for i := 0; i < piaWGWeight; i++ {
-			vpnProviders = append(vpnProviders, piaWG)
+		if piaInit > 0 {
+			log.Printf("PIA WireGuard proxy source active: %d account(s) (weight %d each, opt-in, heavier per-lease — see doc comment)", piaInit, piaWGWeight)
 		}
-		log.Printf("PIA WireGuard proxy source active (weight %d, opt-in, heavier per-lease — see doc comment)", piaWGWeight)
 	}
-	if cfg.SurfsharkKey != "" {
-		surfshark, err := webview2bridge.NewSurfsharkWireGuardProvider(cfg.SurfsharkKey)
-		if err != nil {
-			log.Fatalf("Surfshark provider init failed: %v", err)
+	if len(surfsharkAccounts) > 0 {
+		sfInit := 0
+		for _, a := range surfsharkAccounts {
+			surfshark, err := webview2bridge.NewSurfsharkWireGuardProvider(a.Secret)
+			if err != nil {
+				log.Printf("Surfshark provider init failed, skipping: %v", err)
+				continue
+			}
+			for i := 0; i < surfsharkWeight; i++ {
+				vpnProviders = append(vpnProviders, surfshark)
+			}
+			sfInit++
 		}
-		for i := 0; i < surfsharkWeight; i++ {
-			vpnProviders = append(vpnProviders, surfshark)
+		if sfInit > 0 {
+			log.Printf("Surfshark WireGuard proxy source active: %d account(s) (weight %d each)", sfInit, surfsharkWeight)
 		}
-		log.Printf("Surfshark WireGuard proxy source active (weight %d)", surfsharkWeight)
 	}
-	if cfg.ProtonUsername != "" && cfg.ProtonPassword != "" && cfg.ProtonWireGuard {
-		protonWG, err := webview2bridge.NewProtonVPNWireGuardProvider(cfg.ProtonUsername, cfg.ProtonPassword)
-		if err != nil {
-			log.Printf("ProtonVPN WireGuard provider init failed: %v", err)
-		} else {
+	if len(protonAccounts) > 0 && cfg.ProtonWireGuard {
+		protonInit := 0
+		for _, a := range protonAccounts {
+			protonWG, err := webview2bridge.NewProtonVPNWireGuardProvider(a.Username, a.Secret)
+			if err != nil {
+				log.Printf("ProtonVPN WireGuard provider init failed for %s, skipping: %v", a.Username, err)
+				continue
+			}
 			for i := 0; i < protonWGWeight; i++ {
 				vpnProviders = append(vpnProviders, protonWG)
 			}
-			log.Printf("ProtonVPN WireGuard proxy source active (weight %d, opt-in, unmeasured under concurrency — see doc comment)", protonWGWeight)
+			protonInit++
+		}
+		if protonInit > 0 {
+			log.Printf("ProtonVPN WireGuard proxy source active: %d account(s) (weight %d each, 30/30 confirmed under concurrency after EntryIP-dedup fix — see doc comment)", protonInit, protonWGWeight)
 		}
 	}
 	// Combined round-robin when more than one VPN source is configured —
