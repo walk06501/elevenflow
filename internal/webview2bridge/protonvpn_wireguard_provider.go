@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/netip"
@@ -398,19 +399,34 @@ func (p *ProtonVPNWireGuardProvider) refreshServers() error {
 		return fmt.Errorf("HTTP %d", status)
 	}
 
+	// Dedup by EntryIP: Proton's API lists many "logical" server names
+	// (e.g. SK#1..SK#8) that resolve to the SAME physical EntryIP within a
+	// PoP. Keeping every logical name as a separate round-robin candidate
+	// made 30-concurrent runs pile several goroutines onto one physical IP
+	// within the same handshake window — confirmed live (2026-08-05): e.g.
+	// SK#1,2,3,5,6,7,8 all failed "no handshake within 3s" in the same
+	// round while SK#4 (same EntryIP) succeeded a few seconds later, same
+	// pattern repeated for GR#1..8, LV#1..8, NL#85..96, NZ#13..20,
+	// TW#13..20. One physical endpoint can only field so many brand-new
+	// handshakes from this single client key at once — spreading
+	// first-attempts across distinct physical IPs (instead of wasting
+	// several of the 6 retry slots hammering the same IP) is the fix, the
+	// same lesson as NordVPN's public-key pooling.
+	seenIP := make(map[string]bool)
 	var servers []protonServer
 	for _, logical := range resp.LogicalServers {
 		if logical.Status != 1 || logical.Features&protonFeatureSecureCore != 0 {
 			continue
 		}
 		for _, s := range logical.Servers {
-			if s.Status != 1 || s.EntryIP == "" || s.X25519PublicKey == "" {
+			if s.Status != 1 || s.EntryIP == "" || s.X25519PublicKey == "" || seenIP[s.EntryIP] {
 				continue
 			}
 			pubHex, err := wgKeyToHex(s.X25519PublicKey)
 			if err != nil {
 				continue
 			}
+			seenIP[s.EntryIP] = true
 			servers = append(servers, protonServer{name: logical.Name, entryIP: s.EntryIP, pubHex: pubHex})
 		}
 	}
@@ -523,11 +539,14 @@ func (p *ProtonVPNWireGuardProvider) acquireLease() (Lease, error) {
 		if err != nil {
 			return Lease{}, err
 		}
+		t0 := time.Now()
 		t, err := p.tryOne(s)
 		if err != nil {
+			log.Printf("[proton] attempt %d FAIL %s (%s): %v (%.1fs)", attempt, s.name, s.entryIP, err, time.Since(t0).Seconds())
 			lastErr = fmt.Errorf("%s: %w", s.name, err)
 			continue
 		}
+		log.Printf("[proton] attempt %d OK %s (%s) (%.1fs)", attempt, s.name, s.entryIP, time.Since(t0).Seconds())
 		p.mu.Lock()
 		p.genCtr++
 		gen := p.genCtr
