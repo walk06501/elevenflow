@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -95,6 +97,66 @@ type mullvadServer struct {
 	pubHex   string
 }
 
+// mullvadKeysPath: a cwd-relative path (NOT %LOCALAPPDATA%/os.UserConfigDir())
+// deliberately — this server runs both as a SYSTEM-context Scheduled Task in
+// production and as a plain interactive process during manual debugging
+// (both launch with WorkingDirectory/cwd pinned to the install dir, e.g.
+// C:\elevenflow — see setup-eleven-vps.ps1), and those two contexts resolve
+// %LOCALAPPDATA% to two DIFFERENT paths. A per-user path here would mean a
+// manual debug run can never see keys a Scheduled Task run persisted (or
+// vice versa) and would just re-register a fresh batch every time — the
+// exact bug this file exists to fix. One file per account number, since the
+// portal can configure more than one Mullvad account.
+func mullvadKeysPath(account string) string {
+	return filepath.Join(".", fmt.Sprintf("mullvad_keys_%s.json", account))
+}
+
+type mullvadPersistedKey struct {
+	PrivHex    string `json:"priv_hex"`
+	AssignedV4 string `json:"assigned_v4"`
+}
+
+// loadMullvadKeys reads a previously-saved key set. A missing file (first
+// run ever for this account) is not an error — returns nil, nil so the
+// caller registers a fresh batch exactly like before this fix existed.
+func loadMullvadKeys(account string) ([]mullvadKey, error) {
+	data, err := os.ReadFile(mullvadKeysPath(account))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var saved []mullvadPersistedKey
+	if err := json.Unmarshal(data, &saved); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", mullvadKeysPath(account), err)
+	}
+	keys := make([]mullvadKey, 0, len(saved))
+	for _, s := range saved {
+		if s.PrivHex == "" || s.AssignedV4 == "" {
+			continue
+		}
+		keys = append(keys, mullvadKey{privHex: s.PrivHex, assignedV4: s.AssignedV4})
+	}
+	return keys, nil
+}
+
+// saveMullvadKeys persists the full current key set, overwriting whatever
+// was there before — called once after NewMullvadWireGuardProvider settles
+// on its final key list (loaded + any newly registered), so the NEXT
+// restart reuses every key this run has rather than only the newest batch.
+func saveMullvadKeys(account string, keys []mullvadKey) error {
+	saved := make([]mullvadPersistedKey, len(keys))
+	for i, k := range keys {
+		saved[i] = mullvadPersistedKey{PrivHex: k.privHex, AssignedV4: k.assignedV4}
+	}
+	data, err := json.MarshalIndent(saved, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(mullvadKeysPath(account), data, 0o600)
+}
+
 const (
 	mullvadAPIBase = "https://api.mullvad.net"
 	mullvadDNS     = "10.64.0.1" // wireguard.ipv4_gateway from /app/v1/relays, stable Mullvad-side constant
@@ -102,12 +164,21 @@ const (
 	mullvadMaxKeys = 5 // Mullvad's own hard per-account device cap
 )
 
-// NewMullvadWireGuardProvider registers up to mullvadMaxKeys fresh WireGuard
-// keys against accountNumber and fetches the relay list. Returns an error
-// only if EVERY key registration fails or the relay list can't be fetched —
-// registering fewer than mullvadMaxKeys keys (e.g. the account already has
-// some devices registered from another client) is not fatal, it just caps
-// this provider's own concurrency lower than 5 (see checkoutKey).
+// NewMullvadWireGuardProvider loads any WireGuard keys this account already
+// has saved locally (mullvadKeysPath) and reuses them as-is — NO API call at
+// all for keys already on disk, since they're already registered on
+// Mullvad's side from a previous run. Only tops up with freshly-registered
+// keys if the saved set has fewer than mullvadMaxKeys (first-ever run, or
+// an account that started with some slots already free). This is the fix
+// for a real bug found 2026-08-06: the original version generated and
+// registered mullvadMaxKeys BRAND NEW keys on every single process restart
+// with no persistence at all, silently orphaning the previous run's keys —
+// each one still occupying a device slot on Mullvad's side with its private
+// key gone forever — and burning through the account's hard 5-device cap
+// within 3-4 restarts (confirmed live: 3 manual restarts in one evening
+// left 4 of 5 slots permanently consumed by keys nothing could ever use
+// again). Returns an error only if there are no usable keys at all AFTER
+// both loading and topping up.
 func NewMullvadWireGuardProvider(accountNumber string) (*MullvadWireGuardProvider, error) {
 	p := &MullvadWireGuardProvider{
 		httpClient: &http.Client{Timeout: 20 * time.Second},
@@ -116,25 +187,45 @@ func NewMullvadWireGuardProvider(accountNumber string) (*MullvadWireGuardProvide
 		liveKey:    map[int64]int{},
 	}
 
+	loaded, err := loadMullvadKeys(accountNumber)
+	if err != nil {
+		log.Printf("[mullvad] could not read saved keys (%v), registering fresh instead", err)
+	} else if len(loaded) > 0 {
+		p.keys = append(p.keys, loaded...)
+		log.Printf("[mullvad] reusing %d previously-registered key(s) from %s", len(loaded), mullvadKeysPath(accountNumber))
+	}
+
 	var lastKeyErr error
-	for i := 0; i < mullvadMaxKeys; i++ {
+	registeredNew := 0
+	for len(p.keys) < mullvadMaxKeys {
 		k, err := p.registerNewKey()
 		if err != nil {
 			lastKeyErr = err
-			log.Printf("[mullvad] key %d/%d registration failed: %v", i+1, mullvadMaxKeys, err)
-			continue
+			log.Printf("[mullvad] key %d/%d registration failed: %v", len(p.keys)+1, mullvadMaxKeys, err)
+			break // a failed registration this run won't succeed on the next attempt either (throttle/cap) — stop, don't waste more requests
 		}
 		p.keys = append(p.keys, k)
+		registeredNew++
 	}
 	if len(p.keys) == 0 {
-		return nil, fmt.Errorf("mullvad: could not register any WireGuard key (last error: %w)", lastKeyErr)
+		return nil, fmt.Errorf("mullvad: no usable WireGuard key (last registration error: %w)", lastKeyErr)
+	}
+	if registeredNew > 0 {
+		if err := saveMullvadKeys(accountNumber, p.keys); err != nil {
+			// Not fatal — the newly registered keys still work for THIS run,
+			// just won't survive to the next restart. Logged loudly since
+			// silently reverting to the old bug's behavior is exactly the
+			// failure mode this fix exists to prevent.
+			log.Printf("[mullvad] WARNING: could not save keys to %s (%v) — next restart will register fresh keys again and may hit the device cap", mullvadKeysPath(accountNumber), err)
+		}
 	}
 
 	if err := p.refreshServers(); err != nil {
 		return nil, fmt.Errorf("mullvad server list: %w", err)
 	}
 
-	log.Printf("[mullvad] %d/%d key(s) registered, %d relay(s) loaded", len(p.keys), mullvadMaxKeys, len(p.servers))
+	log.Printf("[mullvad] %d/%d key(s) ready (%d reused, %d newly registered), %d relay(s) loaded",
+		len(p.keys), mullvadMaxKeys, len(p.keys)-registeredNew, registeredNew, len(p.servers))
 	return p, nil
 }
 
