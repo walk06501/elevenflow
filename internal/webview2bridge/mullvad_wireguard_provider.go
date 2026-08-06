@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,9 +28,15 @@ import (
 // trip before trusting a tunnel" shape as the other WireGuard providers,
 // but a genuinely different provisioning model from all four of them —
 // confirmed by reading Mullvad's own official github.com/mullvad/mullvad-wg.sh
-// and by a real end-to-end test against a real account (2026-08-06:
-// POST /wg -> HTTP 201, real IP assigned; tunnel to nl-ams-wg-001 completed
-// a real handshake and a real HTTP round trip through it):
+// and github.com/mullvad/wg-tools, and by real end-to-end tests against a
+// real account (2026-08-06: registration via POST /accounts/v1/devices ->
+// HTTP 201, real IP assigned; tunnel to nl-ams-wg-001 completed a real
+// handshake and a real HTTP round trip through it). Registration uses
+// /accounts/v1/devices (JSON + Bearer token, see registerNewKey/
+// fetchAuthToken) rather than the older POST /wg (form-encoded, no auth)
+// mullvad-wg.sh uses — confirmed live the two are throttled independently
+// of each other, and /accounts/v1/devices is what Mullvad's own current
+// tooling (wg-tools) uses:
 //
 //  1. Auth is a bare account NUMBER, no username/password/2FA/SRP.
 //  2. The account is capped at 5 REGISTERED WireGuard public keys total
@@ -197,15 +202,22 @@ func NewMullvadWireGuardProvider(accountNumber string) (*MullvadWireGuardProvide
 
 	var lastKeyErr error
 	registeredNew := 0
-	for len(p.keys) < mullvadMaxKeys {
-		k, err := p.registerNewKey()
-		if err != nil {
-			lastKeyErr = err
-			log.Printf("[mullvad] key %d/%d registration failed: %v", len(p.keys)+1, mullvadMaxKeys, err)
-			break // a failed registration this run won't succeed on the next attempt either (throttle/cap) — stop, don't waste more requests
+	if len(p.keys) < mullvadMaxKeys {
+		token, tokenErr := p.fetchAuthToken()
+		if tokenErr != nil {
+			lastKeyErr = tokenErr
+			log.Printf("[mullvad] could not get an auth token, skipping registration this run: %v", tokenErr)
 		}
-		p.keys = append(p.keys, k)
-		registeredNew++
+		for token != "" && len(p.keys) < mullvadMaxKeys {
+			k, err := p.registerNewKey(token)
+			if err != nil {
+				lastKeyErr = err
+				log.Printf("[mullvad] key %d/%d registration failed: %v", len(p.keys)+1, mullvadMaxKeys, err)
+				break // a failed registration this run won't succeed on the next attempt either (throttle/cap) — stop, don't waste more requests
+			}
+			p.keys = append(p.keys, k)
+			registeredNew++
+		}
 	}
 	if len(p.keys) == 0 {
 		return nil, fmt.Errorf("mullvad: no usable WireGuard key (last registration error: %w)", lastKeyErr)
@@ -253,20 +265,65 @@ func (p *MullvadWireGuardProvider) Close() {
 	}
 }
 
-// ── Key registration (POST /wg) ───────────────────────────────────────────
+// ── Key registration (POST /accounts/v1/devices) ──────────────────────────
+//
+// Uses the same JSON + Bearer-token API github.com/mullvad/wg-tools (the
+// official CLI tool) and this provider's own key list-and-delete calls
+// (mullvadListDevices/deleting orphaned devices, done by hand 2026-08-06)
+// already use — NOT the older POST /wg (form-encoded, no auth) that
+// github.com/mullvad/mullvad-wg.sh uses and this file originally copied.
+// Switched after confirming live that the two endpoints are throttled
+// independently: /wg was mid-throttle ("Request was throttled... 3600
+// seconds") while /accounts/v1/devices accepted a real registration in the
+// same minute (HTTP 201). No functional difference otherwise — same 5
+// devices, same key material, same account.
+
+type mullvadAuthTokenResp struct {
+	AccessToken string `json:"access_token"`
+}
+
+// fetchAuthToken exchanges the account number for a short-lived (~24h)
+// Bearer token, needed for POST /accounts/v1/devices. Fetched once per
+// NewMullvadWireGuardProvider call (not once per key) — registering up to 5
+// keys shares one token rather than making 5 separate auth round trips.
+func (p *MullvadWireGuardProvider) fetchAuthToken() (string, error) {
+	body, err := json.Marshal(map[string]string{"account_number": p.account})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequest(http.MethodPost, mullvadAPIBase+"/auth/v1/token", strings.NewReader(string(body)))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(respBody), 200))
+	}
+	var parsed mullvadAuthTokenResp
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return "", fmt.Errorf("parse auth token response: %w", err)
+	}
+	if parsed.AccessToken == "" {
+		return "", fmt.Errorf("empty access_token in response: %s", truncate(string(respBody), 200))
+	}
+	return parsed.AccessToken, nil
+}
+
+type mullvadDeviceResp struct {
+	IPv4Address string `json:"ipv4_address"` // e.g. "10.71.231.179/32"
+}
 
 // registerNewKey generates a fresh X25519 keypair locally and registers its
-// public key against the account via POST /wg. Response body on success is
-// literally "<ipv4>/32,<ipv6>/128" (plain text, not JSON) — confirmed live
-// 2026-08-06 ("10.71.231.179/32,fc00:bbbb:bbbb:bb01::8:e7b2/128").
-//
-// account and pubkey MUST go through --data-urlencode equivalent (url.Values
-// here does this automatically): the base64 pubkey routinely contains '+',
-// which application/x-www-form-urlencoded silently reinterprets as a space
-// if sent raw — confirmed live the hard way (first attempt: HTTP 400
-// "Invalid public key" with a correctly-generated key, second attempt with
-// proper encoding: HTTP 201).
-func (p *MullvadWireGuardProvider) registerNewKey() (mullvadKey, error) {
+// public key against the account via POST /accounts/v1/devices, using the
+// Bearer token fetchAuthToken already obtained for this whole batch.
+func (p *MullvadWireGuardProvider) registerNewKey(authToken string) (mullvadKey, error) {
 	var priv [32]byte
 	if _, err := rand.Read(priv[:]); err != nil {
 		return mullvadKey{}, fmt.Errorf("generate key: %w", err)
@@ -280,15 +337,16 @@ func (p *MullvadWireGuardProvider) registerNewKey() (mullvadKey, error) {
 	}
 	pubB64 := base64.StdEncoding.EncodeToString(pub)
 
-	form := url.Values{}
-	form.Set("account", p.account)
-	form.Set("pubkey", pubB64)
-
-	req, err := http.NewRequest(http.MethodPost, mullvadAPIBase+"/wg", strings.NewReader(form.Encode()))
+	reqBody, err := json.Marshal(map[string]any{"pubkey": pubB64, "hijack_dns": false})
 	if err != nil {
 		return mullvadKey{}, err
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req, err := http.NewRequest(http.MethodPost, mullvadAPIBase+"/accounts/v1/devices", strings.NewReader(string(reqBody)))
+	if err != nil {
+		return mullvadKey{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+authToken)
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
@@ -300,12 +358,13 @@ func (p *MullvadWireGuardProvider) registerNewKey() (mullvadKey, error) {
 		return mullvadKey{}, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(body), 200))
 	}
 
-	// "<ipv4>/32,<ipv6>/128" — only the IPv4 half is used (matches the other
-	// three WireGuard providers here, which are all IPv4-only tunnels).
-	v4Part := strings.SplitN(string(body), ",", 2)[0]
-	v4 := strings.SplitN(v4Part, "/", 2)[0]
+	var parsed mullvadDeviceResp
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return mullvadKey{}, fmt.Errorf("parse device response: %w: %s", err, truncate(string(body), 200))
+	}
+	v4 := strings.SplitN(parsed.IPv4Address, "/", 2)[0]
 	if net.ParseIP(v4) == nil {
-		return mullvadKey{}, fmt.Errorf("unexpected /wg response, no parseable IPv4: %s", truncate(string(body), 200))
+		return mullvadKey{}, fmt.Errorf("unexpected device response, no parseable IPv4: %s", truncate(string(body), 200))
 	}
 
 	return mullvadKey{privHex: hex.EncodeToString(priv[:]), assignedV4: v4}, nil
