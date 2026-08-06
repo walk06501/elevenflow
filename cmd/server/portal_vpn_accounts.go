@@ -109,6 +109,11 @@ func envVPNAccounts(cfg *Config) map[string][]portalVPNAccount {
 			Provider: "proton", Label: "proton (.env)", Username: cfg.ProtonUsername, Secret: cfg.ProtonPassword,
 		})
 	}
+	if cfg.MullvadAccountNumber != "" {
+		grouped["mullvad"] = append(grouped["mullvad"], portalVPNAccount{
+			Provider: "mullvad", Label: "mullvad (.env)", Secret: cfg.MullvadAccountNumber,
+		})
+	}
 	return grouped
 }
 

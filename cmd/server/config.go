@@ -52,6 +52,13 @@ type Config struct {
 	ProtonUsername   string // ELEVEN_PROTON_USERNAME: ProtonVPN account username (2FA must be OFF — no interactive prompt in a server process)
 	ProtonPassword   string // ELEVEN_PROTON_PASSWORD: ProtonVPN account password
 	ProtonWireGuard  bool   // ELEVEN_PROTON_WIREGUARD: also add the WireGuard-tunnel-based ProtonVPN source (opt-in, unmeasured under concurrency — see ProtonVPNWireGuardProvider's doc comment)
+	// MullvadAccountNumber: bare account number (no username/password/2FA —
+	// see MullvadWireGuardProvider's doc comment). Only 1 account supported
+	// via .env fallback (unlike NordVPNTokens' comma-list) since this whole
+	// field is seed/fallback-only — real multi-account Mullvad management is
+	// the portal's VPN (ElevenFlow) tab, same as every other provider above.
+	MullvadAccountNumber string // ELEVEN_MULLVAD_ACCOUNT
+	MullvadWireGuard      bool   // ELEVEN_MULLVAD_WIREGUARD: also add the Mullvad WireGuard source (opt-in, same reasoning as ProtonWireGuard — see MullvadWireGuardProvider's doc comment)
 
 	// UsePersistentPool switches HandleSynthesize from the old per-request
 	// spawn-then-teardown Run() to webview2bridge.SessionPool — a fixed set
@@ -119,6 +126,8 @@ func LoadConfig() *Config {
 		ProtonUsername:   getEnv("ELEVEN_PROTON_USERNAME", ""),
 		ProtonPassword:   getEnv("ELEVEN_PROTON_PASSWORD", ""),
 		ProtonWireGuard:  getEnv("ELEVEN_PROTON_WIREGUARD", "") == "true",
+		MullvadAccountNumber: getEnv("ELEVEN_MULLVAD_ACCOUNT", ""),
+		MullvadWireGuard:     getEnv("ELEVEN_MULLVAD_WIREGUARD", "") == "true",
 
 		UsePersistentPool:              getEnv("ELEVEN_PERSISTENT_POOL", "") == "true",
 		PersistentPoolSessions:         getEnvInt("ELEVEN_PERSISTENT_POOL_SESSIONS", 0),

@@ -1,0 +1,450 @@
+package webview2bridge
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/netip"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/crypto/curve25519"
+	"golang.zx2c4.com/wireguard/conn"
+	"golang.zx2c4.com/wireguard/device"
+	"golang.zx2c4.com/wireguard/tun/netstack"
+)
+
+// MullvadWireGuardProvider: same "verify real handshake + real HTTP round
+// trip before trusting a tunnel" shape as the other WireGuard providers,
+// but a genuinely different provisioning model from all four of them —
+// confirmed by reading Mullvad's own official github.com/mullvad/mullvad-wg.sh
+// and by a real end-to-end test against a real account (2026-08-06:
+// POST /wg -> HTTP 201, real IP assigned; tunnel to nl-ams-wg-001 completed
+// a real handshake and a real HTTP round trip through it):
+//
+//  1. Auth is a bare account NUMBER, no username/password/2FA/SRP.
+//  2. The account is capped at 5 REGISTERED WireGuard public keys total
+//     (Mullvad's own hard limit, confirmed via web search — registering a
+//     6th is expected to fail). Unlike Proton/Surfshark's "one key, many
+//     servers, unlimited concurrent data paths" model, Mullvad additionally
+//     will NOT let the SAME key carry two simultaneous sessions: WireGuard
+//     servers key their peer table by public key, so two concurrent
+//     endpoints presenting the same key stomp on each other's table entry
+//     (confirmed via web search, matches WireGuard's own documented
+//     behavior, not Mullvad-specific). So: register up to mullvadMaxKeys
+//     keys ONCE at startup (persisted for the provider's lifetime, not
+//     regenerated per lease), and treat "a free key" as the hard
+//     concurrency resource — same fail-fast-when-exhausted reasoning as
+//     NordVPNWireGuardProvider's slots channel (see that file's doc
+//     comment), implemented here as a linear scan over keys[].inUse instead
+//     of a channel since the resource being limited (a specific pre-
+//     registered key) needs to be handed back to the SAME caller's release,
+//     not just counted. Capacity is whatever registration actually
+//     succeeded (<= 5), since a re-run against an account that already has
+//     some devices registered elsewhere may get fewer.
+//  3. Server list: GET /app/v1/relays (public, no auth) — same
+//     one-endpoint-picked-per-lease model as the other three, round-robin
+//     across every "active" relay.
+//
+// NOT YET MEASURED: whether Mullvad's own infra tolerates the same kind of
+// concurrent-handshake-storm NordVPN's did not (see that file's
+// probeRound) — this provider intentionally does NOT fan out multiple
+// simultaneous probe attempts per acquire, both because the 5-key cap
+// makes "burn several keys probing at once" expensive (each probe attempt
+// occupies a whole key-slot for its duration) and because no community
+// project reviewed while building this one ever tries concurrent handshakes
+// against the same account. Revisit with cmd/testconcurrency if real
+// traffic shows this provider timing out under load the other three do not.
+type MullvadWireGuardProvider struct {
+	httpClient *http.Client
+	account    string
+
+	mu      sync.Mutex
+	keys    []mullvadKey
+	servers []mullvadServer
+	nextIdx int
+	genCtr  int64
+	live    map[int64]*wgTunnel
+
+	// liveKey: which key index (into p.keys) backs each live lease
+	// generation, so closeLease can free the exact key it checked out —
+	// separate lock from mu purely so a slow tunnel teardown never blocks
+	// nextServer()/checkoutKey() for unrelated in-flight acquires.
+	liveKeyMu sync.Mutex
+	liveKey   map[int64]int
+}
+
+type mullvadKey struct {
+	privHex   string
+	assignedV4 string // e.g. "10.71.231.179" (no /32 — embedded directly in the tunnel's own address)
+	inUse     bool
+}
+
+type mullvadServer struct {
+	hostname string
+	entryIP  string
+	pubHex   string
+}
+
+const (
+	mullvadAPIBase = "https://api.mullvad.net"
+	mullvadDNS     = "10.64.0.1" // wireguard.ipv4_gateway from /app/v1/relays, stable Mullvad-side constant
+	mullvadPort    = "51820"
+	mullvadMaxKeys = 5 // Mullvad's own hard per-account device cap
+)
+
+// NewMullvadWireGuardProvider registers up to mullvadMaxKeys fresh WireGuard
+// keys against accountNumber and fetches the relay list. Returns an error
+// only if EVERY key registration fails or the relay list can't be fetched —
+// registering fewer than mullvadMaxKeys keys (e.g. the account already has
+// some devices registered from another client) is not fatal, it just caps
+// this provider's own concurrency lower than 5 (see checkoutKey).
+func NewMullvadWireGuardProvider(accountNumber string) (*MullvadWireGuardProvider, error) {
+	p := &MullvadWireGuardProvider{
+		httpClient: &http.Client{Timeout: 20 * time.Second},
+		account:    accountNumber,
+		live:       map[int64]*wgTunnel{},
+		liveKey:    map[int64]int{},
+	}
+
+	var lastKeyErr error
+	for i := 0; i < mullvadMaxKeys; i++ {
+		k, err := p.registerNewKey()
+		if err != nil {
+			lastKeyErr = err
+			log.Printf("[mullvad] key %d/%d registration failed: %v", i+1, mullvadMaxKeys, err)
+			continue
+		}
+		p.keys = append(p.keys, k)
+	}
+	if len(p.keys) == 0 {
+		return nil, fmt.Errorf("mullvad: could not register any WireGuard key (last error: %w)", lastKeyErr)
+	}
+
+	if err := p.refreshServers(); err != nil {
+		return nil, fmt.Errorf("mullvad server list: %w", err)
+	}
+
+	log.Printf("[mullvad] %d/%d key(s) registered, %d relay(s) loaded", len(p.keys), mullvadMaxKeys, len(p.servers))
+	return p, nil
+}
+
+// KeyCount returns how many WireGuard keys were actually registered
+// (<= mullvadMaxKeys — see NewMullvadWireGuardProvider doc comment on why
+// this can be fewer than 5). This is the provider's real concurrency
+// ceiling, so callers (main.go) use it as the round-robin weight instead of
+// a fixed per-provider constant like the other four providers use, since
+// unlike them Mullvad's usable concurrency isn't a flat number picked from
+// measurement — it's whatever registration actually succeeded.
+func (p *MullvadWireGuardProvider) KeyCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.keys)
+}
+
+func (p *MullvadWireGuardProvider) Close() {
+	p.mu.Lock()
+	live := p.live
+	p.live = map[int64]*wgTunnel{}
+	p.mu.Unlock()
+	for _, t := range live {
+		t.socks.Close()
+		t.dev.Close()
+	}
+}
+
+// ── Key registration (POST /wg) ───────────────────────────────────────────
+
+// registerNewKey generates a fresh X25519 keypair locally and registers its
+// public key against the account via POST /wg. Response body on success is
+// literally "<ipv4>/32,<ipv6>/128" (plain text, not JSON) — confirmed live
+// 2026-08-06 ("10.71.231.179/32,fc00:bbbb:bbbb:bb01::8:e7b2/128").
+//
+// account and pubkey MUST go through --data-urlencode equivalent (url.Values
+// here does this automatically): the base64 pubkey routinely contains '+',
+// which application/x-www-form-urlencoded silently reinterprets as a space
+// if sent raw — confirmed live the hard way (first attempt: HTTP 400
+// "Invalid public key" with a correctly-generated key, second attempt with
+// proper encoding: HTTP 201).
+func (p *MullvadWireGuardProvider) registerNewKey() (mullvadKey, error) {
+	var priv [32]byte
+	if _, err := rand.Read(priv[:]); err != nil {
+		return mullvadKey{}, fmt.Errorf("generate key: %w", err)
+	}
+	priv[0] &= 248
+	priv[31] &= 127
+	priv[31] |= 64
+	pub, err := curve25519.X25519(priv[:], curve25519.Basepoint)
+	if err != nil {
+		return mullvadKey{}, fmt.Errorf("derive pubkey: %w", err)
+	}
+	pubB64 := base64.StdEncoding.EncodeToString(pub)
+
+	form := url.Values{}
+	form.Set("account", p.account)
+	form.Set("pubkey", pubB64)
+
+	req, err := http.NewRequest(http.MethodPost, mullvadAPIBase+"/wg", strings.NewReader(form.Encode()))
+	if err != nil {
+		return mullvadKey{}, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return mullvadKey{}, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusCreated {
+		return mullvadKey{}, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(body), 200))
+	}
+
+	// "<ipv4>/32,<ipv6>/128" — only the IPv4 half is used (matches the other
+	// three WireGuard providers here, which are all IPv4-only tunnels).
+	v4Part := strings.SplitN(string(body), ",", 2)[0]
+	v4 := strings.SplitN(v4Part, "/", 2)[0]
+	if net.ParseIP(v4) == nil {
+		return mullvadKey{}, fmt.Errorf("unexpected /wg response, no parseable IPv4: %s", truncate(string(body), 200))
+	}
+
+	return mullvadKey{privHex: hex.EncodeToString(priv[:]), assignedV4: v4}, nil
+}
+
+// ── Server list (GET /app/v1/relays, public) ──────────────────────────────
+
+type mullvadRelaysResp struct {
+	Wireguard struct {
+		Relays []struct {
+			Hostname  string `json:"hostname"`
+			Active    bool   `json:"active"`
+			IPv4AddrIn string `json:"ipv4_addr_in"`
+			PublicKey string `json:"public_key"`
+		} `json:"relays"`
+	} `json:"wireguard"`
+}
+
+func (p *MullvadWireGuardProvider) refreshServers() error {
+	resp, err := p.httpClient.Get(mullvadAPIBase + "/app/v1/relays")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	var data mullvadRelaysResp
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return fmt.Errorf("decode relays: %w", err)
+	}
+
+	var servers []mullvadServer
+	for _, r := range data.Wireguard.Relays {
+		if !r.Active || r.IPv4AddrIn == "" || r.PublicKey == "" {
+			continue
+		}
+		pubHex, err := wgKeyToHex(r.PublicKey)
+		if err != nil {
+			continue
+		}
+		servers = append(servers, mullvadServer{hostname: r.Hostname, entryIP: r.IPv4AddrIn, pubHex: pubHex})
+	}
+	if len(servers) == 0 {
+		return fmt.Errorf("no active relays in /app/v1/relays response")
+	}
+
+	p.mu.Lock()
+	p.servers = servers
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *MullvadWireGuardProvider) nextServer() (mullvadServer, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.servers) == 0 {
+		return mullvadServer{}, fmt.Errorf("no Mullvad relays loaded")
+	}
+	s := p.servers[p.nextIdx%len(p.servers)]
+	p.nextIdx++
+	return s, nil
+}
+
+// checkoutKey claims a free key from the pool (fails if every key is
+// already checked out by a live tunnel — see slots). Returns the key's
+// INDEX (stable, into p.keys) so releaseKey can free the exact same one.
+func (p *MullvadWireGuardProvider) checkoutKey() (idx int, k mullvadKey, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range p.keys {
+		if !p.keys[i].inUse {
+			p.keys[i].inUse = true
+			return i, p.keys[i], nil
+		}
+	}
+	return -1, mullvadKey{}, fmt.Errorf("no free Mullvad key")
+}
+
+func (p *MullvadWireGuardProvider) releaseKey(idx int) {
+	if idx < 0 {
+		return
+	}
+	p.mu.Lock()
+	if idx < len(p.keys) {
+		p.keys[idx].inUse = false
+	}
+	p.mu.Unlock()
+}
+
+// ── Tunnel (mirrors ProtonVPNWireGuardProvider.tryOne — real handshake,
+// then one real HTTP round trip, since a completed handshake alone is not
+// proof the data path actually carries traffic) ───────────────────────────
+
+func (p *MullvadWireGuardProvider) tryOne(k mullvadKey, s mullvadServer) (*wgTunnel, error) {
+	tun, tnet, err := netstack.CreateNetTUN(
+		[]netip.Addr{netip.MustParseAddr(k.assignedV4)},
+		[]netip.Addr{netip.MustParseAddr(mullvadDNS)},
+		1420,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create tun: %w", err)
+	}
+	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, ""))
+
+	ipc := fmt.Sprintf(
+		"private_key=%s\npublic_key=%s\nendpoint=%s:%s\nallowed_ip=0.0.0.0/0\npersistent_keepalive_interval=25\n",
+		k.privHex, s.pubHex, s.entryIP, mullvadPort,
+	)
+	if err := dev.IpcSet(ipc); err != nil {
+		dev.Close()
+		return nil, fmt.Errorf("ipc set: %w", err)
+	}
+	if err := dev.Up(); err != nil {
+		dev.Close()
+		return nil, fmt.Errorf("device up: %w", err)
+	}
+
+	handshakeOK := false
+	deadline := time.Now().Add(wgHandshakeTimeout)
+	for time.Now().Before(deadline) {
+		time.Sleep(200 * time.Millisecond)
+		info, err := dev.IpcGet()
+		if err == nil && strings.Contains(info, "last_handshake_time_sec=") && !strings.Contains(info, "last_handshake_time_sec=0\n") {
+			handshakeOK = true
+			break
+		}
+	}
+	if !handshakeOK {
+		dev.Close()
+		return nil, fmt.Errorf("no handshake within %s", wgHandshakeTimeout)
+	}
+
+	client := &http.Client{Transport: &http.Transport{DialContext: tnet.DialContext}, Timeout: wgProbeTimeout}
+	resp, err := client.Get("https://api.ipify.org?format=json")
+	if err != nil {
+		dev.Close()
+		return nil, fmt.Errorf("data path check failed: %w", err)
+	}
+	resp.Body.Close()
+
+	socksSrv, err := newLocalSOCKS5Server(func(network, addr string) (net.Conn, error) {
+		return tnet.DialContext(context.Background(), network, addr)
+	})
+	if err != nil {
+		dev.Close()
+		return nil, fmt.Errorf("local socks5 listener: %w", err)
+	}
+
+	return &wgTunnel{dev: dev, socks: socksSrv}, nil
+}
+
+func (p *MullvadWireGuardProvider) acquireLease() (Lease, error) {
+	idx, k, err := p.checkoutKey()
+	if err != nil {
+		// No free key: fail fast, same reasoning as NordVPNWireGuardProvider
+		// — let MultiVPNProvider try a different VPN source immediately
+		// rather than stall waiting for one of this account's 5 keys to
+		// free up.
+		return Lease{}, err
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < wgMaxAcquireAttempts; attempt++ {
+		s, err := p.nextServer()
+		if err != nil {
+			p.releaseKey(idx)
+			return Lease{}, err
+		}
+		t0 := time.Now()
+		t, err := p.tryOne(k, s)
+		if err != nil {
+			log.Printf("[mullvad] attempt %d FAIL %s (%s): %v (%.1fs)", attempt, s.hostname, s.entryIP, err, time.Since(t0).Seconds())
+			lastErr = err
+			continue
+		}
+		log.Printf("[mullvad] attempt %d OK %s (%s) (%.1fs)", attempt, s.hostname, s.entryIP, time.Since(t0).Seconds())
+		p.mu.Lock()
+		p.genCtr++
+		gen := p.genCtr
+		p.live[gen] = t
+		p.mu.Unlock()
+		p.liveKeyMu.Lock()
+		p.liveKey[gen] = idx
+		p.liveKeyMu.Unlock()
+		return Lease{URL: "socks5://" + t.socks.Addr(), AcquiredAt: time.Now(), Generation: gen}, nil
+	}
+	p.releaseKey(idx)
+	return Lease{}, fmt.Errorf("no working Mullvad server after %d attempts (last: %w)", wgMaxAcquireAttempts, lastErr)
+}
+
+func (p *MullvadWireGuardProvider) Acquire(ctx context.Context, workerID int, emit func(string)) (Lease, error) {
+	if emit != nil {
+		emit("Đang tìm server Mullvad khả dụng…")
+	}
+	return p.acquireLease()
+}
+
+func (p *MullvadWireGuardProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, emit func(string)) (Lease, error) {
+	p.closeLease(oldLease.Generation)
+	if emit != nil {
+		emit("Đang đổi sang server Mullvad khác…")
+	}
+	return p.acquireLease()
+}
+
+func (p *MullvadWireGuardProvider) Release(workerID int, lease Lease) {
+	p.closeLease(lease.Generation)
+}
+
+func (p *MullvadWireGuardProvider) closeLease(gen int64) {
+	p.mu.Lock()
+	t, ok := p.live[gen]
+	if ok {
+		delete(p.live, gen)
+	}
+	p.mu.Unlock()
+
+	p.liveKeyMu.Lock()
+	idx, hasKey := p.liveKey[gen]
+	if hasKey {
+		delete(p.liveKey, gen)
+	}
+	p.liveKeyMu.Unlock()
+
+	if ok {
+		t.socks.Close()
+		t.dev.Close()
+	}
+	if hasKey {
+		p.releaseKey(idx)
+	}
+}

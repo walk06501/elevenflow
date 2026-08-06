@@ -135,6 +135,7 @@ func main() {
 	piaAccounts := vpnAccounts["pia"]
 	surfsharkAccounts := vpnAccounts["surfshark"]
 	protonAccounts := vpnAccounts["proton"]
+	mullvadAccounts := vpnAccounts["mullvad"]
 
 	var vpnProviders []webview2bridge.ProxyProvider
 	if len(nordAccounts) > 0 {
@@ -232,6 +233,29 @@ func main() {
 		}
 		if protonInit > 0 {
 			log.Printf("ProtonVPN WireGuard proxy source active: %d account(s) (weight %d each, 30/30 confirmed under concurrency after EntryIP-dedup fix — see doc comment)", protonInit, protonWGWeight)
+		}
+	}
+	if len(mullvadAccounts) > 0 && cfg.MullvadWireGuard {
+		// No fixed mullvadWGWeight constant like the other four providers:
+		// Mullvad's real concurrency ceiling is however many of its 5
+		// account-wide key slots registration actually claimed (see
+		// MullvadWireGuardProvider.KeyCount doc comment), so each account's
+		// weight in the round-robin is read back from the provider itself
+		// after a successful init instead of being a number measured once
+		// and hardcoded.
+		mullvadInit := 0
+		for _, a := range mullvadAccounts {
+			mullvadWG, err := webview2bridge.NewMullvadWireGuardProvider(a.Secret)
+			if err != nil {
+				log.Printf("Mullvad WireGuard provider init failed, skipping: %v", err)
+				continue
+			}
+			weight := mullvadWG.KeyCount()
+			for i := 0; i < weight; i++ {
+				vpnProviders = append(vpnProviders, mullvadWG)
+			}
+			mullvadInit++
+			log.Printf("Mullvad WireGuard proxy source active: account #%d, %d concurrent key slot(s) (weight %d)", mullvadInit, weight, weight)
 		}
 	}
 	// Combined round-robin when more than one VPN source is configured —
