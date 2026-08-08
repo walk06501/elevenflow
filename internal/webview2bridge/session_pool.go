@@ -238,26 +238,44 @@ func (sp *SessionPool) Synthesize(ctx context.Context, jobID string, text string
 	results := make([]ChunkResult, len(chunks))
 	hit := make([]bool, len(chunks))
 	var toSubmit []Chunk
+
+	// QUAN TRỌNG: toàn bộ việc đọc jc.results phải nằm TRONG vùng khoá.
+	// Bug thật đã gặp production - bản trước chỉ khoá lúc lấy con trỏ jc rồi
+	// mở khoá ngay, sau đó đọc jc.results[...] không khoá bên dưới, trong khi
+	// nhánh ghi (cuối hàm) sửa CHÍNH map đó CÓ khoá. 2 request cùng jobID
+	// chạy chồng nhau (web-portal timeout phía client rồi gửi lại trong khi
+	// request cũ vẫn còn chạy ngầm - hoàn toàn có thể xảy ra) → Go crash cứng
+	// "fatal error: concurrent map read and map write", không recover được.
+	// Snapshot toàn bộ chunk cần dùng ra map cục bộ trong lúc khoá, rồi mới
+	// làm I/O (os.WriteFile) bên ngoài khoá.
 	sp.chunkCacheMu.Lock()
 	jc := sp.chunkCache[jobID]
+	var snapshot map[int]cachedChunk
 	if jc != nil {
 		jc.lastTouched = time.Now()
+		snapshot = make(map[int]cachedChunk, len(chunks))
+		for _, c := range chunks {
+			if cc, ok := jc.results[c.ID]; ok {
+				snapshot[c.ID] = cc
+			}
+		}
 	}
 	sp.chunkCacheMu.Unlock()
-	if jc != nil {
+
+	if snapshot != nil {
 		for i, c := range chunks {
-			jc2, ok := jc.results[c.ID]
+			cc, ok := snapshot[c.ID]
 			if !ok {
 				toSubmit = append(toSubmit, c)
 				continue
 			}
-			if err := os.WriteFile(c.OutputPath, jc2.data, 0o644); err != nil {
+			if err := os.WriteFile(c.OutputPath, cc.data, 0o644); err != nil {
 				// Ghi cache ra đĩa lỗi (hiếm — disk full?) — coi như cache
 				// miss, chạy lại chunk này cho chắc thay vì fail cả request.
 				toSubmit = append(toSubmit, c)
 				continue
 			}
-			r := jc2.result
+			r := cc.result
 			r.Output = c.OutputPath
 			results[i] = r
 			hit[i] = true
