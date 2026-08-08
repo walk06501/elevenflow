@@ -61,6 +61,16 @@ type Config struct {
 	MullvadAccountNumber string // ELEVEN_MULLVAD_ACCOUNT
 	MullvadWireGuard      bool   // ELEVEN_MULLVAD_WIREGUARD: also add the Mullvad WireGuard source (opt-in, same reasoning as ProtonWireGuard — see MullvadWireGuardProvider's doc comment)
 
+	// IPVanishWireGuard: opt-in gate for IPVanishWireGuardProvider. Unlike
+	// every other source above, this one needs no account credential at
+	// all - ipvanish_servers.go embeds a fixed, already-self-contained pool
+	// (3555 pre-fetched configs, each with its own private key + server
+	// pairing), so there's nothing to authenticate at startup. Still
+	// opt-in rather than always-on since it's unverified under real
+	// concurrency (see NewIPVanishWireGuardProvider's doc comment) — flip
+	// on only after confirming with cmd/testconcurrency like the others.
+	IPVanishWireGuard bool // ELEVEN_IPVANISH_WIREGUARD
+
 	// UsePersistentPool switches HandleSynthesize from the old per-request
 	// spawn-then-teardown Run() to webview2bridge.SessionPool — a fixed set
 	// of WebView2 sessions kept warm and reused ACROSS requests, only
@@ -146,6 +156,7 @@ func LoadConfig() *Config {
 		ProtonWireGuard:  getEnv("ELEVEN_PROTON_WIREGUARD", "") == "true",
 		MullvadAccountNumber: getEnv("ELEVEN_MULLVAD_ACCOUNT", ""),
 		MullvadWireGuard:     getEnv("ELEVEN_MULLVAD_WIREGUARD", "") == "true",
+		IPVanishWireGuard:    getEnv("ELEVEN_IPVANISH_WIREGUARD", "") == "true",
 
 		UsePersistentPool:              getEnv("ELEVEN_PERSISTENT_POOL", "") == "true",
 		PersistentPoolSessions:         getEnvInt("ELEVEN_PERSISTENT_POOL_SESSIONS", 0),

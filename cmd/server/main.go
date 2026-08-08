@@ -258,6 +258,23 @@ func main() {
 			log.Printf("Mullvad WireGuard proxy source active: account #%d, %d concurrent key slot(s) (weight %d)", mullvadInit, weight, weight)
 		}
 	}
+	if cfg.IPVanishWireGuard {
+		// No account list, no credential to loop over - see
+		// Config.IPVanishWireGuard's doc comment. weight is conservative
+		// (unverified under real concurrency, unlike the others which are
+		// all tuned from cmd/testconcurrency runs) - bump once confirmed
+		// stable under real load.
+		const ipvanishWeight = 2
+		ipvanish, err := webview2bridge.NewIPVanishWireGuardProvider()
+		if err != nil {
+			log.Printf("IPVanish WireGuard provider init failed, skipping: %v", err)
+		} else {
+			for i := 0; i < ipvanishWeight; i++ {
+				vpnProviders = append(vpnProviders, ipvanish)
+			}
+			log.Printf("IPVanish WireGuard proxy source active: %d embedded server(s), weight %d (opt-in, unverified under load — see doc comment)", webview2bridge.IPVanishServerCount(), ipvanishWeight)
+		}
+	}
 	// Combined round-robin when more than one VPN source is configured —
 	// every configured source contributes leases instead of only the
 	// first one ever being used. A single provider is used directly
