@@ -236,6 +236,14 @@ func (w *worker) processChunkWithRetry(ctx context.Context, chunk Chunk) ChunkRe
 			if statErr == nil {
 				res.Bytes = info.Size()
 			}
+			// Trước đây log dừng lại ở "Đang nhận âm thanh…" rồi im lặng
+			// nhảy sang chunk kế tiếp - không có dòng nào báo chunk NÀY đã
+			// xong, rất khó theo dõi tiến độ 1 job nhiều chunk (vd 102 dòng)
+			// chỉ nhìn qua log thô. Thêm 1 dòng "Xong" rõ ràng ngay khi
+			// chunk thành công.
+			w.emit(w.id, chunk.ID, "tts",
+				fmt.Sprintf("Xong dòng %d.", chunk.ID+1),
+				-1, w.total())
 			return res
 		}
 
