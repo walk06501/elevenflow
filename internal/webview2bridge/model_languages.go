@@ -118,6 +118,12 @@ var flashTurboV25Codes = []string{
 	"uk", "vi",
 }
 
+// Flash v2 / Turbo v2 (no ".5") — the older, English-only variants (Help
+// Center: "Our English-only, low latency model"). Distinct from v2.5, which
+// dropped the English-only restriction and added the other 31 languages
+// above.
+var flashTurboV2Codes = []string{"en"}
+
 // SupportedLanguagesForModel trả về các language_code hợp lệ + nhãn, sắp xếp theo Label.
 func SupportedLanguagesForModel(modelID string) []LanguageOption {
 	codes := codesForModelID(strings.TrimSpace(strings.ToLower(modelID)))
@@ -155,6 +161,8 @@ func codesForModelID(modelID string) []string {
 		return multilingualV2Codes
 	case "eleven_turbo_v2_5", "eleven_flash_v2_5":
 		return flashTurboV25Codes
+	case "eleven_turbo_v2", "eleven_flash_v2":
+		return flashTurboV2Codes
 	default:
 		return nil
 	}

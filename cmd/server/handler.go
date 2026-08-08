@@ -44,6 +44,14 @@ type SynthesizeRequest struct {
 	UseSpeakerBoost bool    `json:"use_speaker_boost"`
 	ExportSRT       bool    `json:"export_srt"`
 	MaxWorkers      int     `json:"max_workers"`
+	// JobID (optional): the caller's own stable identifier for this piece of
+	// text (web-portal sends its job_nodes.id, unchanged across that node's
+	// own retries). When set and the persistent session pool is in use,
+	// chunks that already succeeded on a PRIOR call with the same JobID are
+	// served from cache instead of re-run — so a retry after one bad chunk
+	// only redoes that chunk, not the whole text. Safe to omit: an empty
+	// JobID just means every call is treated as independent (old behaviour).
+	JobID string `json:"job_id"`
 }
 
 // SynthesizeSRTResponse is returned by /synthesize-srt endpoint.
@@ -126,7 +134,7 @@ func (h *Handler) HandleSynthesize(forceSRT bool) http.HandlerFunc {
 			// Provider/DataRoot here; the pool owns its own proxy provider
 			// and browser-profile root for its whole lifetime.
 			chunkResults, synthErr = h.sessionPool.Synthesize(
-				r.Context(), req.Text, h.config.ChunkMaxChars, tmpDir, "output",
+				r.Context(), req.JobID, req.Text, h.config.ChunkMaxChars, tmpDir, "output",
 				webview2bridge.TTSParams{
 					Model:           req.ModelID,
 					LanguageCode:    req.LanguageCode,
@@ -188,15 +196,32 @@ func (h *Handler) HandleSynthesize(forceSRT bool) http.HandlerFunc {
 		// Check all chunks succeeded
 		allOK := len(chunkResults) > 0
 		var charsUsed int
+		var okCount, retriedCount, maxAttempt int
 		pieces := webview2bridge.ChunkTextForTTS(req.Text, h.config.ChunkMaxChars)
 		for _, cr := range chunkResults {
+			if cr.Attempts > 1 {
+				retriedCount++
+			}
+			if cr.Attempts > maxAttempt {
+				maxAttempt = cr.Attempts
+			}
 			if !cr.OK {
 				allOK = false
 				log.Printf("Chunk %d failed: %s", cr.ID, cr.Message)
-			} else if cr.ID >= 0 && cr.ID < len(pieces) {
-				charsUsed += utf8.RuneCountInString(pieces[cr.ID])
+			} else {
+				okCount++
+				if cr.ID >= 0 && cr.ID < len(pieces) {
+					charsUsed += utf8.RuneCountInString(pieces[cr.ID])
+				}
 			}
 		}
+		// Tổng kết cho việc phân tích sau: job_id có/không (bật cache hay
+		// không), tỉ lệ chunk phải retry trong nội bộ 1 lần gọi này, attempt
+		// cao nhất 1 chunk phải chịu — dữ liệu để sau này tinh chỉnh
+		// stallTimeout/maxAttempts (worker.go) dựa trên số liệu thật thay vì
+		// đoán.
+		log.Printf("[synth-summary] job_id=%q chunks=%d ok=%d retried=%d max_attempt=%d allOK=%v",
+			req.JobID, len(chunkResults), okCount, retriedCount, maxAttempt, allOK)
 
 		if !allOK {
 			// Collect first error message for diagnostics
@@ -322,6 +347,8 @@ func (h *Handler) HandleModels(w http.ResponseWriter, r *http.Request) {
 		"eleven_multilingual_v2",
 		"eleven_turbo_v2_5",
 		"eleven_flash_v2_5",
+		"eleven_turbo_v2",
+		"eleven_flash_v2",
 	}
 
 	result := make(map[string][]webview2bridge.LanguageOption)

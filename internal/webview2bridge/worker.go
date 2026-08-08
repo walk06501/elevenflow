@@ -205,11 +205,15 @@ func (w *worker) run(ctx context.Context) {
 //  3. Lỗi business (HTTP 4xx khác 401, voice ID sai, model không hỗ trợ
 //     ngôn ngữ…): không retry, fail ngay với message gốc.
 //
-// MaxAttempts = 20: với pool nhiều proxy slot, mỗi rotate ~5s nếu có slot
-// idle, ~60s khi phải đợi cooldown. Tệ nhất 20 × 60s = 20 phút/chunk —
-// chấp nhận để đảm bảo đủ chunk thay vì bỏ.
+// MaxAttempts = 10 (was 20 — halved 2026-08-08 after live jobs took several
+// full retries to land): với pool nhiều proxy slot, mỗi rotate ~5s nếu có
+// slot idle, ~60s khi phải đợi cooldown. Tệ nhất 10 × 60s = 10 phút/chunk.
+// With 6 VPN providers in rotation, a working server is normally found well
+// before attempt 10 — the tail of 11-20 was mostly just delaying the
+// eventual "give up" on a chunk that was never going to work this run,
+// while making the caller's own retry-the-whole-request wait longer too.
 func (w *worker) processChunkWithRetry(ctx context.Context, chunk Chunk) ChunkResult {
-	const maxAttempts = 20
+	const maxAttempts = 10
 	res := ChunkResult{
 		ID:       chunk.ID,
 		GroupID:  chunk.GroupID,
@@ -386,8 +390,22 @@ func (w *worker) processChunkOnce(ctx context.Context, chunk Chunk) (subtitles.A
 	w.chromium.Eval(buildTTSScript(req))
 
 	// Đợi terminal response (audio_done / audio_done_ts / error). Pump messages liên tục.
+	//
+	// stallTimeout (mới, 2026-08-08): trước đây chỉ có 1 mốc "timeout" cứng
+	// 5 phút — nếu trang treo hoàn toàn (không audio_done, không error,
+	// không cả 1 dòng info nào) thì mỗi attempt phải chờ đủ 5 phút mới bị
+	// coi là lỗi rồi mới rotate, trong khi 1 attempt chạy đúng bình thường
+	// luôn có info message mới (Đang thiết lập/xác minh/gửi yêu cầu...) đều
+	// đặn mỗi vài giây. "Im lặng hoàn toàn" trong stallTimeout mà chưa có
+	// audio_done/error là dấu hiệu treo thật (proxy chết giữa chừng, hCaptcha
+	// không load được, v.v.) — coi như transient để rotate SỚM thay vì đợi
+	// hết deadline cứng, mà vẫn giữ deadline cứng 5 phút làm lưới an toàn
+	// cuối cùng phòng khi lastActivity bị cập nhật liên tục nhưng vẫn không
+	// bao giờ ra kết quả (hiếm, nhưng không loại trừ).
+	const stallTimeout = 75 * time.Second
 	timeout := 5 * time.Minute
 	deadline := time.Now().Add(timeout)
+	lastActivity := time.Now()
 	for {
 		if ctx.Err() != nil {
 			return subtitles.Alignment{}, ctx.Err()
@@ -395,12 +413,16 @@ func (w *worker) processChunkOnce(ctx context.Context, chunk Chunk) (subtitles.A
 		if time.Now().After(deadline) {
 			return subtitles.Alignment{}, fmt.Errorf("eval timeout")
 		}
+		if time.Since(lastActivity) > stallTimeout {
+			return subtitles.Alignment{}, fmt.Errorf("%w: no activity for %v (stalled)", errTransient, stallTimeout)
+		}
 		if w.processFail.Load() {
 			w.processFail.Store(false)
 			// WV2 child process crash giữa chừng — coi là transient, respawn.
 			return subtitles.Alignment{}, fmt.Errorf("%w: WV2 process failed", errTransient)
 		}
 		if info := w.pendingInfo.Swap(nil); info != nil {
+			lastActivity = time.Now()
 			text, skip := FriendlyBridgeInfo(*info)
 			if !skip {
 				w.emit(w.id, chunk.ID, "tts",
@@ -408,6 +430,7 @@ func (w *worker) processChunkOnce(ctx context.Context, chunk Chunk) (subtitles.A
 			}
 		}
 		if respPtr := w.pendingResp.Swap(nil); respPtr != nil {
+			lastActivity = time.Now()
 			resp := *respPtr
 			switch resp.Kind {
 			case "audio_done":

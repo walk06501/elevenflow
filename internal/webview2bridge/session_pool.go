@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"log"
 	"net"
 	"net/url"
 	"os"
@@ -47,7 +48,40 @@ type SessionPool struct {
 	wg     sync.WaitGroup
 
 	activeSessions atomic.Int32 // đang có WebView2 mở (không tính lúc idle-closed)
+
+	// chunkCache: kết quả chunk ĐÃ THÀNH CÔNG của 1 JobID (web-portal gửi
+	// job_nodes.id), để 1 request retry (do 1 vài chunk khác lỗi) không phải
+	// làm lại TOÀN BỘ text — chỉ chunk nào chưa có trong cache mới thật sự
+	// chạy lại. Xem doc comment SynthesizeRequest.JobID (handler.go) cho bối
+	// cảnh đầy đủ. Dọn theo TTL (jobChunkCacheTTL) bằng goroutine nền, không
+	// phải theo per-request cleanup, vì 1 JobID có thể cần cache SỐNG QUA
+	// NHIỀU lần gọi /synthesize riêng biệt (mỗi lần retry của web-portal là
+	// 1 request HTTP mới).
+	chunkCacheMu sync.Mutex
+	chunkCache   map[string]*jobChunkCache
 }
+
+type jobChunkCache struct {
+	results     map[int]cachedChunk
+	lastTouched time.Time
+}
+
+// cachedChunk giữ CẢ bytes audio thật (không chỉ ChunkResult.Output — path
+// đó trỏ vào tmpDir riêng của request cũ, đã bị os.RemoveAll dọn sạch ngay
+// sau khi request đó trả lời xong, xem handler.go's "defer
+// os.RemoveAll(tmpDir)"). Không cache bytes thì cache path vô dụng — request
+// retry sau có tmpDir MỚI, phải ghi lại bytes vào đường dẫn mới đó.
+type cachedChunk struct {
+	result ChunkResult
+	data   []byte
+}
+
+// jobChunkCacheTTL: đủ dài để sống qua toàn bộ chuỗi retry thật của 1 job
+// (web-portal: 10 attempt × tối đa vài phút/attempt — xem
+// eleven_visibility_timeout_seconds), nhưng không giữ mãi mãi tránh rò rỉ bộ
+// nhớ cho job không bao giờ retry lại (đa số job — chỉ job có chunk lỗi mới
+// cần cache này).
+const jobChunkCacheTTL = 30 * time.Minute
 
 // SessionPoolConfig cấu hình SessionPool tại thời điểm khởi động server.
 type SessionPoolConfig struct {
@@ -124,13 +158,50 @@ func NewSessionPool(cfg SessionPoolConfig) (*SessionPool, error) {
 		sp.wg.Add(1)
 		go sp.sessionLoop(i)
 	}
+	sp.chunkCache = make(map[string]*jobChunkCache)
+	go sp.chunkCacheJanitor()
 	return sp, nil
+}
+
+// chunkCacheJanitor dọn jobChunkCache định kỳ — job nào không được "chạm"
+// (Synthesize gọi lại với cùng JobID) trong jobChunkCacheTTL thì coi như đã
+// xong (thành công hẳn) hoặc bị bỏ (khách huỷ/hết attempt) và không cần cache
+// nữa. Chạy tới khi sp.closed.
+func (sp *SessionPool) chunkCacheJanitor() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-sp.closed:
+			return
+		case <-ticker.C:
+			sp.chunkCacheMu.Lock()
+			cutoff := time.Now().Add(-jobChunkCacheTTL)
+			evicted := 0
+			for jobID, jc := range sp.chunkCache {
+				if jc.lastTouched.Before(cutoff) {
+					delete(sp.chunkCache, jobID)
+					evicted++
+				}
+			}
+			remaining := len(sp.chunkCache)
+			sp.chunkCacheMu.Unlock()
+			if evicted > 0 {
+				log.Printf("[chunk-cache] janitor: evicted %d stale job(s), %d remaining", evicted, remaining)
+			}
+		}
+	}
 }
 
 // Synthesize chunk hoá text rồi chạy qua SessionPool — chữ ký tương đương
 // webview2bridge.Run, để handler.go đổi qua lại giữa 2 đường (persistent
 // pool bật/tắt qua config) mà không phải viết lại phần chunk/merge xung quanh.
-func (sp *SessionPool) Synthesize(ctx context.Context, text string, maxChars int, outputDir, outputStem string, params TTSParams, voice string, emit EmitFn) ([]ChunkResult, error) {
+//
+// jobID (optional — xem SynthesizeRequest.JobID, handler.go): khi khác rỗng,
+// chunk nào đã THÀNH CÔNG ở 1 lần gọi TRƯỚC ĐÓ cùng jobID được phục vụ từ
+// cache thay vì chạy lại — 1 request retry (do 1-2 chunk lỗi, các chunk khác
+// đã xong) giờ chỉ thật sự tốn phiên trình duyệt cho đúng phần còn thiếu.
+func (sp *SessionPool) Synthesize(ctx context.Context, jobID string, text string, maxChars int, outputDir, outputStem string, params TTSParams, voice string, emit EmitFn) ([]ChunkResult, error) {
 	if err := ValidateLanguageForModel(params.Model, params.LanguageCode); err != nil {
 		return nil, err
 	}
@@ -157,7 +228,114 @@ func (sp *SessionPool) Synthesize(ctx context.Context, text string, maxChars int
 			Params:     &p,
 		}
 	}
-	return sp.Submit(ctx, chunks, emit)
+
+	if strings.TrimSpace(jobID) == "" {
+		return sp.Submit(ctx, chunks, emit)
+	}
+
+	// Tách chunk đã có cache (ghi thẳng bytes vào outputDir MỚI của request
+	// này, không chạy lại) khỏi chunk còn phải chạy thật.
+	results := make([]ChunkResult, len(chunks))
+	hit := make([]bool, len(chunks))
+	var toSubmit []Chunk
+	sp.chunkCacheMu.Lock()
+	jc := sp.chunkCache[jobID]
+	if jc != nil {
+		jc.lastTouched = time.Now()
+	}
+	sp.chunkCacheMu.Unlock()
+	if jc != nil {
+		for i, c := range chunks {
+			jc2, ok := jc.results[c.ID]
+			if !ok {
+				toSubmit = append(toSubmit, c)
+				continue
+			}
+			if err := os.WriteFile(c.OutputPath, jc2.data, 0o644); err != nil {
+				// Ghi cache ra đĩa lỗi (hiếm — disk full?) — coi như cache
+				// miss, chạy lại chunk này cho chắc thay vì fail cả request.
+				toSubmit = append(toSubmit, c)
+				continue
+			}
+			r := jc2.result
+			r.Output = c.OutputPath
+			results[i] = r
+			hit[i] = true
+			emit(r.WorkerID, c.ID, "tts", "Đã có sẵn từ lần thử trước, dùng lại.", -1, len(chunks))
+		}
+	} else {
+		toSubmit = chunks
+	}
+
+	if len(toSubmit) < len(chunks) {
+		log.Printf("[chunk-cache] job=%s: %d/%d chunk phục vụ từ cache, chạy lại %d",
+			jobID, len(chunks)-len(toSubmit), len(chunks), len(toSubmit))
+	}
+
+	if len(toSubmit) > 0 {
+		submitted, err := sp.Submit(ctx, toSubmit, emit)
+		if err != nil {
+			return nil, err
+		}
+		bySubmitID := make(map[int]ChunkResult, len(submitted))
+		for _, r := range submitted {
+			bySubmitID[r.ID] = r
+		}
+		for i, c := range chunks {
+			if hit[i] {
+				continue
+			}
+			if r, ok := bySubmitID[c.ID]; ok {
+				results[i] = r
+			}
+		}
+	}
+
+	allOK := true
+	for _, r := range results {
+		if !r.OK {
+			allOK = false
+			break
+		}
+	}
+
+	if allOK {
+		// Cả job xong sạch trong lần gọi này — không có gì để cache (mọi
+		// chunk cache hit đã lưu sẵn rồi; chunk mới chạy cũng thành công
+		// luôn, không cần lưu lại phòng retry vì sẽ không retry). Dọn luôn
+		// nếu janitor lỡ để sót entry cũ từ 1 lần thử trước đó của job này.
+		sp.chunkCacheMu.Lock()
+		delete(sp.chunkCache, jobID)
+		sp.chunkCacheMu.Unlock()
+	} else if len(toSubmit) > 0 {
+		// Còn chunk lỗi (sẽ retry ở lần gọi request SAU) — lưu lại bytes của
+		// những chunk MỚI vừa thành công trong lần này, để lần retry sau chỉ
+		// còn phải làm lại đúng phần còn lỗi.
+		newlyOK := make(map[int]cachedChunk)
+		for i, c := range chunks {
+			if hit[i] || !results[i].OK {
+				continue
+			}
+			if data, readErr := os.ReadFile(results[i].Output); readErr == nil {
+				newlyOK[c.ID] = cachedChunk{result: results[i], data: data}
+			}
+		}
+		if len(newlyOK) > 0 {
+			sp.chunkCacheMu.Lock()
+			jc := sp.chunkCache[jobID]
+			if jc == nil {
+				jc = &jobChunkCache{results: make(map[int]cachedChunk)}
+				sp.chunkCache[jobID] = jc
+			}
+			for id, cc := range newlyOK {
+				jc.results[id] = cc
+			}
+			jc.lastTouched = time.Now()
+			sp.chunkCacheMu.Unlock()
+		}
+	}
+
+	return results, nil
 }
 
 // Submit đẩy toàn bộ chunks của 1 request vào hàng đợi chung, đợi đủ kết
