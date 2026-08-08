@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -78,6 +79,23 @@ type Config struct {
 	// (NOT its proxy lease/tunnel — see SessionPool doc comment) after this
 	// long without a job, to keep CPU/RAM down when traffic is quiet.
 	PersistentPoolIdleCloseSeconds int // ELEVEN_PERSISTENT_POOL_IDLE_CLOSE_SECONDS (default 180)
+
+	// PersistentPoolDataRoot: where SessionPool keeps its WebView2 profile
+	// folders. Left unset, webview2bridge.NewSessionPool falls back to
+	// os.TempDir() - which resolves to a DIFFERENT path depending on which
+	// Windows account is running the process (interactive Administrator vs.
+	// SYSTEM via Scheduled Task each get their own %TEMP%). Confirmed live
+	// 2026-08-08: the server ran fine for hours started interactively, but
+	// crashed instantly on every launch under the SYSTEM-context watchdog
+	// task with "Failed to unregister class Chrome_WidgetWin_0" - the
+	// SYSTEM-only profile folder had been corrupted by repeated
+	// Stop-Process -Force kills during that night's earlier crash-loop
+	// incident, and being on disk, survived even a full VPS reboot.
+	// Defaulting this to a folder next to the executable (same regardless
+	// of which account launches it) makes the profile path identity-
+	// independent, so interactive and SYSTEM runs always share the same
+	// (working) profile instead of silently using two different ones.
+	PersistentPoolDataRoot string // ELEVEN_PERSISTENT_POOL_DATA_ROOT
 }
 
 func loadEnvFile(path string) {
@@ -132,7 +150,23 @@ func LoadConfig() *Config {
 		UsePersistentPool:              getEnv("ELEVEN_PERSISTENT_POOL", "") == "true",
 		PersistentPoolSessions:         getEnvInt("ELEVEN_PERSISTENT_POOL_SESSIONS", 0),
 		PersistentPoolIdleCloseSeconds: getEnvInt("ELEVEN_PERSISTENT_POOL_IDLE_CLOSE_SECONDS", 180),
+		PersistentPoolDataRoot:         getEnv("ELEVEN_PERSISTENT_POOL_DATA_ROOT", defaultPersistentPoolDataRoot()),
 	}
+}
+
+// defaultPersistentPoolDataRoot picks a WebView2 profile folder anchored to
+// the executable's own directory, not os.TempDir() (which resolves
+// differently per Windows account - see Config.PersistentPoolDataRoot doc
+// comment). Falls back to a relative path if the executable's location
+// can't be resolved (should not happen in practice), which at least keeps
+// interactive and SYSTEM runs consistent with each other when launched from
+// the same working directory.
+func defaultPersistentPoolDataRoot() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "wv2-profiles"
+	}
+	return filepath.Join(filepath.Dir(exe), "wv2-profiles")
 }
 
 func getEnv(key, fallback string) string {

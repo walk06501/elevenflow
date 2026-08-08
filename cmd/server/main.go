@@ -298,13 +298,14 @@ func main() {
 			NumSessions:    numSessions,
 			Provider:       vpnProvider,
 			IdleCloseAfter: time.Duration(cfg.PersistentPoolIdleCloseSeconds) * time.Second,
+			DataRoot:       cfg.PersistentPoolDataRoot,
 		})
 		if err != nil {
 			log.Fatalf("SessionPool init failed: %v", err)
 		}
 		sessionPool = sp
-		log.Printf("Persistent session pool active: %d sessions, idle-close after %ds",
-			numSessions, cfg.PersistentPoolIdleCloseSeconds)
+		log.Printf("Persistent session pool active: %d sessions, idle-close after %ds, data root %s",
+			numSessions, cfg.PersistentPoolIdleCloseSeconds, cfg.PersistentPoolDataRoot)
 	}
 
 	// Register routes
