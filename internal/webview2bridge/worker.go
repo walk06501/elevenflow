@@ -48,6 +48,14 @@ type ChunkResult struct {
 	WorkerID  int
 	Attempts  int
 	Alignment subtitles.Alignment // chỉ có khi ExportSRT=true (audio_done_ts)
+
+	// Thêm 2026-08-08 cho mục tiêu "log thêm để tối ưu về sau" - handler.go
+	// gộp các field này lại thành thống kê tổng ở [synth-summary], dùng để
+	// tinh chỉnh stallTimeout/maxAttempts/weight từng VPN provider dựa trên
+	// số liệu thật thay vì đoán.
+	DurationMs     int64 // tổng thời gian chunk này từ attempt đầu tới lúc xong/bỏ cuộc
+	BanRotates     int   // số lần rotate do errUnusualActivity (401 - IP bị Cloudflare flag)
+	NetworkRotates int   // số lần rotate do errTransient (mạng/nav timeout/5xx/429...)
 }
 
 // EmitFn nhận event progress để UI hiển thị.
@@ -220,6 +228,7 @@ func (w *worker) processChunkWithRetry(ctx context.Context, chunk Chunk) ChunkRe
 		Output:   chunk.OutputPath,
 		WorkerID: w.id,
 	}
+	chunkStart := time.Now()
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		res.Attempts = attempt
@@ -232,6 +241,7 @@ func (w *worker) processChunkWithRetry(ctx context.Context, chunk Chunk) ChunkRe
 			res.OK = true
 			res.Message = "ok"
 			res.Alignment = align
+			res.DurationMs = time.Since(chunkStart).Milliseconds()
 			info, statErr := os.Stat(chunk.OutputPath)
 			if statErr == nil {
 				res.Bytes = info.Size()
@@ -240,9 +250,9 @@ func (w *worker) processChunkWithRetry(ctx context.Context, chunk Chunk) ChunkRe
 			// nhảy sang chunk kế tiếp - không có dòng nào báo chunk NÀY đã
 			// xong, rất khó theo dõi tiến độ 1 job nhiều chunk (vd 102 dòng)
 			// chỉ nhìn qua log thô. Thêm 1 dòng "Xong" rõ ràng ngay khi
-			// chunk thành công.
+			// chunk thành công, kèm thời gian thật để soi chunk nào chậm.
 			w.emit(w.id, chunk.ID, "tts",
-				fmt.Sprintf("Xong dòng %d.", chunk.ID+1),
+				fmt.Sprintf("Xong dòng %d (%.1fs).", chunk.ID+1, time.Since(chunkStart).Seconds()),
 				-1, w.total())
 			return res
 		}
@@ -251,6 +261,7 @@ func (w *worker) processChunkWithRetry(ctx context.Context, chunk Chunk) ChunkRe
 		if !retriable {
 			// Lỗi business / config — fail ngay không retry.
 			res.Message = err.Error()
+			res.DurationMs = time.Since(chunkStart).Milliseconds()
 			return res
 		}
 
@@ -258,19 +269,25 @@ func (w *worker) processChunkWithRetry(ctx context.Context, chunk Chunk) ChunkRe
 			res.Message = fmt.Sprintf(
 				"thất bại sau %d lần thử; mỗi lần đã thử kết nối khác nhưng vẫn không ổn định.",
 				maxAttempts)
+			res.DurationMs = time.Since(chunkStart).Milliseconds()
 			return res
 		}
 
 		reason := "kết nối bị chặn"
-		if errors.Is(err, errTransient) {
+		if errors.Is(err, errUnusualActivity) {
+			res.BanRotates++
+		} else {
 			reason = "mạng không ổn"
+			res.NetworkRotates++
 		}
 		if rotateErr := w.rotateAndRespawn(ctx, chunk.ID, reason); rotateErr != nil {
 			res.Message = rotateErr.Error()
+			res.DurationMs = time.Since(chunkStart).Milliseconds()
 			return res
 		}
 	}
 	res.Message = "exhausted retries"
+	res.DurationMs = time.Since(chunkStart).Milliseconds()
 	return res
 }
 

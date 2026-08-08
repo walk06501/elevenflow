@@ -197,6 +197,8 @@ func (h *Handler) HandleSynthesize(forceSRT bool) http.HandlerFunc {
 		allOK := len(chunkResults) > 0
 		var charsUsed int
 		var okCount, retriedCount, maxAttempt int
+		var banRotates, networkRotates int
+		var totalDurationMs, maxDurationMs int64
 		pieces := webview2bridge.ChunkTextForTTS(req.Text, h.config.ChunkMaxChars)
 		for _, cr := range chunkResults {
 			if cr.Attempts > 1 {
@@ -204,6 +206,12 @@ func (h *Handler) HandleSynthesize(forceSRT bool) http.HandlerFunc {
 			}
 			if cr.Attempts > maxAttempt {
 				maxAttempt = cr.Attempts
+			}
+			banRotates += cr.BanRotates
+			networkRotates += cr.NetworkRotates
+			totalDurationMs += cr.DurationMs
+			if cr.DurationMs > maxDurationMs {
+				maxDurationMs = cr.DurationMs
 			}
 			if !cr.OK {
 				allOK = false
@@ -215,13 +223,18 @@ func (h *Handler) HandleSynthesize(forceSRT bool) http.HandlerFunc {
 				}
 			}
 		}
+		var avgDurationMs int64
+		if len(chunkResults) > 0 {
+			avgDurationMs = totalDurationMs / int64(len(chunkResults))
+		}
 		// Tổng kết cho việc phân tích sau: job_id có/không (bật cache hay
 		// không), tỉ lệ chunk phải retry trong nội bộ 1 lần gọi này, attempt
-		// cao nhất 1 chunk phải chịu — dữ liệu để sau này tinh chỉnh
-		// stallTimeout/maxAttempts (worker.go) dựa trên số liệu thật thay vì
-		// đoán.
-		log.Printf("[synth-summary] job_id=%q chunks=%d ok=%d retried=%d max_attempt=%d allOK=%v",
-			req.JobID, len(chunkResults), okCount, retriedCount, maxAttempt, allOK)
+		// cao nhất 1 chunk phải chịu, thời gian trung bình/chậm nhất 1 chunk,
+		// và tỉ lệ rotate do bị chặn (ban) so với do mạng (network) — dữ liệu
+		// để sau này tinh chỉnh stallTimeout/maxAttempts/weight từng VPN
+		// provider (main.go) dựa trên số liệu thật thay vì đoán.
+		log.Printf("[synth-summary] job_id=%q chunks=%d ok=%d retried=%d max_attempt=%d allOK=%v avg_ms=%d max_ms=%d ban_rotates=%d network_rotates=%d",
+			req.JobID, len(chunkResults), okCount, retriedCount, maxAttempt, allOK, avgDurationMs, maxDurationMs, banRotates, networkRotates)
 
 		if !allOK {
 			// Collect first error message for diagnostics
