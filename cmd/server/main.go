@@ -259,11 +259,11 @@ func main() {
 		}
 	}
 	if cfg.IPVanishWireGuard {
-		// No account list, no credential to loop over - see
-		// Config.IPVanishWireGuard's doc comment. weight is conservative
-		// (unverified under real concurrency, unlike the others which are
-		// all tuned from cmd/testconcurrency runs) - bump once confirmed
-		// stable under real load.
+		// No credential to pass - see NewIPVanishWireGuardProvider's doc
+		// comment (each embedded server carries its own key). weight is
+		// conservative (unverified under real concurrency, unlike the
+		// others which are all tuned from cmd/testconcurrency runs) -
+		// bump once confirmed stable under real load.
 		const ipvanishWeight = 2
 		ipvanish, err := webview2bridge.NewIPVanishWireGuardProvider()
 		if err != nil {

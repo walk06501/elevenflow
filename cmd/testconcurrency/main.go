@@ -29,7 +29,7 @@ type acquirer interface {
 }
 
 func main() {
-	providerName := flag.String("provider", "", "\"pia\", \"surfshark\", or \"proton\"")
+	providerName := flag.String("provider", "", "\"pia\", \"surfshark\", \"proton\", or \"ipvanish\"")
 	user := flag.String("user", os.Getenv("ELEVEN_PIA_USERNAME"), "PIA username (provider=pia)")
 	pass := flag.String("pass", os.Getenv("ELEVEN_PIA_PASSWORD"), "PIA password (provider=pia)")
 	key := flag.String("key", os.Getenv("ELEVEN_SURFSHARK_PRIVATE_KEY"), "Surfshark private key (provider=surfshark)")
@@ -60,8 +60,11 @@ func main() {
 		}
 		fmt.Println("Building ProtonVPNWireGuardProvider (SRP login + certificate registration)...")
 		p, err = webview2bridge.NewProtonVPNWireGuardProvider(*protonUser, *protonPass)
+	case "ipvanish":
+		fmt.Println("Building IPVanishWireGuardProvider...")
+		p, err = webview2bridge.NewIPVanishWireGuardProvider()
 	default:
-		log.Fatal("need -provider pia|surfshark|proton")
+		log.Fatal("need -provider pia|surfshark|proton|ipvanish")
 	}
 	if err != nil {
 		log.Fatalf("provider init failed: %v", err)

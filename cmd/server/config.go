@@ -11,16 +11,16 @@ import (
 
 // Config holds all server configuration, loaded from environment variables.
 type Config struct {
-	Port          string   // ELEVEN_SERVER_PORT: HTTP listen port (default: 8080)
-	Secret        string   // ELEVEN_SERVER_SECRET: API auth secret
-	MaxWorkers    int      // ELEVEN_MAX_WORKERS: WebView2 instances per request (default: 3)
-	MaxConcurrent int      // ELEVEN_MAX_CONCURRENT: Total inflight synthesis requests (default: 50)
-	OutputDir     string   // ELEVEN_OUTPUT_DIR: Temp directory for audio output (default: ./output)
-	ChunkMaxChars int      // ELEVEN_CHUNK_MAX_CHARS: Max characters per chunk (default: 600)
-	ServerURL     string   // ELEVENFLOW_SERVER_URL: Proxy lease Vercel server
-	AppSecret     string   // ELEVENFLOW_APP_SECRET: Proxy lease auth secret
-	UserEmail     string   // ELEVEN_USER_EMAIL: Proxy server account email
-	UserPassword  string   // ELEVEN_USER_PASSWORD: Proxy server account password
+	Port          string // ELEVEN_SERVER_PORT: HTTP listen port (default: 8080)
+	Secret        string // ELEVEN_SERVER_SECRET: API auth secret
+	MaxWorkers    int    // ELEVEN_MAX_WORKERS: WebView2 instances per request (default: 3)
+	MaxConcurrent int    // ELEVEN_MAX_CONCURRENT: Total inflight synthesis requests (default: 50)
+	OutputDir     string // ELEVEN_OUTPUT_DIR: Temp directory for audio output (default: ./output)
+	ChunkMaxChars int    // ELEVEN_CHUNK_MAX_CHARS: Max characters per chunk (default: 600)
+	ServerURL     string // ELEVENFLOW_SERVER_URL: Proxy lease Vercel server
+	AppSecret     string // ELEVENFLOW_APP_SECRET: Proxy lease auth secret
+	UserEmail     string // ELEVEN_USER_EMAIL: Proxy server account email
+	UserPassword  string // ELEVEN_USER_PASSWORD: Proxy server account password
 
 	// PortalAPIURL: web-portal's own API base (e.g. https://sonicvoice.pro/api),
 	// NOT this server's own ELEVENFLOW_SERVER_URL/AppSecret above (that's the
@@ -59,15 +59,15 @@ type Config struct {
 	// field is seed/fallback-only — real multi-account Mullvad management is
 	// the portal's VPN (ElevenFlow) tab, same as every other provider above.
 	MullvadAccountNumber string // ELEVEN_MULLVAD_ACCOUNT
-	MullvadWireGuard      bool   // ELEVEN_MULLVAD_WIREGUARD: also add the Mullvad WireGuard source (opt-in, same reasoning as ProtonWireGuard — see MullvadWireGuardProvider's doc comment)
+	MullvadWireGuard     bool   // ELEVEN_MULLVAD_WIREGUARD: also add the Mullvad WireGuard source (opt-in, same reasoning as ProtonWireGuard — see MullvadWireGuardProvider's doc comment)
 
-	// IPVanishWireGuard: opt-in gate for IPVanishWireGuardProvider. Unlike
-	// every other source above, this one needs no account credential at
-	// all - ipvanish_servers.go embeds a fixed, already-self-contained pool
-	// (3555 pre-fetched configs, each with its own private key + server
-	// pairing), so there's nothing to authenticate at startup. Still
-	// opt-in rather than always-on since it's unverified under real
-	// concurrency (see NewIPVanishWireGuardProvider's doc comment) — flip
+	// IPVanishWireGuard: opt-in gate for IPVanishWireGuardProvider. No
+	// account credential to configure — each embedded server in
+	// ipvanish_servers.go carries its own dedicated key (see that
+	// provider's doc comment for why: neither "one shared key" nor "bulk
+	// harvest many keys at once" survived real testing — only hand-
+	// verified, individually-registered keys did). Still opt-in rather
+	// than always-on since it's unverified under real concurrency — flip
 	// on only after confirming with cmd/testconcurrency like the others.
 	IPVanishWireGuard bool // ELEVEN_IPVANISH_WIREGUARD
 
@@ -133,27 +133,27 @@ func loadEnvFile(path string) {
 func LoadConfig() *Config {
 	loadEnvFile(".env")
 	return &Config{
-		Port:             getEnv("ELEVEN_SERVER_PORT", "8080"),
-		Secret:           getEnv("ELEVEN_SERVER_SECRET", ""),
-		MaxWorkers:       getEnvInt("ELEVEN_MAX_WORKERS", 1),
-		MaxConcurrent:    getEnvInt("ELEVEN_MAX_CONCURRENT", 50),
-		OutputDir:        getEnv("ELEVEN_OUTPUT_DIR", "./output"),
-		ChunkMaxChars:    getEnvInt("ELEVEN_CHUNK_MAX_CHARS", 600),
-		ServerURL:        getEnv("ELEVENFLOW_SERVER_URL", proxyserver.DefaultServerURL),
-		AppSecret:        getEnv("ELEVENFLOW_APP_SECRET", proxyserver.DefaultAppSecret),
-		UserEmail:        getEnv("ELEVEN_USER_EMAIL", ""),
-		UserPassword:     getEnv("ELEVEN_USER_PASSWORD", ""),
-		PortalAPIURL:     getEnv("ELEVEN_PORTAL_API_URL", ""),
-		NordVPNToken:     getEnv("ELEVEN_NORDVPN_TOKEN", ""),
-		NordVPNTokens:    getEnvTokenList("ELEVEN_NORDVPN_TOKENS", getEnv("ELEVEN_NORDVPN_TOKEN", "")),
-		PIAUsername:      getEnv("ELEVEN_PIA_USERNAME", ""),
-		PIAPassword:      getEnv("ELEVEN_PIA_PASSWORD", ""),
-		NordVPNWireGuard: getEnv("ELEVEN_NORDVPN_WIREGUARD", "") == "true",
-		PIAWireGuard:     getEnv("ELEVEN_PIA_WIREGUARD", "") == "true",
-		SurfsharkKey:     getEnv("ELEVEN_SURFSHARK_PRIVATE_KEY", ""),
-		ProtonUsername:   getEnv("ELEVEN_PROTON_USERNAME", ""),
-		ProtonPassword:   getEnv("ELEVEN_PROTON_PASSWORD", ""),
-		ProtonWireGuard:  getEnv("ELEVEN_PROTON_WIREGUARD", "") == "true",
+		Port:                 getEnv("ELEVEN_SERVER_PORT", "8080"),
+		Secret:               getEnv("ELEVEN_SERVER_SECRET", ""),
+		MaxWorkers:           getEnvInt("ELEVEN_MAX_WORKERS", 1),
+		MaxConcurrent:        getEnvInt("ELEVEN_MAX_CONCURRENT", 50),
+		OutputDir:            getEnv("ELEVEN_OUTPUT_DIR", "./output"),
+		ChunkMaxChars:        getEnvInt("ELEVEN_CHUNK_MAX_CHARS", 600),
+		ServerURL:            getEnv("ELEVENFLOW_SERVER_URL", proxyserver.DefaultServerURL),
+		AppSecret:            getEnv("ELEVENFLOW_APP_SECRET", proxyserver.DefaultAppSecret),
+		UserEmail:            getEnv("ELEVEN_USER_EMAIL", ""),
+		UserPassword:         getEnv("ELEVEN_USER_PASSWORD", ""),
+		PortalAPIURL:         getEnv("ELEVEN_PORTAL_API_URL", ""),
+		NordVPNToken:         getEnv("ELEVEN_NORDVPN_TOKEN", ""),
+		NordVPNTokens:        getEnvTokenList("ELEVEN_NORDVPN_TOKENS", getEnv("ELEVEN_NORDVPN_TOKEN", "")),
+		PIAUsername:          getEnv("ELEVEN_PIA_USERNAME", ""),
+		PIAPassword:          getEnv("ELEVEN_PIA_PASSWORD", ""),
+		NordVPNWireGuard:     getEnv("ELEVEN_NORDVPN_WIREGUARD", "") == "true",
+		PIAWireGuard:         getEnv("ELEVEN_PIA_WIREGUARD", "") == "true",
+		SurfsharkKey:         getEnv("ELEVEN_SURFSHARK_PRIVATE_KEY", ""),
+		ProtonUsername:       getEnv("ELEVEN_PROTON_USERNAME", ""),
+		ProtonPassword:       getEnv("ELEVEN_PROTON_PASSWORD", ""),
+		ProtonWireGuard:      getEnv("ELEVEN_PROTON_WIREGUARD", "") == "true",
 		MullvadAccountNumber: getEnv("ELEVEN_MULLVAD_ACCOUNT", ""),
 		MullvadWireGuard:     getEnv("ELEVEN_MULLVAD_WIREGUARD", "") == "true",
 		IPVanishWireGuard:    getEnv("ELEVEN_IPVANISH_WIREGUARD", "") == "true",
