@@ -123,6 +123,15 @@ type SessionPoolConfig struct {
 	// coi là "nhỏ", vào hàng đợi ưu tiên riêng (xem SessionPool.smallJobs
 	// doc comment). 0 → mặc định defaultSmallJobChunkThreshold.
 	SmallJobChunkThreshold int
+
+	// BigJobReservedSessions: số session KHÔNG BAO GIỜ ưu tiên smallJobs —
+	// chỉ nhặt sp.jobs (job lớn). Nếu không có ràng buộc này, ưu tiên tuyệt
+	// đối cho job nhỏ (mọi session khác) có thể khiến job lớn ĐÓI VÔ THỜI
+	// HẠN khi traffic job nhỏ liên tục (đã thấy thật: nhiều user gửi job
+	// 1-chunk dồn dập trong lúc 1 job dialogue 300 node vẫn đang chạy) —
+	// đây là dải sàn tối thiểu đảm bảo job lớn luôn có chỗ, dù job nhỏ có
+	// dồn tới đâu. 0 → mặc định defaultBigJobReservedSessions.
+	BigJobReservedSessions int
 }
 
 // defaultSmallJobChunkThreshold: hầu hết job kind=single/batch chỉ 1-4 chunk
@@ -130,6 +139,11 @@ type SessionPoolConfig struct {
 // lượt thoại thật sự "lớn" thường lên tới hàng trăm node. 5 tách rõ 2 nhóm
 // đó mà không cần cấu hình gì thêm cho phần lớn deployment.
 const defaultSmallJobChunkThreshold = 5
+
+// defaultBigJobReservedSessions: tối thiểu 1, và không quá 1/4 số session
+// (đa số vẫn ưu tiên job nhỏ, đúng mục tiêu chính — sàn tối thiểu chỉ để
+// chặn đói vô thời hạn, không phải chia đều 50/50).
+const defaultBigJobReservedFraction = 4
 
 type sessionJob struct {
 	ctx    context.Context
@@ -165,6 +179,24 @@ func NewSessionPool(cfg SessionPoolConfig) (*SessionPool, error) {
 	if cfg.SmallJobChunkThreshold <= 0 {
 		cfg.SmallJobChunkThreshold = defaultSmallJobChunkThreshold
 	}
+	if cfg.BigJobReservedSessions <= 0 {
+		cfg.BigJobReservedSessions = cfg.NumSessions / defaultBigJobReservedFraction
+		if cfg.BigJobReservedSessions < 1 {
+			cfg.BigJobReservedSessions = 1
+		}
+	}
+	// Luôn chừa ÍT NHẤT 1 session ở chế độ ưu tiên job nhỏ, kể cả khi
+	// NumSessions rất nhỏ (1-2, ít khả năng nhưng vẫn phải đúng) — nếu
+	// không, công thức /4 phía trên (hoặc 1 giá trị cấu hình tay quá lớn)
+	// có thể dồn HẾT session vào "big-only", khiến đói ngược lại đúng phía
+	// vừa sửa cho job lớn. NumSessions=1 (biên nhất) → 0 session dành riêng
+	// big-only, job lớn vẫn được nhặt bất cứ khi nào hàng nhỏ rỗng.
+	if cfg.BigJobReservedSessions >= cfg.NumSessions {
+		cfg.BigJobReservedSessions = cfg.NumSessions - 1
+	}
+	if cfg.BigJobReservedSessions < 0 {
+		cfg.BigJobReservedSessions = 0
+	}
 	if cfg.DataRoot == "" {
 		cfg.DataRoot = filepath.Join(os.TempDir(), "elevenflow-session-pool-profiles")
 	}
@@ -184,13 +216,21 @@ func NewSessionPool(cfg SessionPoolConfig) (*SessionPool, error) {
 	}
 
 	diaglog.Append("session_pool_start", map[string]any{
-		"numSessions":    cfg.NumSessions,
-		"idleCloseAfter": cfg.IdleCloseAfter.String(),
+		"numSessions":            cfg.NumSessions,
+		"idleCloseAfter":         cfg.IdleCloseAfter.String(),
+		"bigJobReservedSessions": cfg.BigJobReservedSessions,
 	})
+	log.Printf("SessionPool: %d session(s), %d reserved big-job-only (rest prioritize small jobs, threshold=%d chunks)",
+		cfg.NumSessions, cfg.BigJobReservedSessions, cfg.SmallJobChunkThreshold)
 
+	// N session ĐẦU dành riêng "big-only" (sàn tối thiểu cho job lớn — xem
+	// Config.BigJobReservedSessions doc comment), phần còn lại ưu tiên job
+	// nhỏ như bình thường. Thứ tự index không mang ý nghĩa gì khác — chỉ
+	// cần chia đúng SỐ LƯỢNG.
 	for i := 0; i < cfg.NumSessions; i++ {
 		sp.wg.Add(1)
-		go sp.sessionLoop(i)
+		bigOnly := i < cfg.BigJobReservedSessions
+		go sp.sessionLoop(i, bigOnly)
 	}
 	sp.chunkCache = make(map[string]*jobChunkCache)
 	go sp.chunkCacheJanitor()
@@ -506,7 +546,12 @@ func (sp *SessionPool) ActiveSessions() int32 { return sp.activeSessions.Load() 
 // — chỉ thoát khi SessionPool.Close() được gọi — spawn thất bại chỉ đặt lại
 // cờ "chưa mở", job kế tiếp sẽ tự thử acquire+spawn lại từ đầu (tự phục hồi
 // dần, không rút bớt sức chứa pool vĩnh viễn như mô hình cũ).
-func (sp *SessionPool) sessionLoop(id int) {
+//
+// bigOnly: khi true, session này CHỈ nhặt sp.jobs (job lớn), không bao giờ
+// peek/nhận từ sp.smallJobs — đây là sàn tối thiểu chặn job lớn bị đói vô
+// thời hạn (xem Config.BigJobReservedSessions doc comment). Đa số session
+// (bigOnly=false) vẫn ưu tiên job nhỏ như thiết kế gốc.
+func (sp *SessionPool) sessionLoop(id int, bigOnly bool) {
 	defer sp.wg.Done()
 
 	runtime.LockOSThread()
@@ -627,6 +672,28 @@ func (sp *SessionPool) sessionLoop(id int) {
 		}
 
 		idleTimer.Reset(sp.cfg.IdleCloseAfter)
+	}
+
+	// bigOnly: vòng lặp đơn giản hơn hẳn — không bao giờ đụng sp.smallJobs,
+	// nên không cần bước peek ưu tiên. Đây chính là sàn tối thiểu cho job
+	// lớn (xem doc comment hàm/Config.BigJobReservedSessions).
+	if bigOnly {
+		for {
+			select {
+			case <-sp.closed:
+				finalClose()
+				return
+			case <-idleTimer.C:
+				teardown()
+				idleTimer.Reset(sp.cfg.IdleCloseAfter)
+			case job, ok := <-sp.jobs:
+				if !ok {
+					finalClose()
+					return
+				}
+				handleJob(job)
+			}
+		}
 	}
 
 	for {
