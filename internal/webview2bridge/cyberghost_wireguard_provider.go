@@ -1,0 +1,668 @@
+package webview2bridge
+
+import (
+	"context"
+	"crypto/ecdh"
+	"crypto/rand"
+	"crypto/tls"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/netip"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.zx2c4.com/wireguard/conn"
+	"golang.zx2c4.com/wireguard/device"
+	"golang.zx2c4.com/wireguard/tun/netstack"
+)
+
+// CyberGhostWireGuardProvider mirrors PIAWireGuardProvider's shape almost
+// exactly (fresh X25519 keypair per lease, registered live via an addKey
+// call, real handshake + real HTTP round trip before trusting the tunnel —
+// see that file's doc comment for the shared reasoning), confirmed by
+// reverse-engineering CyberGhost's own v2 API live against a real account
+// (2026-08-09):
+//
+//   - Auth is 3-legged, unlike PIA's flat username/password: POST
+//     .../v2/my/account/jwt exchanges username+password for a short-lived
+//     JWT (needed again on every restart — used for the country/server-
+//     list calls, not for addKey), then POST .../v2/my/devices registers
+//     a "device" against that JWT and returns a (token, tokenSecret) pair
+//     used for every addKey call afterward.
+//   - The device registration DOES have a hard per-account cap — confirmed
+//     live 2026-08-09 (same class of bug Mullvad's persistence fix exists
+//     for, see mullvad_wireguard_provider.go's doc comment): 4 test runs
+//     of NewCyberGhostWireGuardProvider each silently registered a BRAND
+//     NEW device with no persistence, and the 5th call failed with HTTP
+//     403 "The maximum amount of devices was reached." So exactly like
+//     Mullvad, the device (token, tokenSecret) pair is persisted to disk
+//     (cgDevicePath) and reused on every subsequent startup instead of
+//     calling POST /v2/my/devices again — login() still runs every
+//     restart (needed for the country-list JWT and appears to carry no
+//     cap of its own), only the device-registration call is skipped once
+//     a saved device exists.
+//   - Every v2-api.cyberghostvpn.com call also needs a static x-app-key
+//     header alongside the Bearer JWT. cgAppKey below is CyberGhost's own
+//     app-identification value for their official Linux client, found
+//     embedded in plain text in ananyatimalsina/cyberghost-linux's
+//     src-tauri/src/auth.rs — a legitimate open-source alternate client,
+//     not pulled from reversing a compiled binary. It carries no per-user
+//     secret.
+//   - The server list has no "give me everything" mode: GET
+//     .../v2/my/servers/filters/74 requires filter_country (confirmed
+//     live — omitting it is a 404 "missing param", not a global list).
+//     The full country catalog (GET .../v2/my/servers/countries, 100
+//     countries, confirmed non-paginated) is fetched at startup and every
+//     one of them is queried in turn for its own WireGuard server list —
+//     the operator's own stated priority is proxy/IP diversity over
+//     startup speed, so this deliberately does NOT settle for a curated
+//     subset. An early attempt at sweeping all 100 in one tight loop
+//     (0.3s delay) hit a wall after ~22 requests — every later country
+//     came back HTTP 429 "error code: 1015" (Cloudflare's rate-limit
+//     signature, confirmed live 2026-08-09), not real zero-server
+//     countries (re-querying one of the failed countries alone
+//     immediately afterward returned its real, non-empty list). Handled
+//     two ways instead of just accepting a smaller pool: a longer
+//     inter-request pace (cgCountryFetchDelay) and one retry-after-
+//     backoff specifically for 429 responses (cgFetch429RetryDelay)
+//     before giving up on a given country — a country failing for any
+//     OTHER reason is skipped immediately, since 429 is the one failure
+//     mode confirmed transient.
+//   - addKey (GET https://<lower(name)>.cg-dialup.net:1337/addKey?pubkey=…,
+//     Authorization: Basic base64(token:tokenSecret)) is structurally
+//     identical to PIA's: register a fresh pubkey, get back this
+//     connection's own peer_ip, the server's WireGuard pubkey, and its
+//     real endpoint port (server_port — confirmed live it's 1337, the
+//     same port addKey itself is served on, unlike PIA which differs).
+//     dns_servers comes back in the same response instead of being a
+//     fixed constant the way PIA's is.
+//   - addKey's TLS certificate is self-signed per node (CN is the node's
+//     internal hostname, e.g. "newyork-rack416.nodes.gen4.ninja", issued
+//     by a "CyberGhost Root CA" the server itself does NOT send in the
+//     chain) — confirmed live via openssl s_client. Unlike PIA, there is
+//     no publicly published root cert to pin (PIA's own
+//     pia-foss/manual-connections repo ships ca.rsa.4096.crt; no
+//     equivalent CyberGhost repo does), and the cert differs per node
+//     rather than being one fixed value this file could embed. Uses
+//     InsecureSkipVerify for this one call as a result — the same
+//     trade-off an earlier version of PIAWireGuardProvider made before a
+//     real pinned CA became available; revisit if CyberGhost's root CA
+//     ever surfaces somewhere crackable.
+type CyberGhostWireGuardProvider struct {
+	username, password string
+
+	mu          sync.Mutex
+	token       string
+	tokenSecret string
+	servers     []cgServer
+	nextIdx     int
+	genCtr      int64
+	live        map[int64]*wgTunnel
+}
+
+type cgServer struct {
+	name        string // e.g. "NewYork-S416-i01" -> host is strings.ToLower(name)+".cg-dialup.net"
+	countryCode string
+}
+
+const (
+	cgAPIBase = "https://v2-api.cyberghostvpn.com"
+	// cgAppKey: see type doc comment — CyberGhost's own Linux-client app
+	// key, publicly embedded in an open-source alternate client, not a
+	// per-user secret.
+	cgAppKey = "QzgDsDNUXlgF9jehkTHHtBJwwI4RyInkZQDRJfLyz"
+
+	// cgCountryFetchDelay: pause between per-country server-list calls at
+	// startup — see type doc comment on why the full 100-country sweep
+	// needs pacing to avoid Cloudflare's rate limit. 15 requests at 0.4s
+	// each ran clean; back-to-back batches (two provider inits within
+	// ~10s of each other) started tripping 429s partway through the
+	// second batch, so this leaves real margin rather than just clearing
+	// the exact number observed to work once.
+	cgCountryFetchDelay = 600 * time.Millisecond
+
+	// cgFetch429RetryDelay: on a 429 specifically (confirmed transient —
+	// see type doc comment), wait this long and retry the SAME country
+	// once before giving up on it. Not applied to any other failure kind.
+	cgFetch429RetryDelay = 5 * time.Second
+)
+
+// cgCountries: the full country catalog CyberGhost's own GET
+// .../v2/my/servers/countries returned live (2026-08-09, 100 countries,
+// confirmed non-paginated) — fetching every one maximizes proxy/IP
+// diversity, per the operator's own stated priority. Hardcoded rather
+// than fetched at every startup because the countries endpoint needs the
+// same JWT/device dance as everything else here for no real benefit —
+// the set of countries CyberGhost offers changes rarely enough that a
+// stale list just means a newly-added country is missed until this is
+// refreshed by hand, not a wrong or broken server list.
+var cgCountries = []string{
+	"IT", "DE", "FR", "CH", "HK", "US", "NL", "KE", "BY", "AL",
+	"ES", "GB", "BR", "MX", "IS", "QA", "SE", "SI", "AT", "CL",
+	"CR", "MY", "FI", "DK", "BE", "RU", "KZ", "RO", "TH", "CA",
+	"JP", "IE", "BD", "LK", "IL", "CO", "HR", "AU", "TW", "VN",
+	"BA", "NP", "MM", "LA", "UY", "PE", "GT", "BO", "DO", "EC",
+	"SK", "AD", "IN", "KR", "CY", "MT", "GR", "GL", "MC", "NZ",
+	"MK", "MD", "HU", "NO", "CZ", "LT", "AE", "EG", "TR", "PH",
+	"KH", "SG", "CN", "IM", "LI", "PA", "MA", "GE", "AM", "VE",
+	"IR", "MO", "ME", "DZ", "SA", "PK", "AR", "PL", "PT", "NG",
+	"BG", "UA", "LV", "ID", "MN", "RS", "EE", "LU", "ZA", "BS",
+}
+
+// cgDeviceFilenameSafe replaces characters that don't belong in a filename
+// (an email's "@"/"." mainly) so cgDevicePath produces one file per
+// CyberGhost account without colliding across accounts.
+var cgDeviceFilenameSafe = strings.NewReplacer("@", "_at_", ".", "_", "/", "_", "\\", "_", ":", "_")
+
+// cgDevicePath: a cwd-relative path (NOT %LOCALAPPDATA%/os.UserConfigDir())
+// deliberately — same reasoning as mullvadKeysPath (this server runs both
+// as a SYSTEM-context Scheduled Task and as a plain interactive process,
+// and those resolve per-user paths differently; a cwd-relative path is the
+// same file either way since both launch with cwd pinned to the install
+// dir). One file per account, since the portal can configure more than one
+// CyberGhost account.
+func cgDevicePath(username string) string {
+	return filepath.Join(".", fmt.Sprintf("cyberghost_device_%s.json", cgDeviceFilenameSafe.Replace(username)))
+}
+
+type cgPersistedDevice struct {
+	Token       string `json:"token"`
+	TokenSecret string `json:"token_secret"`
+}
+
+// loadCyberGhostDevice reads a previously-saved device credential pair. A
+// missing file (first run ever for this account) is not an error —
+// returns "", "", nil so the caller registers a fresh device exactly like
+// before this fix existed.
+func loadCyberGhostDevice(username string) (token, tokenSecret string, err error) {
+	data, err := os.ReadFile(cgDevicePath(username))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", "", nil
+		}
+		return "", "", err
+	}
+	var d cgPersistedDevice
+	if err := json.Unmarshal(data, &d); err != nil {
+		return "", "", fmt.Errorf("parse %s: %w", cgDevicePath(username), err)
+	}
+	return d.Token, d.TokenSecret, nil
+}
+
+func saveCyberGhostDevice(username, token, tokenSecret string) error {
+	data, err := json.MarshalIndent(cgPersistedDevice{Token: token, TokenSecret: tokenSecret}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(cgDevicePath(username), data, 0o600)
+}
+
+// NewCyberGhostWireGuardProvider logs in, reuses a previously-registered
+// device credential pair if one was saved (or registers a fresh one and
+// saves it — see type doc comment on why registering fresh every restart
+// is not an option, it burns the account's hard device cap), and loads
+// the server list for every country in cgCountries once. Returns an error
+// if login, getting SOME device credential, or the server list all fail —
+// a provider with no device token or no servers can never build a
+// working lease.
+func NewCyberGhostWireGuardProvider(username, password string) (*CyberGhostWireGuardProvider, error) {
+	p := &CyberGhostWireGuardProvider{
+		username: username,
+		password: password,
+		live:     map[int64]*wgTunnel{},
+	}
+
+	jwt, err := p.login()
+	if err != nil {
+		return nil, fmt.Errorf("cyberghost login: %w", err)
+	}
+
+	token, tokenSecret, loadErr := loadCyberGhostDevice(username)
+	if loadErr != nil {
+		log.Printf("[CyberGhost-WG] could not read saved device (%v), registering fresh instead", loadErr)
+	}
+	if token == "" || tokenSecret == "" {
+		token, tokenSecret, err = p.registerDevice(jwt)
+		if err != nil {
+			return nil, fmt.Errorf("cyberghost device registration: %w", err)
+		}
+		if saveErr := saveCyberGhostDevice(username, token, tokenSecret); saveErr != nil {
+			// Not fatal — the newly registered device still works for
+			// THIS run, just won't survive to the next restart. Logged
+			// loudly since silently reverting to "register fresh every
+			// restart" is exactly the failure mode this fix exists to
+			// prevent (see type doc comment: 5 restarts exhausted the
+			// device cap).
+			log.Printf("[CyberGhost-WG] WARNING: could not save device credentials to %s (%v) — next restart will register a fresh device again and may hit the device cap", cgDevicePath(username), saveErr)
+		}
+	} else {
+		log.Printf("[CyberGhost-WG] reusing previously-registered device from %s", cgDevicePath(username))
+	}
+	p.mu.Lock()
+	p.token, p.tokenSecret = token, tokenSecret
+	p.mu.Unlock()
+
+	if err := p.refreshServers(jwt); err != nil {
+		return nil, fmt.Errorf("cyberghost server list: %w", err)
+	}
+
+	log.Printf("[CyberGhost-WG] Ready: %d server(s) across %d countries", len(p.servers), len(cgCountries))
+	return p, nil
+}
+
+func (p *CyberGhostWireGuardProvider) Close() {
+	p.mu.Lock()
+	live := p.live
+	p.live = map[int64]*wgTunnel{}
+	p.mu.Unlock()
+	for _, t := range live {
+		t.socks.Close()
+		t.dev.Close()
+	}
+}
+
+// cgHTTPStatusError carries the real HTTP status code through cgDoJSON's
+// error return so callers that need to react to a SPECIFIC status (429,
+// see refreshServers) can, without string-parsing an error message.
+type cgHTTPStatusError struct {
+	Status int
+	Body   string
+}
+
+func (e *cgHTTPStatusError) Error() string {
+	return fmt.Sprintf("HTTP %d: %s", e.Status, e.Body)
+}
+
+func cgDoJSON(method, u string, headers map[string]string, body any, out any) error {
+	var reader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		reader = strings.NewReader(string(b))
+	}
+	req, err := http.NewRequest(method, u, reader)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	// Login and the server-list/countries GETs return 200; device
+	// registration (POST /v2/my/devices) returns 201 Created (confirmed
+	// live 2026-08-09) — accept any 2xx rather than hardcoding one status
+	// per call site.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return &cgHTTPStatusError{Status: resp.StatusCode, Body: truncate(string(respBody), 200)}
+	}
+	if out != nil {
+		if err := json.Unmarshal(respBody, out); err != nil {
+			return fmt.Errorf("parse response: %w: %s", err, truncate(string(respBody), 200))
+		}
+	}
+	return nil
+}
+
+func (p *CyberGhostWireGuardProvider) login() (string, error) {
+	var out struct {
+		JWT string `json:"jwt"`
+	}
+	err := cgDoJSON(http.MethodPost, cgAPIBase+"/v2/my/account/jwt?language=en",
+		map[string]string{"x-app-key": cgAppKey},
+		map[string]string{"userName": p.username, "password": p.password},
+		&out)
+	if err != nil {
+		return "", err
+	}
+	if out.JWT == "" {
+		return "", fmt.Errorf("empty jwt in response")
+	}
+	log.Printf("[CyberGhost-WG] Logged in as %s", p.username)
+	return out.JWT, nil
+}
+
+func (p *CyberGhostWireGuardProvider) registerDevice(jwt string) (token, tokenSecret string, err error) {
+	var out struct {
+		Token       string `json:"token"`
+		TokenSecret string `json:"tokenSecret"`
+	}
+	err = cgDoJSON(http.MethodPost, cgAPIBase+"/v2/my/devices",
+		map[string]string{"x-app-key": cgAppKey, "Authorization": "Bearer " + jwt},
+		map[string]any{"linuxApp": true, "machineName": ""},
+		&out)
+	if err != nil {
+		return "", "", err
+	}
+	if out.Token == "" || out.TokenSecret == "" {
+		return "", "", fmt.Errorf("empty token/tokenSecret in response")
+	}
+	return out.Token, out.TokenSecret, nil
+}
+
+// fetchCountryServers does one GET for a single country's WireGuard server
+// list, retrying exactly once (after cgFetch429RetryDelay) if and only if
+// the failure was a 429 — see type doc comment on why 429 specifically is
+// treated as transient and nothing else is.
+func (p *CyberGhostWireGuardProvider) fetchCountryServers(headers map[string]string, cc string) ([]cgServer, error) {
+	var out []struct {
+		Name        string `json:"name"`
+		CountryCode string `json:"countrycode"`
+	}
+	u := cgAPIBase + "/v2/my/servers/filters/74?filter_protocol=wireguard&filter_country=" + url.QueryEscape(cc)
+
+	err := cgDoJSON(http.MethodGet, u, headers, nil, &out)
+	if err != nil {
+		var httpErr *cgHTTPStatusError
+		if errors.As(err, &httpErr) && httpErr.Status == http.StatusTooManyRequests {
+			log.Printf("[CyberGhost-WG] %s rate-limited (429), retrying once after %s", cc, cgFetch429RetryDelay)
+			time.Sleep(cgFetch429RetryDelay)
+			err = cgDoJSON(http.MethodGet, u, headers, nil, &out)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	servers := make([]cgServer, 0, len(out))
+	for _, s := range out {
+		if s.Name == "" {
+			continue
+		}
+		servers = append(servers, cgServer{name: s.Name, countryCode: s.CountryCode})
+	}
+	return servers, nil
+}
+
+// refreshServers fetches every country in cgCountries in turn (see
+// cgCountryFetchDelay/cgFetch429RetryDelay doc comments), then makes one
+// slower cleanup pass over whatever still failed. This two-pass shape
+// exists because Cloudflare's rate limit observed live (2026-08-09) isn't
+// simply "N requests total" — it comes in bursty streaks (a run of ~10-20
+// consecutive countries all 429ing, then a long clean stretch, then
+// another streak), so a country caught in one streak often succeeds fine
+// once retried later with the streak's window long expired, even though
+// its own immediate cgFetch429RetryDelay retry (5s) landed inside the
+// same streak and failed too. A country still failing after BOTH the
+// per-country retry and this cleanup pass is logged and skipped rather
+// than failing the whole provider — losing a handful of the 100 still
+// leaves a large, usable pool.
+func (p *CyberGhostWireGuardProvider) refreshServers(jwt string) error {
+	headers := map[string]string{"x-app-key": cgAppKey, "Authorization": "Bearer " + jwt}
+	var servers []cgServer
+	var failed []string
+	for i, cc := range cgCountries {
+		if i > 0 {
+			time.Sleep(cgCountryFetchDelay)
+		}
+		got, err := p.fetchCountryServers(headers, cc)
+		if err != nil {
+			log.Printf("[CyberGhost-WG] server list for %s failed, will retry in cleanup pass: %v", cc, err)
+			failed = append(failed, cc)
+			continue
+		}
+		servers = append(servers, got...)
+	}
+
+	if len(failed) > 0 {
+		log.Printf("[CyberGhost-WG] cleanup pass: retrying %d countries that failed in the main sweep", len(failed))
+		var stillFailed []string
+		for i, cc := range failed {
+			if i > 0 {
+				time.Sleep(cgCountryFetchDelay * 2)
+			}
+			got, err := p.fetchCountryServers(headers, cc)
+			if err != nil {
+				stillFailed = append(stillFailed, cc)
+				continue
+			}
+			servers = append(servers, got...)
+		}
+		if len(stillFailed) > 0 {
+			log.Printf("[CyberGhost-WG] %d/%d countries skipped after main sweep + cleanup pass: %s", len(stillFailed), len(cgCountries), strings.Join(stillFailed, ","))
+		}
+	}
+
+	if len(servers) == 0 {
+		return fmt.Errorf("no servers loaded across %d countries", len(cgCountries))
+	}
+	p.mu.Lock()
+	p.servers = servers
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *CyberGhostWireGuardProvider) nextCandidate() (cgServer, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.servers) == 0 {
+		return cgServer{}, fmt.Errorf("no CyberGhost servers loaded")
+	}
+	s := p.servers[p.nextIdx%len(p.servers)]
+	p.nextIdx++
+	return s, nil
+}
+
+type cgAddKeyResponse struct {
+	Status     string   `json:"status"`
+	ServerKey  string   `json:"server_key"`
+	ServerIP   string   `json:"server_ip"`
+	ServerPort int      `json:"server_port"`
+	PeerIP     string   `json:"peer_ip"`
+	DNSServers []string `json:"dns_servers"`
+}
+
+// addKey registers a fresh public key with one CyberGhost server — see
+// type doc comment for why InsecureSkipVerify is used here specifically
+// (self-signed per-node cert, no publicly pinnable root available).
+func (p *CyberGhostWireGuardProvider) addKey(s cgServer, token, tokenSecret, pubKeyB64 string) (*cgAddKeyResponse, error) {
+	host := strings.ToLower(s.name) + ".cg-dialup.net"
+	u := fmt.Sprintf("https://%s:1337/addKey?pubkey=%s", host, url.QueryEscape(pubKeyB64))
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	auth := base64.StdEncoding.EncodeToString([]byte(token + ":" + tokenSecret))
+	req.Header.Set("Authorization", "Basic "+auth)
+
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(body), 200))
+	}
+	var out cgAddKeyResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("parse addKey response: %w: %s", err, truncate(string(body), 200))
+	}
+	if out.Status != "OK" {
+		return nil, fmt.Errorf("addKey status=%q", out.Status)
+	}
+	return &out, nil
+}
+
+// tryOne mirrors PIAWireGuardProvider.tryOne exactly (see that file for
+// the full reasoning): fresh keypair, register it, build the tunnel from
+// what addKey hands back, wait briefly for a real handshake, then prove
+// data actually flows with one real HTTP round trip.
+func (p *CyberGhostWireGuardProvider) tryOne(s cgServer, token, tokenSecret string) (*wgTunnel, error) {
+	curve := ecdh.X25519()
+	priv, err := curve.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate keypair: %w", err)
+	}
+	pubB64 := base64.StdEncoding.EncodeToString(priv.PublicKey().Bytes())
+
+	ak, err := p.addKey(s, token, tokenSecret, pubB64)
+	if err != nil {
+		return nil, fmt.Errorf("addKey: %w", err)
+	}
+
+	peerAddr, err := netip.ParseAddr(ak.PeerIP)
+	if err != nil {
+		return nil, fmt.Errorf("bad peer_ip %q: %w", ak.PeerIP, err)
+	}
+	dnsIP := "10.0.0.243"
+	if len(ak.DNSServers) > 0 {
+		dnsIP = ak.DNSServers[0]
+	}
+	dnsAddr, err := netip.ParseAddr(dnsIP)
+	if err != nil {
+		return nil, fmt.Errorf("bad dns %q: %w", dnsIP, err)
+	}
+
+	tun, tnet, err := netstack.CreateNetTUN([]netip.Addr{peerAddr}, []netip.Addr{dnsAddr}, 1420)
+	if err != nil {
+		return nil, fmt.Errorf("create tun: %w", err)
+	}
+	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, ""))
+
+	privHex := hex.EncodeToString(priv.Bytes())
+	serverPubRaw, err := base64.StdEncoding.DecodeString(ak.ServerKey)
+	if err != nil {
+		dev.Close()
+		return nil, fmt.Errorf("bad server_key: %w", err)
+	}
+	serverPubHex := hex.EncodeToString(serverPubRaw)
+
+	port := ak.ServerPort
+	if port == 0 {
+		port = 1337
+	}
+	ipc := fmt.Sprintf(
+		"private_key=%s\npublic_key=%s\nendpoint=%s:%d\nallowed_ip=0.0.0.0/0\npersistent_keepalive_interval=25\n",
+		privHex, serverPubHex, ak.ServerIP, port,
+	)
+	if err := dev.IpcSet(ipc); err != nil {
+		dev.Close()
+		return nil, fmt.Errorf("ipc set: %w", err)
+	}
+	if err := dev.Up(); err != nil {
+		dev.Close()
+		return nil, fmt.Errorf("device up: %w", err)
+	}
+
+	handshakeOK := false
+	deadline := time.Now().Add(wgHandshakeTimeout)
+	for time.Now().Before(deadline) {
+		time.Sleep(200 * time.Millisecond)
+		info, err := dev.IpcGet()
+		if err == nil && strings.Contains(info, "last_handshake_time_sec=") && !strings.Contains(info, "last_handshake_time_sec=0\n") {
+			handshakeOK = true
+			break
+		}
+	}
+	if !handshakeOK {
+		dev.Close()
+		return nil, fmt.Errorf("no handshake within %s", wgHandshakeTimeout)
+	}
+
+	client := &http.Client{Transport: &http.Transport{DialContext: tnet.DialContext}, Timeout: wgProbeTimeout}
+	resp, err := client.Get("https://api.ipify.org?format=json")
+	if err != nil {
+		dev.Close()
+		return nil, fmt.Errorf("data path check failed: %w", err)
+	}
+	resp.Body.Close()
+
+	socksSrv, err := newLocalSOCKS5Server(func(network, addr string) (net.Conn, error) {
+		return tnet.DialContext(context.Background(), network, addr)
+	})
+	if err != nil {
+		dev.Close()
+		return nil, fmt.Errorf("local socks5 listener: %w", err)
+	}
+
+	return &wgTunnel{dev: dev, socks: socksSrv}, nil
+}
+
+func (p *CyberGhostWireGuardProvider) acquireLease() (Lease, error) {
+	p.mu.Lock()
+	token, tokenSecret := p.token, p.tokenSecret
+	p.mu.Unlock()
+	if token == "" || tokenSecret == "" {
+		return Lease{}, fmt.Errorf("no CyberGhost device token")
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < wgMaxAcquireAttempts; attempt++ {
+		s, err := p.nextCandidate()
+		if err != nil {
+			return Lease{}, err
+		}
+		t, err := p.tryOne(s, token, tokenSecret)
+		if err != nil {
+			lastErr = fmt.Errorf("%s (%s): %w", s.name, s.countryCode, err)
+			continue
+		}
+		p.mu.Lock()
+		p.genCtr++
+		gen := p.genCtr
+		p.live[gen] = t
+		p.mu.Unlock()
+		return Lease{URL: "socks5://" + t.socks.Addr(), AcquiredAt: time.Now(), Generation: gen}, nil
+	}
+	return Lease{}, fmt.Errorf("no working CyberGhost WireGuard server after %d attempts (last: %v)", wgMaxAcquireAttempts, lastErr)
+}
+
+func (p *CyberGhostWireGuardProvider) Acquire(ctx context.Context, workerID int, emit func(string)) (Lease, error) {
+	if emit != nil {
+		emit("Đang tìm server CyberGhost (WireGuard) khả dụng…")
+	}
+	return p.acquireLease()
+}
+
+func (p *CyberGhostWireGuardProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, emit func(string)) (Lease, error) {
+	p.closeLease(oldLease.Generation)
+	if emit != nil {
+		emit("Đang đổi sang server CyberGhost khác…")
+	}
+	return p.acquireLease()
+}
+
+func (p *CyberGhostWireGuardProvider) Release(workerID int, lease Lease) {
+	p.closeLease(lease.Generation)
+}
+
+func (p *CyberGhostWireGuardProvider) closeLease(gen int64) {
+	p.mu.Lock()
+	t, ok := p.live[gen]
+	if ok {
+		delete(p.live, gen)
+	}
+	p.mu.Unlock()
+	if ok {
+		t.socks.Close()
+		t.dev.Close()
+	}
+}

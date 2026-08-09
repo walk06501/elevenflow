@@ -9,6 +9,7 @@
 //
 //	go run ./cmd/testconcurrency -provider pia -user <PIA_USER> -pass <PIA_PASS> -count 10
 //	go run ./cmd/testconcurrency -provider surfshark -key <SURFSHARK_PRIVATE_KEY> -count 10
+//	go run ./cmd/testconcurrency -provider cyberghost -cg-user <CG_USER> -cg-pass <CG_PASS> -count 10
 package main
 
 import (
@@ -29,12 +30,14 @@ type acquirer interface {
 }
 
 func main() {
-	providerName := flag.String("provider", "", "\"pia\", \"surfshark\", \"proton\", or \"ipvanish\"")
+	providerName := flag.String("provider", "", "\"pia\", \"surfshark\", \"proton\", \"ipvanish\", or \"cyberghost\"")
 	user := flag.String("user", os.Getenv("ELEVEN_PIA_USERNAME"), "PIA username (provider=pia)")
 	pass := flag.String("pass", os.Getenv("ELEVEN_PIA_PASSWORD"), "PIA password (provider=pia)")
 	key := flag.String("key", os.Getenv("ELEVEN_SURFSHARK_PRIVATE_KEY"), "Surfshark private key (provider=surfshark)")
 	protonUser := flag.String("proton-user", os.Getenv("ELEVEN_PROTON_USERNAME"), "ProtonVPN username (provider=proton)")
 	protonPass := flag.String("proton-pass", os.Getenv("ELEVEN_PROTON_PASSWORD"), "ProtonVPN password (provider=proton)")
+	cgUser := flag.String("cg-user", os.Getenv("ELEVEN_CYBERGHOST_USERNAME"), "CyberGhost username (provider=cyberghost)")
+	cgPass := flag.String("cg-pass", os.Getenv("ELEVEN_CYBERGHOST_PASSWORD"), "CyberGhost password (provider=cyberghost)")
 	count := flag.Int("count", 10, "how many leases to acquire concurrently, same account")
 	hold := flag.Duration("hold", 5*time.Second, "keep each successful lease open this long before releasing")
 	flag.Parse()
@@ -63,8 +66,14 @@ func main() {
 	case "ipvanish":
 		fmt.Println("Building IPVanishWireGuardProvider...")
 		p, err = webview2bridge.NewIPVanishWireGuardProvider()
+	case "cyberghost":
+		if *cgUser == "" || *cgPass == "" {
+			log.Fatal("need -cg-user/-cg-pass or ELEVEN_CYBERGHOST_USERNAME/ELEVEN_CYBERGHOST_PASSWORD")
+		}
+		fmt.Println("Building CyberGhostWireGuardProvider...")
+		p, err = webview2bridge.NewCyberGhostWireGuardProvider(*cgUser, *cgPass)
 	default:
-		log.Fatal("need -provider pia|surfshark|proton|ipvanish")
+		log.Fatal("need -provider pia|surfshark|proton|ipvanish|cyberghost")
 	}
 	if err != nil {
 		log.Fatalf("provider init failed: %v", err)

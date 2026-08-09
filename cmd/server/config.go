@@ -71,6 +71,16 @@ type Config struct {
 	// on only after confirming with cmd/testconcurrency like the others.
 	IPVanishWireGuard bool // ELEVEN_IPVANISH_WIREGUARD
 
+	// CyberGhostUsername/CyberGhostPassword: CyberGhost account credentials
+	// (username+password login, like PIA/Proton — see
+	// CyberGhostWireGuardProvider's doc comment for the 3-legged auth flow
+	// this feeds into). CyberGhostWireGuard opt-in for the same reason as
+	// IPVanish/Mullvad/Proton above: unverified under real concurrency
+	// until confirmed with cmd/testconcurrency.
+	CyberGhostUsername  string // ELEVEN_CYBERGHOST_USERNAME
+	CyberGhostPassword  string // ELEVEN_CYBERGHOST_PASSWORD
+	CyberGhostWireGuard bool   // ELEVEN_CYBERGHOST_WIREGUARD
+
 	// UsePersistentPool switches HandleSynthesize from the old per-request
 	// spawn-then-teardown Run() to webview2bridge.SessionPool — a fixed set
 	// of WebView2 sessions kept warm and reused ACROSS requests, only
@@ -157,6 +167,9 @@ func LoadConfig() *Config {
 		MullvadAccountNumber: getEnv("ELEVEN_MULLVAD_ACCOUNT", ""),
 		MullvadWireGuard:     getEnv("ELEVEN_MULLVAD_WIREGUARD", "") == "true",
 		IPVanishWireGuard:    getEnv("ELEVEN_IPVANISH_WIREGUARD", "") == "true",
+		CyberGhostUsername:   getEnv("ELEVEN_CYBERGHOST_USERNAME", ""),
+		CyberGhostPassword:   getEnv("ELEVEN_CYBERGHOST_PASSWORD", ""),
+		CyberGhostWireGuard:  getEnv("ELEVEN_CYBERGHOST_WIREGUARD", "") == "true",
 
 		UsePersistentPool:              getEnv("ELEVEN_PERSISTENT_POOL", "") == "true",
 		PersistentPoolSessions:         getEnvInt("ELEVEN_PERSISTENT_POOL_SESSIONS", 0),

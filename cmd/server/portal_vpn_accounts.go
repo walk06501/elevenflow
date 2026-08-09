@@ -114,6 +114,11 @@ func envVPNAccounts(cfg *Config) map[string][]portalVPNAccount {
 			Provider: "mullvad", Label: "mullvad (.env)", Secret: cfg.MullvadAccountNumber,
 		})
 	}
+	if cfg.CyberGhostUsername != "" && cfg.CyberGhostPassword != "" {
+		grouped["cyberghost"] = append(grouped["cyberghost"], portalVPNAccount{
+			Provider: "cyberghost", Label: "cyberghost (.env)", Username: cfg.CyberGhostUsername, Secret: cfg.CyberGhostPassword,
+		})
+	}
 	return grouped
 }
 

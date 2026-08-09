@@ -86,6 +86,11 @@ func main() {
 	//     1-2.5s/lease). Mỗi lease tự sinh cặp khoá X25519 mới rồi đăng ký
 	//     riêng (xem addKey), nên các kết nối độc lập thật sự trên 361+
 	//     server — nguồn đáng tin cậy nhất trong 4 nguồn, gánh phần lớn tải.
+	//   - CyberGhost-WireGuard (6): đo được 25/25 thành công cùng lúc
+	//     (2026-08-09), 2.3-2.7s/lease, KHÔNG chậm lại khi tải cao (kiến trúc
+	//     addKey giống hệt PIA — mỗi lease tự sinh khoá riêng, xem
+	//     cyberghost_wireguard_provider.go) — đặt ngang PIA vì số đo thực tế
+	//     tương đương, dù mới (chỉ 1 tài khoản, chưa chạy dài hạn trên prod).
 	//   - Surfshark (2): CŨNG đo được 30/30 thành công dù dùng CHUNG 1 khoá
 	//     tĩnh (giống NordVPN-WG về kiến trúc) — bác bỏ giả thuyết cũ rằng
 	//     dùng chung khoá tĩnh ắt bị tranh đường dữ liệu như NordVPN; đó là
@@ -121,6 +126,12 @@ func main() {
 		piaWGWeight      = 6
 		surfsharkWeight  = 2
 		protonWGWeight   = 3
+		// cyberghostWGWeight (6): đo được 25/25 thành công cùng lúc
+		// (2026-08-09, cmd/testconcurrency), latency 2.3-2.7s/lease — KHÔNG
+		// tăng khi tải cao (khác hẳn Surfshark), không thấy dấu hiệu trần
+		// kết nối đồng thời nào như NordVPN-WG. Đặt ngang PIA (nguồn đáng
+		// tin nhất hiện có) vì số đo thực tế tương đương.
+		cyberghostWGWeight = 6
 	)
 
 	// See loadVPNAccounts (portal_vpn_accounts.go): web-portal's admin
@@ -136,6 +147,7 @@ func main() {
 	surfsharkAccounts := vpnAccounts["surfshark"]
 	protonAccounts := vpnAccounts["proton"]
 	mullvadAccounts := vpnAccounts["mullvad"]
+	cyberghostAccounts := vpnAccounts["cyberghost"]
 
 	var vpnProviders []webview2bridge.ProxyProvider
 	if len(nordAccounts) > 0 {
@@ -256,6 +268,23 @@ func main() {
 			}
 			mullvadInit++
 			log.Printf("Mullvad WireGuard proxy source active: account #%d, %d concurrent key slot(s) (weight %d)", mullvadInit, weight, weight)
+		}
+	}
+	if len(cyberghostAccounts) > 0 && cfg.CyberGhostWireGuard {
+		cgInit := 0
+		for _, a := range cyberghostAccounts {
+			cgWG, err := webview2bridge.NewCyberGhostWireGuardProvider(a.Username, a.Secret)
+			if err != nil {
+				log.Printf("CyberGhost WireGuard provider init failed for %s, skipping: %v", a.Username, err)
+				continue
+			}
+			for i := 0; i < cyberghostWGWeight; i++ {
+				vpnProviders = append(vpnProviders, cgWG)
+			}
+			cgInit++
+		}
+		if cgInit > 0 {
+			log.Printf("CyberGhost WireGuard proxy source active: %d account(s) (weight %d each, opt-in, unverified under concurrency — see doc comment)", cgInit, cyberghostWGWeight)
 		}
 	}
 	if cfg.IPVanishWireGuard {
