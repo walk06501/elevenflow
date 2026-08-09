@@ -342,6 +342,11 @@ func (h *Handler) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	if h.sessionPool != nil {
 		resp["persistent_pool_active_sessions"] = h.sessionPool.ActiveSessions()
+		smallQ, bigQ, smallTotal, bigTotal := h.sessionPool.QueueStats()
+		resp["queue_small_waiting"] = smallQ
+		resp["queue_big_waiting"] = bigQ
+		resp["queue_small_total"] = smallTotal
+		resp["queue_big_total"] = bigTotal
 	}
 
 	w.Header().Set("Content-Type", "application/json")

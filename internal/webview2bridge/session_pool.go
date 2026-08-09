@@ -61,6 +61,13 @@ type SessionPool struct {
 
 	activeSessions atomic.Int32 // đang có WebView2 mở (không tính lúc idle-closed)
 
+	// Đếm cộng dồn số chunk đã ĐƯA VÀO mỗi hàng (không phải số đã xử lý
+	// xong) — đủ để trả lời "job nhỏ có thực sự chiếm được ưu tiên không"
+	// qua /health hoặc log định kỳ (statsLogger), không cần công cụ đo
+	// riêng. Xem Submit() (nơi tăng) và statsLogger/QueueStats (nơi đọc).
+	smallJobsEnqueued atomic.Int64
+	bigJobsEnqueued   atomic.Int64
+
 	// chunkCache: kết quả chunk ĐÃ THÀNH CÔNG của 1 JobID (web-portal gửi
 	// job_nodes.id), để 1 request retry (do 1 vài chunk khác lỗi) không phải
 	// làm lại TOÀN BỘ text — chỉ chunk nào chưa có trong cache mới thật sự
@@ -187,7 +194,41 @@ func NewSessionPool(cfg SessionPoolConfig) (*SessionPool, error) {
 	}
 	sp.chunkCache = make(map[string]*jobChunkCache)
 	go sp.chunkCacheJanitor()
+	go sp.statsLogger()
 	return sp, nil
+}
+
+// QueueStats trả độ sâu hàng đợi NGAY LÚC GỌI (bao nhiêu chunk đang chờ
+// nhặt) và tổng số chunk đã từng đưa vào mỗi hàng từ lúc server khởi động —
+// dùng cho /health (handler.go) và statsLogger bên dưới. Không khoá gì cả:
+// len() trên channel buffered và atomic.Load đều an toàn đọc đồng thời.
+func (sp *SessionPool) QueueStats() (smallQueued, bigQueued int, smallTotal, bigTotal int64) {
+	return len(sp.smallJobs), len(sp.jobs), sp.smallJobsEnqueued.Load(), sp.bigJobsEnqueued.Load()
+}
+
+// statsLogger in định kỳ tỉ lệ job nhỏ/lớn thật — dữ liệu để biết ngưỡng
+// SmallJobChunkThreshold (mặc định 5) có đang hợp lý không, và độ sâu hàng
+// đợi hiện tại có báo hiệu NumSessions đã không đủ cho tải thật hay chưa
+// (hàng đợi liên tục dài dù job nhỏ vẫn được ưu tiên → cần tăng NumSessions/
+// nâng cấp tài nguyên, không phải chỉnh lại threshold).
+func (sp *SessionPool) statsLogger() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-sp.closed:
+			return
+		case <-ticker.C:
+			smallQ, bigQ, smallTotal, bigTotal := sp.QueueStats()
+			total := smallTotal + bigTotal
+			if total == 0 {
+				continue
+			}
+			pct := float64(smallTotal) / float64(total) * 100
+			log.Printf("[queue-stats] small=%d/%d (%.1f%%) big=%d queued_now: small=%d big=%d active_sessions=%d",
+				smallTotal, total, pct, bigTotal, smallQ, bigQ, sp.ActiveSessions())
+		}
+	}
 }
 
 // chunkCacheJanitor dọn jobChunkCache định kỳ — job nào không được "chạm"
@@ -409,6 +450,9 @@ func (sp *SessionPool) Submit(ctx context.Context, chunks []Chunk, emit EmitFn) 
 		targetQueue := sp.jobs
 		if total <= sp.cfg.SmallJobChunkThreshold {
 			targetQueue = sp.smallJobs
+			sp.smallJobsEnqueued.Add(1)
+		} else {
+			sp.bigJobsEnqueued.Add(1)
 		}
 		select {
 		case targetQueue <- job:
