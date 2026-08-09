@@ -42,10 +42,22 @@ type SessionPool struct {
 	cfg  SessionPoolConfig
 	pool *Pool // chỉ dùng cho proxyProvider/requestFor — KHÔNG có config TTS cố định
 
-	jobs   chan sessionJob
-	closed chan struct{}
-	once   sync.Once
-	wg     sync.WaitGroup
+	// jobs: chunks thuộc request "lớn" (> smallJobChunkThreshold chunk).
+	// smallJobs: chunks thuộc request "nhỏ" — sessionLoop LUÔN ưu tiên nhặt
+	// ở đây trước (xem sessionLoop's select). Tách 2 hàng đợi thay vì 1
+	// FIFO chung vì lý do thật đã gặp production (2026-08-09): 1 tài khoản
+	// gửi job hàng trăm chunk (vd 223 node cùng lúc) chiếm gần hết pool
+	// NumSessions, khiến job 1-chunk của khách khác (nhiều khả năng là
+	// user mới/dùng thử, dễ rời đi nếu đợi lâu) phải xếp hàng y hệt job
+	// khổng lồ dù đáng lẽ chỉ mất vài giây. Không cần priority queue phức
+	// tạp — 2 channel + "ưu tiên đọc smallJobs trước" là đủ, giữ nguyên
+	// toàn bộ semantics cũ (backpressure qua buffer size, ctx-cancel lúc
+	// chờ, đóng pool) cho cả 2 hàng.
+	jobs      chan sessionJob
+	smallJobs chan sessionJob
+	closed    chan struct{}
+	once      sync.Once
+	wg        sync.WaitGroup
 
 	activeSessions atomic.Int32 // đang có WebView2 mở (không tính lúc idle-closed)
 
@@ -99,7 +111,18 @@ type SessionPoolConfig struct {
 	// đợi đầy (áp lực ngược tự nhiên thay vì OOM nếu traffic v ượt xa NumSessions).
 	// 0 → mặc định NumSessions*8.
 	JobQueueSize int
+
+	// SmallJobChunkThreshold: request có total chunk <= giá trị này được
+	// coi là "nhỏ", vào hàng đợi ưu tiên riêng (xem SessionPool.smallJobs
+	// doc comment). 0 → mặc định defaultSmallJobChunkThreshold.
+	SmallJobChunkThreshold int
 }
+
+// defaultSmallJobChunkThreshold: hầu hết job kind=single/batch chỉ 1-4 chunk
+// (văn bản ngắn, ChunkMax mặc định 600 ký tự/chunk); job kind=dialogue nhiều
+// lượt thoại thật sự "lớn" thường lên tới hàng trăm node. 5 tách rõ 2 nhóm
+// đó mà không cần cấu hình gì thêm cho phần lớn deployment.
+const defaultSmallJobChunkThreshold = 5
 
 type sessionJob struct {
 	ctx    context.Context
@@ -132,6 +155,9 @@ func NewSessionPool(cfg SessionPoolConfig) (*SessionPool, error) {
 	if cfg.JobQueueSize <= 0 {
 		cfg.JobQueueSize = cfg.NumSessions * 8
 	}
+	if cfg.SmallJobChunkThreshold <= 0 {
+		cfg.SmallJobChunkThreshold = defaultSmallJobChunkThreshold
+	}
 	if cfg.DataRoot == "" {
 		cfg.DataRoot = filepath.Join(os.TempDir(), "elevenflow-session-pool-profiles")
 	}
@@ -144,9 +170,10 @@ func NewSessionPool(cfg SessionPoolConfig) (*SessionPool, error) {
 		// pool chỉ để tái dùng proxyProvider + requestFor(chunk) từ worker.go —
 		// totalChunks/emitFn ở đây không dùng tới (mỗi job tự mang emit/total
 		// riêng qua overrideEmit/overrideTotal, xem worker.go).
-		pool:   &Pool{proxyProvider: cfg.Provider},
-		jobs:   make(chan sessionJob, cfg.JobQueueSize),
-		closed: make(chan struct{}),
+		pool:      &Pool{proxyProvider: cfg.Provider},
+		jobs:      make(chan sessionJob, cfg.JobQueueSize),
+		smallJobs: make(chan sessionJob, cfg.JobQueueSize),
+		closed:    make(chan struct{}),
 	}
 
 	diaglog.Append("session_pool_start", map[string]any{
@@ -375,8 +402,16 @@ func (sp *SessionPool) Submit(ctx context.Context, chunks []Chunk, emit EmitFn) 
 		rc := make(chan ChunkResult, 1)
 		resultChans[i] = rc
 		job := sessionJob{ctx: ctx, chunk: c, emit: emit, total: total, result: rc}
+		// Request nhỏ (total <= SmallJobChunkThreshold) vào hàng ưu tiên
+		// riêng — sessionLoop luôn nhặt ở đây trước, nên 1 job vài chunk
+		// không bao giờ phải xếp hàng dài sau 1 job hàng trăm chunk (xem
+		// SessionPool.smallJobs doc comment cho bối cảnh đầy đủ).
+		targetQueue := sp.jobs
+		if total <= sp.cfg.SmallJobChunkThreshold {
+			targetQueue = sp.smallJobs
+		}
 		select {
-		case sp.jobs <- job:
+		case targetQueue <- job:
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-sp.closed:
@@ -465,7 +500,106 @@ func (sp *SessionPool) sessionLoop(id int) {
 	idleTimer := time.NewTimer(sp.cfg.IdleCloseAfter)
 	defer idleTimer.Stop()
 
+	// handleJob xử lý đúng 1 job — tách riêng để cả 3 điểm nhận job trong
+	// vòng lặp bên dưới (peek ưu tiên smallJobs, rồi 2 case trong select
+	// chính) dùng chung, không lặp lại logic. Đóng lại các biến spawned/
+	// idleTimer/w của sessionLoop qua closure, hành vi y hệt bản gốc.
+	handleJob := func(job sessionJob) {
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+
+		if job.ctx.Err() != nil {
+			// Caller đã bỏ cuộc trong lúc job còn nằm trong hàng đợi — trả
+			// lỗi ngay, không tốn 1 lần acquire/spawn/hCaptcha vô ích.
+			job.result <- ChunkResult{
+				ID: job.chunk.ID, GroupID: job.chunk.GroupID,
+				Output: job.chunk.OutputPath, WorkerID: id,
+				Message: job.ctx.Err().Error(),
+			}
+			idleTimer.Reset(sp.cfg.IdleCloseAfter)
+			return
+		}
+
+		w.overrideEmit = job.emit
+		w.overrideTotal = job.total
+
+		if !spawned {
+			// QUAN TRỌNG: nếu đã từng có lease (currentLease.URL != ""),
+			// đây là thức dậy sau idle-close — KHÔNG được gọi lại Acquire().
+			// Với các provider WireGuard (Nord/PIA/Surfshark), Acquire() luôn
+			// tạo 1 tunnel MỚI hoàn toàn; gọi lại ở đây trong khi tunnel cũ
+			// (đứng sau lease hiện có) vẫn còn sống — vì idle-close chỉ
+			// teardown cửa sổ WebView2, không đụng tới lease — sẽ làm rò rỉ
+			// tunnel cũ vĩnh viễn (không ai còn giữ generation của nó để
+			// đóng). Idle-close nghĩa là "đóng cửa sổ, giữ nguyên IP", nên
+			// thức dậy phải mở lại cửa sổ trên ĐÚNG lease đang có, chỉ
+			// Acquire() thật sự khi đây là lần đầu tiên (chưa có lease nào).
+			//
+			// Trước khi mở lại cửa sổ trên lease cũ, xác nhận nó CÒN SỐNG:
+			// giữ tunnel chạy suốt lúc idle không đảm bảo nó còn hoạt động
+			// hàng phút/giờ sau (server phía kia hết hạn session, NAT
+			// timeout dù đã keepalive, IP bị ban ngay lúc không dùng...).
+			// Không probe thì lease chết chỉ lộ ra SAU KHI mở cửa sổ thành
+			// công (mở cửa sổ không cần mạng) qua 1 lần navigation timeout
+			// 2 phút trong processChunkOnce — probe biến đó thành phát
+			// hiện ~6s, rồi rotate ngay như đường lỗi bình thường.
+			var spawnErr error
+			switch {
+			case w.currentLease.URL == "":
+				spawnErr = w.acquireProxyAndSpawn(job.ctx)
+			case probeLeaseAlive(w.currentLease, 6*time.Second) != nil:
+				spawnErr = w.rotateAndRespawn(job.ctx, job.chunk.ID, "kết nối rảnh lâu đã hết hạn")
+			default:
+				spawnErr = w.spawnWebView2WithRetry(job.ctx, 3)
+			}
+			if spawnErr != nil {
+				job.result <- ChunkResult{
+					ID: job.chunk.ID, GroupID: job.chunk.GroupID,
+					Output: job.chunk.OutputPath, WorkerID: id,
+					Message: fmt.Sprintf("không mở được phiên: %v", spawnErr),
+				}
+				idleTimer.Reset(sp.cfg.IdleCloseAfter)
+				return
+			}
+			spawned = true
+			sp.activeSessions.Add(1)
+		}
+
+		res := w.processChunkWithRetry(job.ctx, job.chunk)
+		job.result <- res
+
+		// processChunkWithRetry tự rotate+respawn khi lỗi transient/bị ban;
+		// w.chromium == nil nghĩa là NGAY CẢ retry rotate cũng hết sạch
+		// (spawnWebView2WithRetry thất bại liên tục, vd disk full kéo dài).
+		// Không thoát goroutine — chỉ đánh dấu "chưa mở" để job KẾ TIẾP tự
+		// acquire+spawn lại từ đầu (xem doc comment hàm).
+		if w.chromium == nil {
+			spawned = false
+			sp.activeSessions.Add(-1)
+		}
+
+		idleTimer.Reset(sp.cfg.IdleCloseAfter)
+	}
+
 	for {
+		// Ưu tiên tuyệt đối cho job nhỏ: thử nhặt smallJobs KHÔNG CHỜ trước
+		// mỗi vòng lặp. Job lớn (sp.jobs) chỉ được nhặt khi smallJobs đang
+		// rỗng — xem SessionPool.smallJobs doc comment.
+		select {
+		case job, ok := <-sp.smallJobs:
+			if !ok {
+				finalClose()
+				return
+			}
+			handleJob(job)
+			continue
+		default:
+		}
+
 		select {
 		case <-sp.closed:
 			finalClose()
@@ -475,89 +609,19 @@ func (sp *SessionPool) sessionLoop(id int) {
 			teardown()
 			idleTimer.Reset(sp.cfg.IdleCloseAfter)
 
+		case job, ok := <-sp.smallJobs:
+			if !ok {
+				finalClose()
+				return
+			}
+			handleJob(job)
+
 		case job, ok := <-sp.jobs:
 			if !ok {
 				finalClose()
 				return
 			}
-			if !idleTimer.Stop() {
-				select {
-				case <-idleTimer.C:
-				default:
-				}
-			}
-
-			if job.ctx.Err() != nil {
-				// Caller đã bỏ cuộc trong lúc job còn nằm trong hàng đợi — trả
-				// lỗi ngay, không tốn 1 lần acquire/spawn/hCaptcha vô ích.
-				job.result <- ChunkResult{
-					ID: job.chunk.ID, GroupID: job.chunk.GroupID,
-					Output: job.chunk.OutputPath, WorkerID: id,
-					Message: job.ctx.Err().Error(),
-				}
-				idleTimer.Reset(sp.cfg.IdleCloseAfter)
-				continue
-			}
-
-			w.overrideEmit = job.emit
-			w.overrideTotal = job.total
-
-			if !spawned {
-				// QUAN TRỌNG: nếu đã từng có lease (currentLease.URL != ""),
-				// đây là thức dậy sau idle-close — KHÔNG được gọi lại Acquire().
-				// Với các provider WireGuard (Nord/PIA/Surfshark), Acquire() luôn
-				// tạo 1 tunnel MỚI hoàn toàn; gọi lại ở đây trong khi tunnel cũ
-				// (đứng sau lease hiện có) vẫn còn sống — vì idle-close chỉ
-				// teardown cửa sổ WebView2, không đụng tới lease — sẽ làm rò rỉ
-				// tunnel cũ vĩnh viễn (không ai còn giữ generation của nó để
-				// đóng). Idle-close nghĩa là "đóng cửa sổ, giữ nguyên IP", nên
-				// thức dậy phải mở lại cửa sổ trên ĐÚNG lease đang có, chỉ
-				// Acquire() thật sự khi đây là lần đầu tiên (chưa có lease nào).
-				//
-				// Trước khi mở lại cửa sổ trên lease cũ, xác nhận nó CÒN SỐNG:
-				// giữ tunnel chạy suốt lúc idle không đảm bảo nó còn hoạt động
-				// hàng phút/giờ sau (server phía kia hết hạn session, NAT
-				// timeout dù đã keepalive, IP bị ban ngay lúc không dùng...).
-				// Không probe thì lease chết chỉ lộ ra SAU KHI mở cửa sổ thành
-				// công (mở cửa sổ không cần mạng) qua 1 lần navigation timeout
-				// 2 phút trong processChunkOnce — probe biến đó thành phát
-				// hiện ~6s, rồi rotate ngay như đường lỗi bình thường.
-				var spawnErr error
-				switch {
-				case w.currentLease.URL == "":
-					spawnErr = w.acquireProxyAndSpawn(job.ctx)
-				case probeLeaseAlive(w.currentLease, 6*time.Second) != nil:
-					spawnErr = w.rotateAndRespawn(job.ctx, job.chunk.ID, "kết nối rảnh lâu đã hết hạn")
-				default:
-					spawnErr = w.spawnWebView2WithRetry(job.ctx, 3)
-				}
-				if spawnErr != nil {
-					job.result <- ChunkResult{
-						ID: job.chunk.ID, GroupID: job.chunk.GroupID,
-						Output: job.chunk.OutputPath, WorkerID: id,
-						Message: fmt.Sprintf("không mở được phiên: %v", spawnErr),
-					}
-					idleTimer.Reset(sp.cfg.IdleCloseAfter)
-					continue
-				}
-				spawned = true
-				sp.activeSessions.Add(1)
-			}
-
-			res := w.processChunkWithRetry(job.ctx, job.chunk)
-			job.result <- res
-
-			// processChunkWithRetry tự rotate+respawn khi lỗi transient/bị ban;
-			// w.chromium == nil nghĩa là NGAY CẢ retry rotate cũng hết sạch
-			// (spawnWebView2WithRetry thất bại liên tục, vd disk full kéo dài).
-			// Không thoát goroutine — chỉ đánh dấu "chưa mở" để job KẾ TIẾP tự
-			// acquire+spawn lại từ đầu (xem doc comment hàm).
-			if w.chromium == nil {
-				spawned = false
-				sp.activeSessions.Add(-1)
-			}
-
-			idleTimer.Reset(sp.cfg.IdleCloseAfter)
+			handleJob(job)
 		}
 	}
 }
