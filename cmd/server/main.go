@@ -124,14 +124,33 @@ func main() {
 		nordSOCKS5Weight = 1
 		nordWGWeight     = 1
 		piaWGWeight      = 6
-		surfsharkWeight  = 2
-		protonWGWeight   = 3
-		// cyberghostWGWeight (6): đo được 25/25 thành công cùng lúc
-		// (2026-08-09, cmd/testconcurrency), latency 2.3-2.7s/lease — KHÔNG
-		// tăng khi tải cao (khác hẳn Surfshark), không thấy dấu hiệu trần
-		// kết nối đồng thời nào như NordVPN-WG. Đặt ngang PIA (nguồn đáng
-		// tin nhất hiện có) vì số đo thực tế tương đương.
-		cyberghostWGWeight = 6
+		// surfsharkWeight: hạ từ 2 xuống 1 tạm thời (2026-08-10) — stress
+		// test thật cho thấy 0/7 = 0% qua cơ chế thăm dò định kỳ (không
+		// phải dữ liệu cũ đóng băng, đã xác nhận đang được thử lại thật).
+		// Chưa có nguyên nhân gốc xác định (khác CyberGhost, Surfshark
+		// không có vòng quét nền để nghi ngờ) — hạ trọng số vì bằng chứng
+		// còn ít (7 mẫu) hơn CyberGhost, chưa loại hẳn. Nâng lại 2 khi xác
+		// nhận đã ổn định qua theo dõi [vpn-stats] thêm.
+		surfsharkWeight = 1
+		protonWGWeight  = 3
+		// cyberghostWGWeight: hạ từ 6 xuống 1 tạm thời (2026-08-10) — dữ
+		// liệu cũ bên dưới (25/25, 2026-08-09) vẫn đúng lúc đo, nhưng
+		// stress test thật HÔM NAY cho thấy 0/10 = 0% qua cơ chế thăm dò
+		// định kỳ (không phải dữ liệu cũ đóng băng — đã xác nhận đang được
+		// thử lại thật), TRÙNG với thời điểm server list refresh liên tục
+		// bị Cloudflare 429 trên gần như MỌI quốc gia (không dừng suốt
+		// nhiều giờ, pacing 1500ms/8s đã tăng trước đó không đủ). Nghi ngờ
+		// IP/tài khoản đang bị chặn diện rộng phía CyberGhost/Cloudflare,
+		// không phải lỗi code — cần điều tra riêng trước khi nâng lại. Hạ
+		// trọng số (và theo đó, trần đồng thời = weight×3) để giảm lãng phí
+		// thời gian/tài nguyên trong lúc chờ, không loại hẳn (cơ chế thăm dò
+		// định kỳ vẫn tự phát hiện lúc nó hồi phục).
+		//
+		// Đo cũ (2026-08-09, cmd/testconcurrency): 25/25 thành công cùng
+		// lúc, latency 2.3-2.7s/lease, không tăng khi tải cao. Nếu nguyên
+		// nhân gốc được xác nhận đã hết (vd đổi IP, liên hệ CyberGhost),
+		// nâng lại 6 và xoá đoạn ghi chú này.
+		cyberghostWGWeight = 1
 	)
 
 	// See loadVPNAccounts (portal_vpn_accounts.go): web-portal's admin
