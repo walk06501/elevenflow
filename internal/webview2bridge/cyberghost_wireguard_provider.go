@@ -208,14 +208,87 @@ func saveCyberGhostDevice(username, token, tokenSecret string) error {
 	return os.WriteFile(cgDevicePath(username), data, 0o600)
 }
 
+// cgServersCachePath: same cwd-relative reasoning as cgDevicePath. Caches
+// the combined 100-country sweep so a restart doesn't have to pay the
+// ~5-6 minute (429-paced) sweep cost again before the server can even
+// start — see NewCyberGhostWireGuardProvider's doc comment.
+func cgServersCachePath(username string) string {
+	return filepath.Join(".", fmt.Sprintf("cyberghost_servers_%s.json", cgDeviceFilenameSafe.Replace(username)))
+}
+
+type cgPersistedServer struct {
+	Name        string `json:"name"`
+	CountryCode string `json:"country_code"`
+}
+
+func loadCyberGhostServersCache(username string) ([]cgServer, error) {
+	data, err := os.ReadFile(cgServersCachePath(username))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var saved []cgPersistedServer
+	if err := json.Unmarshal(data, &saved); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", cgServersCachePath(username), err)
+	}
+	servers := make([]cgServer, 0, len(saved))
+	for _, s := range saved {
+		if s.Name == "" {
+			continue
+		}
+		servers = append(servers, cgServer{name: s.Name, countryCode: s.CountryCode})
+	}
+	return servers, nil
+}
+
+func saveCyberGhostServersCache(username string, servers []cgServer) error {
+	saved := make([]cgPersistedServer, len(servers))
+	for i, s := range servers {
+		saved[i] = cgPersistedServer{Name: s.name, CountryCode: s.countryCode}
+	}
+	data, err := json.MarshalIndent(saved, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(cgServersCachePath(username), data, 0o600)
+}
+
+// cgServerRefreshInterval: how often the background loop re-sweeps the
+// full 100-country catalog after the first successful load. Country
+// server rosters don't churn minute-to-minute, so this is generous —
+// the point is "eventually fresh", not "always fresh", since the sweep
+// itself costs real time (~5-6 min, 429-paced) and a stale-by-a-few-hours
+// list is still a perfectly usable proxy pool.
+const cgServerRefreshInterval = 6 * time.Hour
+
 // NewCyberGhostWireGuardProvider logs in, reuses a previously-registered
 // device credential pair if one was saved (or registers a fresh one and
 // saves it — see type doc comment on why registering fresh every restart
-// is not an option, it burns the account's hard device cap), and loads
-// the server list for every country in cgCountries once. Returns an error
-// if login, getting SOME device credential, or the server list all fail —
-// a provider with no device token or no servers can never build a
-// working lease.
+// is not an option, it burns the account's hard device cap), and gets a
+// server list ready WITHOUT blocking the caller on the 100-country sweep.
+//
+// Confirmed live 2026-08-10: the sweep alone takes ~5-6 minutes (429-paced,
+// see refreshServers' doc comment) and, before this fix, main.go called
+// this constructor synchronously before the HTTP server started listening
+// — meaning EVERY restart delayed the entire ElevenFlow server (all six
+// VPN sources, not just this one) by 5-6 minutes, even though five of them
+// were already fully ready. Fixed two ways:
+//  1. The combined server list is cached to disk (cgServersCachePath) after
+//     a successful sweep. A restart that finds a cache uses it immediately
+//     (synchronously, near-instant) instead of re-sweeping from scratch.
+//  2. The actual sweep (fresh on first-ever run, or a periodic refresh
+//     every cgServerRefreshInterval afterward) runs in a background
+//     goroutine that this function does NOT wait on. A first-ever run for
+//     a brand new account genuinely has zero CyberGhost servers for the
+//     first ~5-6 minutes (nextCandidate errors, MultiVPNProvider just
+//     tries the other five sources meanwhile) — unavoidable once, but
+//     never again after the cache exists.
+//
+// Returns an error only for login/device-credential failures — not having
+// a server list YET is not fatal, since the background goroutine will
+// populate it (see above).
 func NewCyberGhostWireGuardProvider(username, password string) (*CyberGhostWireGuardProvider, error) {
 	p := &CyberGhostWireGuardProvider{
 		username: username,
@@ -253,12 +326,58 @@ func NewCyberGhostWireGuardProvider(username, password string) (*CyberGhostWireG
 	p.token, p.tokenSecret = token, tokenSecret
 	p.mu.Unlock()
 
-	if err := p.refreshServers(jwt); err != nil {
-		return nil, fmt.Errorf("cyberghost server list: %w", err)
+	cached, cacheErr := loadCyberGhostServersCache(username)
+	if cacheErr != nil {
+		log.Printf("[CyberGhost-WG] could not read cached server list (%v), starting with none until background sweep completes", cacheErr)
+	} else if len(cached) > 0 {
+		p.mu.Lock()
+		p.servers = cached
+		p.mu.Unlock()
+		log.Printf("[CyberGhost-WG] Ready immediately: %d cached server(s) from %s (refreshing in background)", len(cached), cgServersCachePath(username))
+	} else {
+		log.Printf("[CyberGhost-WG] no cached server list yet — server starts now, CyberGhost gains capacity once the background sweep completes (~5-6 min)")
 	}
 
-	log.Printf("[CyberGhost-WG] Ready: %d server(s) across %d countries", len(p.servers), len(cgCountries))
+	go p.backgroundServerRefreshLoop(username)
+
 	return p, nil
+}
+
+// backgroundServerRefreshLoop does the first sweep (if no cache was found,
+// or to freshen a cache that was found) and then repeats every
+// cgServerRefreshInterval — never blocking NewCyberGhostWireGuardProvider's
+// caller. Each cycle re-logs-in for its own JWT rather than reusing the
+// constructor's, since a JWT obtained hours ago may well have expired by
+// the next scheduled refresh.
+func (p *CyberGhostWireGuardProvider) backgroundServerRefreshLoop(username string) {
+	for {
+		jwt, err := p.login()
+		if err != nil {
+			log.Printf("[CyberGhost-WG] background refresh: login failed, will retry next cycle: %v", err)
+		} else if err := p.refreshServers(jwt); err != nil {
+			log.Printf("[CyberGhost-WG] background refresh: server sweep failed, will retry next cycle: %v", err)
+		} else {
+			p.mu.Lock()
+			n := len(p.servers)
+			p.mu.Unlock()
+			log.Printf("[CyberGhost-WG] Ready: %d server(s) across %d countries", n, len(cgCountries))
+			if saveErr := saveCyberGhostServersCache(username, p.serversSnapshot()); saveErr != nil {
+				log.Printf("[CyberGhost-WG] WARNING: could not save server cache to %s (%v) — next restart will re-sweep from scratch", cgServersCachePath(username), saveErr)
+			}
+		}
+		time.Sleep(cgServerRefreshInterval)
+	}
+}
+
+// serversSnapshot returns a copy of the current server list under lock —
+// used only for handing data to saveCyberGhostServersCache without racing
+// nextCandidate()'s own locked reads.
+func (p *CyberGhostWireGuardProvider) serversSnapshot() []cgServer {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]cgServer, len(p.servers))
+	copy(out, p.servers)
+	return out
 }
 
 func (p *CyberGhostWireGuardProvider) Close() {
