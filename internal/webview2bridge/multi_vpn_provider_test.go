@@ -154,6 +154,43 @@ func TestPushRecentWindowBounded(t *testing.T) {
 	}
 }
 
+// TestMarkUnhealthyAndRotate_RecordsFailureAgainstOldProvider khoá lại
+// đúng lỗi thật phát hiện 2026-08-10 từ log production: trước bản sửa,
+// MarkUnhealthyAndRotate (worker.go gọi đúng lúc "mạng không ổn" — nghĩa
+// là lease đã qua được Acquire() nhưng thất bại ở bài test THẬT, tải
+// trang) không hề ghi nhận gì vào Stats()/recent — khiến 1 nguồn bắt tay
+// VPN nhanh nhưng hay rớt phiên thật vẫn tiếp tục được xếp "tốt" và ưu
+// tiên chọn lại, một vòng luẩn quẩn quan sát được thật trên VPS.
+func TestMarkUnhealthyAndRotate_RecordsFailureAgainstOldProvider(t *testing.T) {
+	m, _ := newTestMultiVPN("flaky")
+	owner := &fakeVPNProvider{name: "flaky"}
+	oldLease := Lease{owner: owner, Generation: 1}
+
+	// MarkUnhealthyAndRotate tự nó gọi tiếp acquireFrom() để lấy lease mới
+	// (đây là hành vi có từ trước, không phải phần đang test) — với chỉ 1
+	// provider "flaky" cấu hình, acquireFrom() sẽ acquire lại đúng "flaky"
+	// và ghi thêm 1 THÀNH CÔNG. Nên sau lệnh gọi đầy đủ: 2 attempts (1 thất
+	// bại từ chính rotate đang test + 1 thành công từ acquire kế tiếp).
+	if _, err := m.MarkUnhealthyAndRotate(context.Background(), 0, oldLease, nil); err != nil {
+		t.Fatalf("MarkUnhealthyAndRotate returned unexpected error: %v", err)
+	}
+
+	st, ok := m.Stats()["flaky"]
+	if !ok {
+		t.Fatal("expected a Stats() entry for \"flaky\" after MarkUnhealthyAndRotate")
+	}
+	if st.Attempts != 2 || st.Successes != 1 {
+		t.Fatalf("Stats()[\"flaky\"] = %+v, want 2 attempts / 1 success (1 failure recorded for the rotate itself, 1 success from the follow-up acquire)", st)
+	}
+
+	m.mu.Lock()
+	recent := append([]bool(nil), m.runtime["flaky"].recent...)
+	m.mu.Unlock()
+	if len(recent) != 2 || recent[0] != false || recent[1] != true {
+		t.Fatalf("recent window = %v, want [false, true] — the rotate failure must land in the recency window BEFORE the follow-up success, in order", recent)
+	}
+}
+
 func TestNewProviderCap_MinimumFloor(t *testing.T) {
 	if got := newProviderCap(0); got != vpnCapSlack {
 		t.Errorf("newProviderCap(0) = %d, want floor of weight=1 * slack = %d", got, vpnCapSlack)

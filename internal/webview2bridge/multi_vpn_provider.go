@@ -443,10 +443,26 @@ func (m *MultiVPNProvider) Acquire(ctx context.Context, workerID int, emit func(
 // đóng tunnel thật), rồi lấy lease mới từ vòng round-robin bình thường —
 // lease mới cố tình KHÔNG ưu tiên provider cũ, vì lý do rotate thường là
 // chính đường đi đó đang có vấn đề.
+//
+// Ghi 1 lần THẤT BẠI vào Stats()/providerRuntime.recent của provider cũ
+// TRƯỚC khi rotate — sửa 2026-08-10, phát hiện thật từ log production:
+// trước bản sửa này, recordAttempt() chỉ được gọi trong acquireFrom() dựa
+// trên kết quả p.Acquire() (chỉ là bắt tay VPN + 1 lần GET ipify — thường
+// nhanh và hầu như luôn "thành công"), KHÔNG BAO GIỜ biết được lease đó
+// sau đó có sống nổi qua bài test THẬT (tải trang elevenlabs.io, hCaptcha)
+// hay không — chính MarkUnhealthyAndRotate mới là nơi duy nhất biết điều
+// đó (worker.go gọi hàm này đúng lúc phát hiện "mạng không ổn"). Thiếu
+// dòng ghi nhận này tạo ra đúng vòng lặp luẩn quẩn quan sát được thật: 1
+// nguồn bắt tay VPN nhanh/ổn định (nên Acquire() gần như luôn qua) nhưng
+// phiên TTS thật qua nó hay rớt vẫn tiếp tục được xếp "tốt" và ưu tiên
+// chọn lại — ranking hoàn toàn mù trước đúng loại thất bại mà cơ chế này
+// được dựng ra để tránh.
 func (m *MultiVPNProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, emit func(string)) (Lease, error) {
 	if oldLease.owner != nil {
+		name := providerName(oldLease.owner)
+		m.recordAttempt(name, false, 0)
 		oldLease.owner.Release(workerID, oldLease)
-		m.releaseActive(providerName(oldLease.owner))
+		m.releaseActive(name)
 	}
 	return m.acquireFrom(ctx, workerID, emit)
 }
