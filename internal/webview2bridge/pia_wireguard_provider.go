@@ -452,6 +452,10 @@ func (p *PIAWireGuardProvider) acquireLease() (Lease, error) {
 	return Lease{}, fmt.Errorf("no working PIA WireGuard server after %d attempts (last: %v)", wgMaxAcquireAttempts, lastErr)
 }
 
+// Name identifies this source in MultiVPNProvider's per-provider stats
+// (see multi_vpn_provider.go).
+func (p *PIAWireGuardProvider) Name() string { return "PIA-WG" }
+
 func (p *PIAWireGuardProvider) Acquire(ctx context.Context, workerID int, emit func(string)) (Lease, error) {
 	if emit != nil {
 		emit("Đang tìm server PIA (WireGuard) khả dụng…")

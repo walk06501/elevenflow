@@ -806,6 +806,10 @@ func (p *CyberGhostWireGuardProvider) acquireLease() (Lease, error) {
 	return Lease{}, fmt.Errorf("no working CyberGhost WireGuard server after %d attempts (last: %v)", wgMaxAcquireAttempts, lastErr)
 }
 
+// Name identifies this source in MultiVPNProvider's per-provider stats
+// (see multi_vpn_provider.go).
+func (p *CyberGhostWireGuardProvider) Name() string { return "CyberGhost-WG" }
+
 func (p *CyberGhostWireGuardProvider) Acquire(ctx context.Context, workerID int, emit func(string)) (Lease, error) {
 	if emit != nil {
 		emit("Đang tìm server CyberGhost (WireGuard) khả dụng…")

@@ -185,6 +185,10 @@ func (p *IPVanishWireGuardProvider) acquireLease() (Lease, error) {
 	return Lease{}, fmt.Errorf("no working IPVanish server after %d attempts (last: %v)", wgMaxAcquireAttempts, lastErr)
 }
 
+// Name identifies this source in MultiVPNProvider's per-provider stats
+// (see multi_vpn_provider.go).
+func (p *IPVanishWireGuardProvider) Name() string { return "IPVanish-WG" }
+
 func (p *IPVanishWireGuardProvider) Acquire(ctx context.Context, workerID int, emit func(string)) (Lease, error) {
 	if emit != nil {
 		emit("Đang tìm server IPVanish khả dụng…")

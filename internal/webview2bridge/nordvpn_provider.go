@@ -156,6 +156,10 @@ func (p *NordVPNProvider) nextLease() (Lease, error) {
 // concurrent worker — including same-numbered workers from different
 // concurrent requests — gets its own round-robin slot; see the type doc
 // for why this can't be memoized per workerID.
+// Name identifies this source in MultiVPNProvider's per-provider stats
+// (see multi_vpn_provider.go).
+func (p *NordVPNProvider) Name() string { return "NordVPN-SOCKS5" }
+
 func (p *NordVPNProvider) Acquire(ctx context.Context, workerID int, emit func(string)) (Lease, error) {
 	p.mu.Lock()
 	lease, err := p.nextLease()

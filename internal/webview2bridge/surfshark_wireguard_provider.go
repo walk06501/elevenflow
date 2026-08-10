@@ -188,6 +188,10 @@ func (p *SurfsharkWireGuardProvider) acquireLease() (Lease, error) {
 	return Lease{}, fmt.Errorf("no working Surfshark server after %d attempts (last: %v)", wgMaxAcquireAttempts, lastErr)
 }
 
+// Name identifies this source in MultiVPNProvider's per-provider stats
+// (see multi_vpn_provider.go).
+func (p *SurfsharkWireGuardProvider) Name() string { return "Surfshark-WG" }
+
 func (p *SurfsharkWireGuardProvider) Acquire(ctx context.Context, workerID int, emit func(string)) (Lease, error) {
 	if emit != nil {
 		emit("Đang tìm server Surfshark khả dụng…")

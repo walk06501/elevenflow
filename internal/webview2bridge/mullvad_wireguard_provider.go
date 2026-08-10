@@ -556,6 +556,10 @@ func (p *MullvadWireGuardProvider) acquireLease() (Lease, error) {
 	return Lease{}, fmt.Errorf("no working Mullvad server after %d attempts (last: %w)", wgMaxAcquireAttempts, lastErr)
 }
 
+// Name identifies this source in MultiVPNProvider's per-provider stats
+// (see multi_vpn_provider.go).
+func (p *MullvadWireGuardProvider) Name() string { return "Mullvad-WG" }
+
 func (p *MullvadWireGuardProvider) Acquire(ctx context.Context, workerID int, emit func(string)) (Lease, error) {
 	if emit != nil {
 		emit("Đang tìm server Mullvad khả dụng…")

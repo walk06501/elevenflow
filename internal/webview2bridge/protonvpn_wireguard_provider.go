@@ -557,6 +557,10 @@ func (p *ProtonVPNWireGuardProvider) acquireLease() (Lease, error) {
 	return Lease{}, fmt.Errorf("no working ProtonVPN server after %d attempts (last: %v)", wgMaxAcquireAttempts, lastErr)
 }
 
+// Name identifies this source in MultiVPNProvider's per-provider stats
+// (see multi_vpn_provider.go).
+func (p *ProtonVPNWireGuardProvider) Name() string { return "ProtonVPN-WG" }
+
 func (p *ProtonVPNWireGuardProvider) Acquire(ctx context.Context, workerID int, emit func(string)) (Lease, error) {
 	if emit != nil {
 		emit("Đang tìm server ProtonVPN khả dụng…")

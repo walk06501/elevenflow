@@ -698,6 +698,10 @@ grab:
 	return winner, nil
 }
 
+// Name identifies this source in MultiVPNProvider's per-provider stats
+// (see multi_vpn_provider.go).
+func (p *NordVPNWireGuardProvider) Name() string { return "NordVPN-WG" }
+
 func (p *NordVPNWireGuardProvider) Acquire(ctx context.Context, workerID int, emit func(string)) (Lease, error) {
 	if emit != nil {
 		emit("Đang tìm server NordVPN (WireGuard) khả dụng…")

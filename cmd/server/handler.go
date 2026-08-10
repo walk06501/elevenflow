@@ -348,6 +348,34 @@ func (h *Handler) HandleHealth(w http.ResponseWriter, r *http.Request) {
 		resp["queue_small_total"] = smallTotal
 		resp["queue_big_total"] = bigTotal
 	}
+	// Per-VPN-source attempt/success/timing stats — only present when
+	// multiple sources are configured (single-source setups skip the
+	// MultiVPNProvider wrapper entirely, see main.go's vpnProvider switch).
+	// Answers "which source actually fails or is actually slow more" as
+	// opposed to "which source gets picked more often because of its
+	// weight" — the two are easy to conflate from raw per-event log lines
+	// alone under 20+-way concurrency.
+	if mv, ok := h.vpnProvider.(*webview2bridge.MultiVPNProvider); ok {
+		vpnStats := make(map[string]any)
+		for name, st := range mv.Stats() {
+			rate := 1.0
+			avgMs := int64(0)
+			if st.Attempts > 0 {
+				rate = float64(st.Successes) / float64(st.Attempts)
+			}
+			if st.Successes > 0 {
+				avgMs = st.TotalMs / st.Successes
+			}
+			vpnStats[name] = map[string]any{
+				"attempts":     st.Attempts,
+				"successes":    st.Successes,
+				"success_rate": rate,
+				"avg_ms":       avgMs,
+				"max_ms":       st.MaxMs,
+			}
+		}
+		resp["vpn_provider_stats"] = vpnStats
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
