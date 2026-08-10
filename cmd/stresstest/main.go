@@ -76,7 +76,14 @@ func main() {
 	secret := flag.String("secret", os.Getenv("ELEVEN_SERVER_SECRET"), "X-Api-Secret (mặc định đọc từ biến môi trường ELEVEN_SERVER_SECRET)")
 	voiceID := flag.String("voice-id", "", "voice_id THẬT để test (bắt buộc)")
 	modelID := flag.String("model-id", "eleven_flash_v2_5", "model_id")
-	langCode := flag.String("lang", "", "language_code (để trống nếu model tự nhận diện)")
+	// Mặc định "vi" — xác nhận THẬT từ 1 lần chạy lỗi (2026-08-10):
+	// eleven_flash_v2_5 (model mặc định của chính tool này) TỪ CHỐI
+	// language_code rỗng với HTTP 400 "does not support language_code ''"
+	// (không tự nhận diện như comment cũ ở đây từng đoán sai) — và lỗi này
+	// chỉ lộ ra SAU KHI đã tốn 1 phiên VPN+trình duyệt thật, không phải lỗi
+	// validate sớm, nên để trống mặc định làm lãng phí tài nguyên thật mỗi
+	// lần chạy tool. "vi" khớp đối tượng khách hàng chính của hệ thống này.
+	langCode := flag.String("lang", "vi", "language_code — BẮT BUỘC với các model enforce ngôn ngữ (flash/turbo/v3); rỗng sẽ 400 sau khi đã tốn 1 phiên thật")
 	concurrency := flag.Int("concurrency", 30, "số request đồng thời (cố tình > MaxConcurrent mặc định 25 để test backpressure thật)")
 	total := flag.Int("total", 40, "tổng số request sẽ bắn — MỖI request là 1 job thật, tốn tài nguyên thật, đừng đặt quá cao ở lần chạy đầu")
 	timeout := flag.Duration("timeout", 6*time.Minute, "timeout tối đa cho MỖI request (job dài + nhiều lần rotate có thể mất vài phút)")

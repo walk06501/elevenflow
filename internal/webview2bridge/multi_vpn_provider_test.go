@@ -63,7 +63,7 @@ func TestQualityRankLocked_GoodFirstBadLast(t *testing.T) {
 	// "unknown": chưa có mẫu nào -> giữ nguyên vị trí.
 
 	m.mu.Lock()
-	out := m.qualityRankLocked(providers)
+	out := m.qualityRankLocked(providers, false)
 	m.mu.Unlock()
 
 	if len(out) != 4 {
@@ -82,6 +82,70 @@ func TestQualityRankLocked_GoodFirstBadLast(t *testing.T) {
 	}
 }
 
+// TestQualityRankLocked_Explore khoá lại hành vi "thăm dò định kỳ" mới thêm
+// 2026-08-10: khi explore=true, thứ tự phải ĐẢO NGƯỢC (tệ trước, tốt sau
+// cùng) — đây chính là cơ chế chống đóng băng dữ liệu phát hiện từ stress
+// test thật (CyberGhost/Surfshark nhận 0 lần thử mới suốt 7 phút tải cao).
+func TestQualityRankLocked_Explore(t *testing.T) {
+	m, providers := newTestMultiVPN("good", "bad")
+	for i := 0; i < 8; i++ {
+		m.runtime["good"].pushRecent(true)
+	}
+	for i := 0; i < 2; i++ {
+		m.runtime["good"].pushRecent(false)
+	}
+	for i := 0; i < 1; i++ {
+		m.runtime["bad"].pushRecent(true)
+	}
+	for i := 0; i < 9; i++ {
+		m.runtime["bad"].pushRecent(false)
+	}
+
+	m.mu.Lock()
+	normal := m.qualityRankLocked(providers, false)
+	explore := m.qualityRankLocked(providers, true)
+	m.mu.Unlock()
+
+	if providerName(normal[0]) != "good" || providerName(normal[1]) != "bad" {
+		t.Fatalf("normal order = %v, want [good, bad]", []string{providerName(normal[0]), providerName(normal[1])})
+	}
+	if providerName(explore[0]) != "bad" || providerName(explore[1]) != "good" {
+		t.Fatalf("explore order = %v, want [bad, good] (reversed)", []string{providerName(explore[0]), providerName(explore[1])})
+	}
+}
+
+// TestRankedProviders_ExploreFiresEveryN xác nhận rankedProviders() thật sự
+// đảo ngược đúng 1 lần trong mỗi vpnExploreEveryN lần gọi liên tiếp — không
+// phải logic đúng trong qualityRankLocked nhưng không bao giờ được kích
+// hoạt từ caller thật.
+func TestRankedProviders_ExploreFiresEveryN(t *testing.T) {
+	m, _ := newTestMultiVPN("good", "bad")
+	for i := 0; i < 8; i++ {
+		m.runtime["good"].pushRecent(true)
+	}
+	for i := 0; i < 2; i++ {
+		m.runtime["good"].pushRecent(false)
+	}
+	for i := 0; i < 1; i++ {
+		m.runtime["bad"].pushRecent(true)
+	}
+	for i := 0; i < 9; i++ {
+		m.runtime["bad"].pushRecent(false)
+	}
+
+	exploreHits := 0
+	for i := 0; i < vpnExploreEveryN*3; i++ {
+		all := m.distinctProviders()
+		out := m.rankedProviders(all)
+		if providerName(out[0]) == "bad" {
+			exploreHits++
+		}
+	}
+	if exploreHits != 3 {
+		t.Fatalf("exploreHits = %d over %d calls, want exactly 3 (1 per %d-call cycle)", exploreHits, vpnExploreEveryN*3, vpnExploreEveryN)
+	}
+}
+
 func TestQualityRankLocked_NotEnoughSamplesNeverRanked(t *testing.T) {
 	m, providers := newTestMultiVPN("almost-good")
 	// 4 mẫu, 100% thành công — dưới ngưỡng vpnRankMinRecentSamples=5, không
@@ -93,7 +157,7 @@ func TestQualityRankLocked_NotEnoughSamplesNeverRanked(t *testing.T) {
 	}
 	m.mu.Lock()
 	rate, n := m.runtime["almost-good"].recentRate()
-	out := m.qualityRankLocked(providers)
+	out := m.qualityRankLocked(providers, false)
 	m.mu.Unlock()
 	if n != 4 || rate != 1.0 {
 		t.Fatalf("sanity check failed: rate=%v n=%v", rate, n)

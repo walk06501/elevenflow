@@ -128,6 +128,10 @@ type MultiVPNProvider struct {
 	next      int
 	stats     map[string]*ProviderStat
 	runtime   map[string]*providerRuntime
+	// exploreCounter: tăng mỗi lần rankedProviders() được gọi — cứ mỗi
+	// vpnExploreEveryN lần thì đảo ngược ưu tiên tốt/tệ, xem doc comment
+	// vpnExploreEveryN.
+	exploreCounter int64
 }
 
 // newProviderCap tính trần mềm cho 1 nguồn từ trọng số nó xuất hiện trong
@@ -339,13 +343,31 @@ const (
 	vpnRankGoodRate         = 0.7 // >= ngưỡng này (đủ mẫu): "đang chạy tốt", ưu tiên thử trước trong nhóm của nó
 	vpnRankBadRate          = 0.4 // < ngưỡng này (đủ mẫu): "đang chạy tệ", thử sau cùng trong nhóm của nó
 	vpnCapSlack             = 3   // trần mềm = trọng số cấu hình × hệ số này — phỏng đoán ban đầu, xem providerRuntime.cap
+
+	// vpnExploreEveryN: cứ mỗi N lần gọi rankedProviders thì ĐẢO NGƯỢC thứ
+	// tự trong từng nhóm (tệ thử TRƯỚC, tốt thử SAU CÙNG) thay vì luôn tốt
+	// trước — thêm 2026-08-10, phát hiện thật từ stress test cùng ngày:
+	// PIA-WG hút 81% tổng số lần thử trong 7 phút tải cao (275/~340), trong
+	// khi CyberGhost-WG và Surfshark-WG nhận ĐÚNG 0 lần thử mới suốt cả bài
+	// test dù chạy liên tục — vì 6 hãng còn lại gần như không bao giờ CÙNG
+	// LÚC hết sạch lựa chọn, nên vòng lặp thử trong acquireFrom không bao
+	// giờ chạm tới cuối bảng xếp hạng để "cho hãng tệ 1 cơ hội mới". Hậu
+	// quả: 1 hãng bị đánh giá "tệ" dù chỉ do mẫu nhỏ/trùng hợp (ProviderStat
+	// không có cơ chế hết hạn) có thể bị loại khỏi traffic GẦN NHƯ VĨNH
+	// VIỄN, không có đường tự phục hồi kể cả khi nó đã sửa xong vấn đề thật.
+	// Không phá cơ chế cap (lớp 1, tách under/over-cap TRƯỚC khi vào đây) —
+	// thăm dò chỉ đổi thứ tự trong PHẠM VI 1 nhóm đã qua cổng an toàn đó.
+	vpnExploreEveryN = 8
 )
 
-// qualityRank sắp 1 nhóm provider theo tỉ lệ thành công CỬA SỔ GẦN ĐÂY:
-// tốt (đủ mẫu, tỉ lệ cao) trước, chưa rõ/ở giữa giữ nguyên thứ tự
-// round-robin, tệ (đủ mẫu, tỉ lệ thấp) sau cùng. Caller must hold m.mu (chỉ
-// đọc runtime, không sửa).
-func (m *MultiVPNProvider) qualityRankLocked(group []ProxyProvider) []ProxyProvider {
+// qualityRank sắp 1 nhóm provider theo tỉ lệ thành công CỬA SỔ GẦN ĐÂY: bình
+// thường tốt (đủ mẫu, tỉ lệ cao) trước, chưa rõ/ở giữa giữ nguyên thứ tự
+// round-robin, tệ (đủ mẫu, tỉ lệ thấp) sau cùng — nhưng cứ mỗi
+// vpnExploreEveryN lần gọi (explore=true) thì ĐẢO NGƯỢC: tệ trước, tốt sau
+// cùng, để dữ liệu của nhóm "tệ" được làm mới định kỳ thay vì đóng băng
+// (xem doc comment vpnExploreEveryN). Caller must hold m.mu (chỉ đọc
+// runtime, không sửa).
+func (m *MultiVPNProvider) qualityRankLocked(group []ProxyProvider, explore bool) []ProxyProvider {
 	type scored struct {
 		p    ProxyProvider
 		rate float64
@@ -370,6 +392,16 @@ func (m *MultiVPNProvider) qualityRankLocked(group []ProxyProvider) []ProxyProvi
 	sort.Slice(bad, func(i, j int) bool { return bad[i].rate > bad[j].rate })
 
 	out := make([]ProxyProvider, 0, len(group))
+	if explore {
+		for _, b := range bad {
+			out = append(out, b.p)
+		}
+		out = append(out, mid...)
+		for _, g := range good {
+			out = append(out, g.p)
+		}
+		return out
+	}
 	for _, g := range good {
 		out = append(out, g.p)
 	}
@@ -386,6 +418,8 @@ func (m *MultiVPNProvider) qualityRankLocked(group []ProxyProvider) []ProxyProvi
 // (lớp 2, qualityRankLocked) — xem doc comment ngay phía trên 2 hàm này.
 func (m *MultiVPNProvider) rankedProviders(all []ProxyProvider) []ProxyProvider {
 	m.mu.Lock()
+	m.exploreCounter++
+	explore := m.exploreCounter%vpnExploreEveryN == 0
 	underCap := make([]ProxyProvider, 0, len(all))
 	overCap := make([]ProxyProvider, 0, len(all))
 	for _, p := range all {
@@ -396,7 +430,7 @@ func (m *MultiVPNProvider) rankedProviders(all []ProxyProvider) []ProxyProvider 
 			overCap = append(overCap, p)
 		}
 	}
-	out := append(m.qualityRankLocked(underCap), m.qualityRankLocked(overCap)...)
+	out := append(m.qualityRankLocked(underCap, explore), m.qualityRankLocked(overCap, explore)...)
 	m.mu.Unlock()
 	return out
 }
