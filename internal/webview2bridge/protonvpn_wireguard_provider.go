@@ -80,6 +80,11 @@ type ProtonVPNWireGuardProvider struct {
 	nextIdx int
 	genCtr  int64
 	live    map[int64]*wgTunnel
+	// ranker: trí nhớ theo TỪNG server (khoá bằng name) — xem
+	// server_ranker.go. Trước 2026-08-10, nextCandidate chỉ round-robin
+	// thuần, không nhớ server nào vừa hỏng (kể cả các route Secure Core độ
+	// trễ cao đã ghi chú ở protonProbeTimeout phía trên).
+	ranker *serverRanker
 }
 
 type protonServer struct {
@@ -140,6 +145,7 @@ func NewProtonVPNWireGuardProvider(username, password string) (*ProtonVPNWireGua
 		httpClient: &http.Client{Timeout: 20 * time.Second},
 		apiBase:    protonAPIBase,
 		live:       map[int64]*wgTunnel{},
+		ranker:     newServerRanker(),
 	}
 
 	if err := p.login(username, password); err != nil {
@@ -446,11 +452,34 @@ func (p *ProtonVPNWireGuardProvider) refreshServers() error {
 // the data path works — protonvpn-wg-luci's doc comment documents exactly
 // this failure mode for a wrongly-derived key) ──────────────────────────
 
+// nextCandidate thử server đã chứng minh đáng tin qua traffic thật trước
+// (p.ranker.rankedGood, xem server_ranker.go), bỏ qua server đang cooldown
+// sau lần fail gần nhất; hết server tốt thì rơi xuống round-robin bình
+// thường như cũ.
 func (p *ProtonVPNWireGuardProvider) nextCandidate() (protonServer, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.servers) == 0 {
 		return protonServer{}, fmt.Errorf("no ProtonVPN servers loaded")
+	}
+
+	for _, id := range p.ranker.rankedGood() {
+		if p.ranker.isPenalized(id) {
+			continue
+		}
+		for _, s := range p.servers {
+			if s.name == id {
+				return s, nil
+			}
+		}
+	}
+
+	for scanned := 0; scanned < len(p.servers); scanned++ {
+		s := p.servers[p.nextIdx%len(p.servers)]
+		p.nextIdx++
+		if !p.ranker.isPenalized(s.name) {
+			return s, nil
+		}
 	}
 	s := p.servers[p.nextIdx%len(p.servers)]
 	p.nextIdx++
@@ -541,6 +570,7 @@ func (p *ProtonVPNWireGuardProvider) acquireLease() (Lease, error) {
 		}
 		t0 := time.Now()
 		t, err := p.tryOne(s)
+		p.ranker.noteResult(s.name, err == nil)
 		if err != nil {
 			log.Printf("[proton] attempt %d FAIL %s (%s): %v (%.1fs)", attempt, s.name, s.entryIP, err, time.Since(t0).Seconds())
 			lastErr = fmt.Errorf("%s: %w", s.name, err)

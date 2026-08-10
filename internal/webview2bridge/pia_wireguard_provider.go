@@ -117,6 +117,10 @@ type PIAWireGuardProvider struct {
 	nextIdx int
 	genCtr  int64
 	live    map[int64]*wgTunnel
+	// ranker: trí nhớ theo TỪNG server (khoá bằng ip, xem candidateID) về
+	// thành công/thất bại thật — xem server_ranker.go doc comment. Trước
+	// 2026-08-10, nextCandidate chỉ round-robin thuần, không nhớ gì.
+	ranker *serverRanker
 }
 
 const (
@@ -127,7 +131,7 @@ const (
 // NewPIAWireGuardProvider fetches an auth token and the current WireGuard
 // server list once. Returns an error if either fails.
 func NewPIAWireGuardProvider(username, password string) (*PIAWireGuardProvider, error) {
-	p := &PIAWireGuardProvider{username: username, password: password, live: map[int64]*wgTunnel{}}
+	p := &PIAWireGuardProvider{username: username, password: password, live: map[int64]*wgTunnel{}, ranker: newServerRanker()}
 	if err := p.fetchToken(); err != nil {
 		return nil, fmt.Errorf("pia wireguard token: %w", err)
 	}
@@ -245,9 +249,33 @@ func (p *PIAWireGuardProvider) refreshServers() error {
 	return nil
 }
 
+// nextCandidate thử server đã chứng minh đáng tin qua traffic thật trước
+// (p.ranker.rankedGood, xem server_ranker.go), bỏ qua server đang trong
+// cooldown sau lần fail gần nhất; hết server tốt thì rơi xuống round-robin
+// bình thường, cũng bỏ qua cooldown trừ khi mọi server đều đang bị phạt
+// (khi đó thà thử 1 server có thể hỏng còn hơn từ chối phục vụ hoàn toàn).
 func (p *PIAWireGuardProvider) nextCandidate() (piaWGServer, error) {
 	if len(p.servers) == 0 {
 		return piaWGServer{}, fmt.Errorf("no PIA WireGuard servers loaded")
+	}
+
+	for _, id := range p.ranker.rankedGood() {
+		if p.ranker.isPenalized(id) {
+			continue
+		}
+		for _, s := range p.servers {
+			if s.ip == id {
+				return s, nil
+			}
+		}
+	}
+
+	for scanned := 0; scanned < len(p.servers); scanned++ {
+		s := p.servers[p.nextIdx%len(p.servers)]
+		p.nextIdx++
+		if !p.ranker.isPenalized(s.ip) {
+			return s, nil
+		}
 	}
 	s := p.servers[p.nextIdx%len(p.servers)]
 	p.nextIdx++
@@ -438,6 +466,7 @@ func (p *PIAWireGuardProvider) acquireLease() (Lease, error) {
 			return Lease{}, err
 		}
 		t, err := p.tryOne(s, token)
+		p.ranker.noteResult(s.ip, err == nil)
 		if err != nil {
 			lastErr = fmt.Errorf("%s (%s): %w", s.ip, s.region, err)
 			continue

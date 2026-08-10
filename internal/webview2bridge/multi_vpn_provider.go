@@ -33,7 +33,11 @@ func providerName(p ProxyProvider) string {
 
 // ProviderStat is one VPN source's accumulated Acquire() attempts since
 // process start — exported so cmd/server/handler.go can serialize it into
-// /health directly.
+// /health directly. Kept as a plain lifetime counter (never decays) so
+// /health always answers "how has this source done overall" — the
+// recency-aware view used for live ranking decisions (providerRuntime.recent
+// below) is a separate, unexported thing on purpose: mixing "overall" and
+// "just now" into one number would make neither question answerable.
 type ProviderStat struct {
 	Attempts  int64
 	Successes int64
@@ -45,6 +49,56 @@ type ProviderStat struct {
 	// printed elsewhere, not folded in here.
 	TotalMs int64
 	MaxMs   int64
+}
+
+// providerRuntime holds the live, decision-relevant state ProviderStat
+// deliberately does not: how many leases this source has open RIGHT NOW,
+// and how it has done over just the last vpnRankRecentWindow attempts
+// (not since process start). Added 2026-08-10 together with the
+// capacity-gated ranking below — see that doc comment for the full
+// reasoning. Guarded by MultiVPNProvider.mu, same as everything else here.
+type providerRuntime struct {
+	// active: số lease đang mở thật của nguồn này (tăng lúc RESERVE, tức
+	// ngay trước khi thử Acquire() — không đợi thành công — để chặn đúng
+	// tình huống 20+ worker cùng nhắm 1 nguồn trong lúc TẤT CẢ còn đang bắt
+	// tay, chưa ai kịp thành công để phản ánh vào active).
+	active int
+	// cap: trần mềm cho active, tính 1 lần lúc khởi tạo từ trọng số
+	// (weight) nguồn đó đã được cấu hình trong main.go — xem newProviderCap.
+	// "Mềm" vì KHÔNG dùng để từ chối hẳn, chỉ để xếp nguồn đã đầy xuống thử
+	// sau (xem rankedProviders) — con số slack nhân với trọng số là phỏng
+	// đoán ban đầu, chưa có số đo thật về trần kết nối đồng thời thật của
+	// từng tài khoản; mục đích ghi log active/cap mỗi kỳ là để thu thập đủ
+	// dữ liệu thật rồi chỉnh lại con số này sau, không phải để đoán đúng
+	// ngay từ đầu.
+	cap int
+	// recent: kết quả vpnRankMinRecentSamples..vpnRankRecentWindow lần thử
+	// GẦN NHẤT (true = thành công), cũ nhất bị đẩy ra khi đầy. Khác
+	// ProviderStat.Attempts/Successes ở chỗ đây là cửa sổ trượt, không phải
+	// cộng dồn cả đời — 1 nguồn có lịch sử tốt lâu năm vẫn phải "trả giá"
+	// nhanh khi vừa có 1 đợt fail dồn dập, không bị lịch sử cũ che mất.
+	recent []bool
+}
+
+func (pr *providerRuntime) pushRecent(ok bool) {
+	pr.recent = append(pr.recent, ok)
+	if len(pr.recent) > vpnRankRecentWindow {
+		pr.recent = pr.recent[len(pr.recent)-vpnRankRecentWindow:]
+	}
+}
+
+func (pr *providerRuntime) recentRate() (rate float64, n int) {
+	n = len(pr.recent)
+	if n == 0 {
+		return 0, 0
+	}
+	ok := 0
+	for _, v := range pr.recent {
+		if v {
+			ok++
+		}
+	}
+	return float64(ok) / float64(n), n
 }
 
 // MultiVPNProvider round-robins across several VPN-backed ProxyProviders
@@ -73,10 +127,36 @@ type MultiVPNProvider struct {
 	providers []ProxyProvider
 	next      int
 	stats     map[string]*ProviderStat
+	runtime   map[string]*providerRuntime
+}
+
+// newProviderCap tính trần mềm cho 1 nguồn từ trọng số nó xuất hiện trong
+// danh sách providers (main.go append 1 provider nhiều lần để đánh trọng
+// số — xem distinctProviders). vpnCapSlack nhân thêm để "tận dụng tối đa
+// tài nguyên" thay vì khoá cứng đúng bằng trọng số gốc: 1 nguồn đang chạy
+// tốt được phép gánh nhiều hơn tỉ trọng gốc của nó khi các nguồn khác đang
+// tệ, chỉ bị chặn khi thực sự vượt xa mức đó.
+func newProviderCap(weight int) int {
+	if weight < 1 {
+		weight = 1
+	}
+	return weight * vpnCapSlack
 }
 
 func NewMultiVPNProvider(providers ...ProxyProvider) *MultiVPNProvider {
-	m := &MultiVPNProvider{providers: providers, stats: map[string]*ProviderStat{}}
+	weight := map[string]int{}
+	for _, p := range providers {
+		weight[providerName(p)]++
+	}
+	runtime := make(map[string]*providerRuntime, len(weight))
+	for name, w := range weight {
+		runtime[name] = &providerRuntime{cap: newProviderCap(w)}
+	}
+	m := &MultiVPNProvider{
+		providers: providers,
+		stats:     map[string]*ProviderStat{},
+		runtime:   runtime,
+	}
 	go m.statsLogger()
 	return m
 }
@@ -103,6 +183,46 @@ func (m *MultiVPNProvider) distinctProviders() []ProxyProvider {
 	return all
 }
 
+// runtimeFor trả về providerRuntime của 1 tên nguồn, tạo mới nếu chưa có
+// (phòng trường hợp providerName trả "unknown" hoặc 1 nguồn không nằm
+// trong danh sách lúc New — không nên xảy ra nhưng không được panic).
+// Caller must hold m.mu.
+func (m *MultiVPNProvider) runtimeFor(name string) *providerRuntime {
+	rt, ok := m.runtime[name]
+	if !ok {
+		rt = &providerRuntime{cap: newProviderCap(1)}
+		m.runtime[name] = rt
+	}
+	return rt
+}
+
+// reserve đánh dấu 1 slot đang được dùng bởi `name` NGAY TRƯỚC khi thử
+// Acquire() — không đợi thành công. Đây là điểm mấu chốt chặn dồn tải:
+// nếu chờ tới lúc thành công mới tăng active, 20+ worker cùng chọn 1 nguồn
+// trong lúc tất cả còn đang bắt tay sẽ không thấy nhau, mỗi worker đều
+// thấy nguồn đó "còn chỗ". Reserve() luôn thành công (không từ chối) —
+// cap chỉ ảnh hưởng thứ tự thử ở rankedProviders, không chặn cứng ở đây.
+func (m *MultiVPNProvider) reserve(name string) {
+	m.mu.Lock()
+	m.runtimeFor(name).active++
+	m.mu.Unlock()
+}
+
+// releaseActive trả 1 slot lại cho `name` — gọi khi 1 lần thử thất bại
+// ngay lập tức (không bao giờ giữ lease), hoặc khi 1 lease đã cấp được
+// đóng/giao trả (Release/MarkUnhealthyAndRotate).
+func (m *MultiVPNProvider) releaseActive(name string) {
+	m.mu.Lock()
+	rt := m.runtimeFor(name)
+	if rt.active > 0 {
+		rt.active--
+	}
+	m.mu.Unlock()
+}
+
+// recordAttempt ghi 1 kết quả thật vào cả 2 nơi: ProviderStat (cộng dồn cả
+// đời, dùng cho /health) và providerRuntime.recent (cửa sổ trượt, dùng để
+// xếp hạng — xem doc comment providerRuntime).
 func (m *MultiVPNProvider) recordAttempt(name string, ok bool, dur time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -120,6 +240,7 @@ func (m *MultiVPNProvider) recordAttempt(name string, ok bool, dur time.Duration
 			st.MaxMs = ms
 		}
 	}
+	m.runtimeFor(name).pushRecent(ok)
 }
 
 // Stats returns a snapshot of attempt/success/timing counts per VPN
@@ -137,31 +258,42 @@ func (m *MultiVPNProvider) Stats() map[string]ProviderStat {
 }
 
 // statsLogger prints one aggregate line per vpnStatsLogInterval, sorted
-// worst-success-rate-first — the point of glancing at this line is
-// spotting a degrading source, so the one most worth looking at belongs
-// at the front, not buried after five healthy ones in alphabetical order.
+// worst-recent-rate-first — the point of glancing at this line is spotting
+// a degrading source, so the one most worth looking at belongs at the
+// front, not buried after five healthy ones in alphabetical order. Prints
+// BOTH the lifetime rate (ProviderStat, cả đời) and the recent-window rate
+// (providerRuntime.recent, vpnRankRecentWindow lần gần nhất) side by side
+// so a diverging pair (lifetime cao, recent thấp) is visible directly in
+// the log without needing a separate query — cộng thêm active/cap để thấy
+// ngay nguồn nào đang gần/đã chạm trần mềm tại đúng thời điểm log in ra.
 func (m *MultiVPNProvider) statsLogger() {
 	t := time.NewTicker(vpnStatsLogInterval)
 	defer t.Stop()
 	for range t.C {
-		snap := m.Stats()
-		if len(snap) == 0 {
+		m.mu.Lock()
+		type row struct {
+			name         string
+			st           ProviderStat
+			lifetimeRate float64
+			recentRate   float64
+			recentN      int
+			active, cap  int
+		}
+		rows := make([]row, 0, len(m.stats))
+		for name, st := range m.stats {
+			lifetimeRate := 1.0
+			if st.Attempts > 0 {
+				lifetimeRate = float64(st.Successes) / float64(st.Attempts)
+			}
+			rt := m.runtimeFor(name)
+			rRate, rN := rt.recentRate()
+			rows = append(rows, row{name, *st, lifetimeRate, rRate, rN, rt.active, rt.cap})
+		}
+		m.mu.Unlock()
+		if len(rows) == 0 {
 			continue
 		}
-		type row struct {
-			name string
-			st   ProviderStat
-			rate float64
-		}
-		rows := make([]row, 0, len(snap))
-		for name, st := range snap {
-			rate := 1.0
-			if st.Attempts > 0 {
-				rate = float64(st.Successes) / float64(st.Attempts)
-			}
-			rows = append(rows, row{name, st, rate})
-		}
-		sort.Slice(rows, func(i, j int) bool { return rows[i].rate < rows[j].rate })
+		sort.Slice(rows, func(i, j int) bool { return rows[i].recentRate < rows[j].recentRate })
 
 		parts := make([]string, 0, len(rows))
 		for _, r := range rows {
@@ -170,8 +302,10 @@ func (m *MultiVPNProvider) statsLogger() {
 				avgMs = r.st.TotalMs / r.st.Successes
 			}
 			parts = append(parts, fmt.Sprintf(
-				"%s: %d/%d (%.0f%%) tb=%.1fs max=%.1fs",
-				r.name, r.st.Successes, r.st.Attempts, r.rate*100,
+				"%s: recent=%.0f%%(%d) lifetime=%d/%d(%.0f%%) active=%d/%d tb=%.1fs max=%.1fs",
+				r.name, r.recentRate*100, r.recentN,
+				r.st.Successes, r.st.Attempts, r.lifetimeRate*100,
+				r.active, r.cap,
 				float64(avgMs)/1000, float64(r.st.MaxMs)/1000,
 			))
 		}
@@ -179,52 +313,51 @@ func (m *MultiVPNProvider) statsLogger() {
 	}
 }
 
-// Ngưỡng xếp hạng provider theo lịch sử thật (Stats) — y hệt ngưỡng
-// NordVPNWireGuardProvider.rankedGoodKeysLocked dùng cho các key con của
-// riêng nó, áp lên 1 tầng cao hơn: xếp hạng GIỮA CÁC HÃNG thay vì giữa các
-// server/key trong cùng 1 hãng. Thêm 2026-08-10 sau khi operator hỏi có
-// cách nào biết trước 1 lease có ổn không trước khi giao cho worker thật —
-// câu trả lời đã tồn tại trong chính codebase này (worker.go's doc comment
-// về navTimeout/stallTimeout): 1 lần GET/handshake nhẹ lúc Acquire() không
-// đủ chứng minh tunnel chịu nổi tải trang thật, nên KHÔNG thêm 1 bài test
-// nhẹ mới (dễ cho qua nhầm/loại nhầm so với tải trang thật). Thay vào đó
-// tận dụng đúng dữ liệu THẬT đã tích luỹ từ chính các lần thử thật
-// (navTimeout/stallTimeout/HTTP lỗi đều đã phản ánh vào recordAttempt) để
-// đổi THỨ TỰ thử giữa các hãng — hãng đang chạy tốt được thử trước, hãng
-// đang chạy tệ bị đẩy xuống cuối, nhưng KHÔNG hãng nào bị loại hẳn (đúng
-// triết lý xuyên suốt file này: không phụ thuộc/loại bỏ vĩnh viễn 1 nguồn).
+// Ngưỡng xếp hạng/chặn quá tải — thêm 2026-08-10. Thiết kế 2 lớp, lớp 1 áp
+// trước lớp 2:
+//
+//  1. Chặn quá tải đồng thời (active/cap, xem providerRuntime.cap): 1 nguồn
+//     đang có active >= cap bị đẩy xuống thử SAU mọi nguồn còn dưới cap,
+//     bất kể đang chạy tốt hay tệ. Đây là thứ ranking-theo-tỉ-lệ-thuần-tuý
+//     (bản trước, chỉ có lớp 2) không có: nếu chỉ xếp theo tỉ lệ thành
+//     công, 1 nguồn đang chạy tốt sẽ bị TẤT CẢ worker cùng ưu tiên thử
+//     cùng lúc, có thể tự nó gây quá tải/chạm trần kết nối thật của chính
+//     tài khoản đó — hỏng vì bị chọn quá nhiều, không phải vì nó tệ.
+//  2. Trong từng nhóm (dưới cap, rồi tới đã đầy cap), xếp tiếp theo tỉ lệ
+//     thành công CỦA CỬA SỔ GẦN ĐÂY (providerRuntime.recent), không dùng
+//     tỉ lệ cả đời — 1 nguồn có lịch sử tốt rất dài sẽ có "quán tính": vài
+//     chục lần fail dồn dập gần đây khó kéo tỉ lệ CẢ ĐỜI xuống dưới ngưỡng
+//     kịp thời, khiến hệ thống tiếp tục dồn traffic vào đúng lúc nó đang
+//     tệ. Cửa sổ trượt phản ứng nhanh hơn nhiều.
+//
+// Cả 2 lớp đều "mềm" — không bao giờ loại hẳn 1 nguồn, chỉ đẩy xuống thử
+// sau, đúng triết lý xuyên suốt file này (thà thử 1 nguồn có thể tệ còn
+// hơn từ chối phục vụ hoàn toàn khi mọi nguồn khác cũng đang bận/tệ).
 const (
-	vpnRankMinAttempts = 5   // dưới ngưỡng này: chưa đủ dữ liệu, coi như "chưa biết" — không được thử sớm hơn (may mắn vài lần đầu không đủ), cũng không bị đẩy xuống cuối
-	vpnRankGoodRate    = 0.7 // >= ngưỡng này (đủ dữ liệu): "đang chạy tốt", ưu tiên thử trước
-	vpnRankBadRate     = 0.4 // < ngưỡng này (đủ dữ liệu): "đang chạy tệ", đẩy xuống thử cuối cùng, không loại hẳn
+	vpnRankRecentWindow     = 20  // kích thước cửa sổ trượt (số lần thử gần nhất được nhớ) để tính tỉ lệ dùng cho xếp hạng
+	vpnRankMinRecentSamples = 5   // dưới ngưỡng này trong cửa sổ: chưa đủ dữ liệu, coi như "chưa biết" — không ưu tiên cũng không bị đẩy xuống
+	vpnRankGoodRate         = 0.7 // >= ngưỡng này (đủ mẫu): "đang chạy tốt", ưu tiên thử trước trong nhóm của nó
+	vpnRankBadRate          = 0.4 // < ngưỡng này (đủ mẫu): "đang chạy tệ", thử sau cùng trong nhóm của nó
+	vpnCapSlack             = 3   // trần mềm = trọng số cấu hình × hệ số này — phỏng đoán ban đầu, xem providerRuntime.cap
 )
 
-// rankedProviders sắp lại thứ tự thử trong `all` (đã dedupe theo trọng số ở
-// distinctProviders) thành 3 nhóm, mỗi nhóm giữ nguyên thứ tự round-robin
-// nội bộ trừ 2 nhóm đầu/cuối được sắp theo tỉ lệ thành công thật:
-//  1. "Tốt" (đủ mẫu, tỉ lệ >= vpnRankGoodRate) — thử trước, tỉ lệ cao nhất
-//     trước tiên.
-//  2. "Chưa rõ" (chưa đủ mẫu, hoặc đủ mẫu nhưng ở khoảng giữa) — giữ đúng
-//     thứ tự round-robin bình thường, đây cũng chính là cách 1 hãng mới/ít
-//     dữ liệu được thăm dò tự nhiên thay vì bị cả 2 nhóm kia che mất.
-//  3. "Tệ" (đủ mẫu, tỉ lệ < vpnRankBadRate) — thử cuối cùng, vẫn được thử
-//     khi 2 nhóm kia đều hết chứ không bị loại hẳn.
-func (m *MultiVPNProvider) rankedProviders(all []ProxyProvider) []ProxyProvider {
-	snap := m.Stats()
+// qualityRank sắp 1 nhóm provider theo tỉ lệ thành công CỬA SỔ GẦN ĐÂY:
+// tốt (đủ mẫu, tỉ lệ cao) trước, chưa rõ/ở giữa giữ nguyên thứ tự
+// round-robin, tệ (đủ mẫu, tỉ lệ thấp) sau cùng. Caller must hold m.mu (chỉ
+// đọc runtime, không sửa).
+func (m *MultiVPNProvider) qualityRankLocked(group []ProxyProvider) []ProxyProvider {
 	type scored struct {
 		p    ProxyProvider
 		rate float64
 	}
 	var good, bad []scored
-	mid := make([]ProxyProvider, 0, len(all))
-	for _, p := range all {
-		st, ok := snap[providerName(p)]
-		if !ok || st.Attempts < vpnRankMinAttempts {
-			mid = append(mid, p)
-			continue
-		}
-		rate := float64(st.Successes) / float64(st.Attempts)
+	mid := make([]ProxyProvider, 0, len(group))
+	for _, p := range group {
+		rt := m.runtimeFor(providerName(p))
+		rate, n := rt.recentRate()
 		switch {
+		case n < vpnRankMinRecentSamples:
+			mid = append(mid, p)
 		case rate >= vpnRankGoodRate:
 			good = append(good, scored{p, rate})
 		case rate < vpnRankBadRate:
@@ -236,7 +369,7 @@ func (m *MultiVPNProvider) rankedProviders(all []ProxyProvider) []ProxyProvider 
 	sort.Slice(good, func(i, j int) bool { return good[i].rate > good[j].rate })
 	sort.Slice(bad, func(i, j int) bool { return bad[i].rate > bad[j].rate })
 
-	out := make([]ProxyProvider, 0, len(all))
+	out := make([]ProxyProvider, 0, len(group))
 	for _, g := range good {
 		out = append(out, g.p)
 	}
@@ -247,11 +380,36 @@ func (m *MultiVPNProvider) rankedProviders(all []ProxyProvider) []ProxyProvider 
 	return out
 }
 
+// rankedProviders sắp lại thứ tự thử trong `all` (đã dedupe theo trọng số
+// ở distinctProviders): trước tiên tách nguồn còn dưới trần mềm khỏi nguồn
+// đã đầy (lớp 1), rồi xếp riêng từng nhóm theo tỉ lệ thành công gần đây
+// (lớp 2, qualityRankLocked) — xem doc comment ngay phía trên 2 hàm này.
+func (m *MultiVPNProvider) rankedProviders(all []ProxyProvider) []ProxyProvider {
+	m.mu.Lock()
+	underCap := make([]ProxyProvider, 0, len(all))
+	overCap := make([]ProxyProvider, 0, len(all))
+	for _, p := range all {
+		rt := m.runtimeFor(providerName(p))
+		if rt.active < rt.cap {
+			underCap = append(underCap, p)
+		} else {
+			overCap = append(overCap, p)
+		}
+	}
+	out := append(m.qualityRankLocked(underCap), m.qualityRankLocked(overCap)...)
+	m.mu.Unlock()
+	return out
+}
+
 // acquireFrom thử lần lượt từng nguồn cho tới khi có lease. Trước đây chỉ
 // thử ĐÚNG 1 nguồn rồi trả lỗi thẳng — nghĩa là 1 nguồn đang kẹt (hết hạn
 // mức kết nối đồng thời, hạ tầng nhà cung cấp trục trặc…) làm job fail hẳn
 // dù 3 nguồn còn lại vẫn tốt. Có nhiều nguồn chính là để không phụ thuộc 1
 // nguồn nào, nên phải thực sự dùng chúng khi cần.
+//
+// reserve()/releaseActive() bọc quanh MỖI lần thử (không chỉ khi thành
+// công) — xem doc comment reserve() để biết vì sao phải tăng active TRƯỚC
+// khi biết kết quả, không phải sau.
 func (m *MultiVPNProvider) acquireFrom(ctx context.Context, workerID int, emit func(string)) (Lease, error) {
 	var lastErr error
 	for _, p := range m.rankedProviders(m.distinctProviders()) {
@@ -259,10 +417,12 @@ func (m *MultiVPNProvider) acquireFrom(ctx context.Context, workerID int, emit f
 			return Lease{}, err
 		}
 		name := providerName(p)
+		m.reserve(name)
 		t0 := time.Now()
 		lease, err := p.Acquire(ctx, workerID, emit)
 		m.recordAttempt(name, err == nil, time.Since(t0))
 		if err != nil {
+			m.releaseActive(name)
 			lastErr = err
 			continue
 		}
@@ -286,6 +446,7 @@ func (m *MultiVPNProvider) Acquire(ctx context.Context, workerID int, emit func(
 func (m *MultiVPNProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, emit func(string)) (Lease, error) {
 	if oldLease.owner != nil {
 		oldLease.owner.Release(workerID, oldLease)
+		m.releaseActive(providerName(oldLease.owner))
 	}
 	return m.acquireFrom(ctx, workerID, emit)
 }
@@ -296,9 +457,12 @@ func (m *MultiVPNProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID 
 // tài khoản VPN chạm trần số kết nối đồng thời và MỌI handshake sau đó đều
 // hỏng (đã xảy ra thật, 2026-08-04: NordVPN-WG fail 40/40 lần thử liên
 // tiếp ở mọi quốc gia, trong khi NordVPN-SOCKS5 cùng lúc vẫn chạy bình
-// thường vì nó không tạo tunnel).
+// thường vì nó không tạo tunnel). Cũng giải phóng slot active tương ứng —
+// bỏ qua bước này sẽ làm active chỉ tăng chứ không bao giờ giảm, cuối cùng
+// mọi nguồn đều bị coi là "đầy" vĩnh viễn.
 func (m *MultiVPNProvider) Release(workerID int, lease Lease) {
 	if lease.owner != nil {
 		lease.owner.Release(workerID, lease)
+		m.releaseActive(providerName(lease.owner))
 	}
 }

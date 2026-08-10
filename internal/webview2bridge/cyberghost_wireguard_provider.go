@@ -118,6 +118,10 @@ type CyberGhostWireGuardProvider struct {
 	nextIdx   int
 	genCtr    int64
 	live      map[int64]*wgTunnel
+	// ranker: trí nhớ theo TỪNG server (khoá bằng name) — xem
+	// server_ranker.go. Trước 2026-08-10, nextCandidate chỉ round-robin
+	// thuần qua toàn bộ union byCountry, không nhớ server nào vừa hỏng.
+	ranker *serverRanker
 }
 
 type cgServer struct {
@@ -309,6 +313,7 @@ func NewCyberGhostWireGuardProvider(username, password string) (*CyberGhostWireG
 		password:  password,
 		live:      map[int64]*wgTunnel{},
 		byCountry: map[string][]cgServer{},
+		ranker:    newServerRanker(),
 	}
 
 	jwt, err := p.login()
@@ -624,11 +629,34 @@ func (p *CyberGhostWireGuardProvider) refreshServers(jwt string) error {
 	return nil
 }
 
+// nextCandidate thử server đã chứng minh đáng tin qua traffic thật trước
+// (p.ranker.rankedGood, xem server_ranker.go), bỏ qua server đang cooldown
+// sau lần fail gần nhất; hết server tốt thì rơi xuống round-robin bình
+// thường qua toàn bộ union byCountry như cũ.
 func (p *CyberGhostWireGuardProvider) nextCandidate() (cgServer, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.servers) == 0 {
 		return cgServer{}, fmt.Errorf("no CyberGhost servers loaded")
+	}
+
+	for _, id := range p.ranker.rankedGood() {
+		if p.ranker.isPenalized(id) {
+			continue
+		}
+		for _, s := range p.servers {
+			if s.name == id {
+				return s, nil
+			}
+		}
+	}
+
+	for scanned := 0; scanned < len(p.servers); scanned++ {
+		s := p.servers[p.nextIdx%len(p.servers)]
+		p.nextIdx++
+		if !p.ranker.isPenalized(s.name) {
+			return s, nil
+		}
 	}
 	s := p.servers[p.nextIdx%len(p.servers)]
 	p.nextIdx++
@@ -792,6 +820,7 @@ func (p *CyberGhostWireGuardProvider) acquireLease() (Lease, error) {
 			return Lease{}, err
 		}
 		t, err := p.tryOne(s, token, tokenSecret)
+		p.ranker.noteResult(s.name, err == nil)
 		if err != nil {
 			lastErr = fmt.Errorf("%s (%s): %w", s.name, s.countryCode, err)
 			continue

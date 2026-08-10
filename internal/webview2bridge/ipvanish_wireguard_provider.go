@@ -46,6 +46,10 @@ type IPVanishWireGuardProvider struct {
 	nextIdx int
 	genCtr  int64
 	live    map[int64]*wgTunnel
+	// ranker: trí nhớ theo TỪNG server (khoá bằng Host) — xem
+	// server_ranker.go. Trước 2026-08-10, nextCandidate chỉ round-robin
+	// thuần qua ipvanishServerList, không nhớ server nào vừa hỏng.
+	ranker *serverRanker
 }
 
 type ipvanishServer struct {
@@ -72,7 +76,7 @@ func NewIPVanishWireGuardProvider() (*IPVanishWireGuardProvider, error) {
 	if len(ipvanishServerList) == 0 {
 		return nil, fmt.Errorf("no ipvanish servers embedded (ipvanish_servers.go empty)")
 	}
-	return &IPVanishWireGuardProvider{live: map[int64]*wgTunnel{}}, nil
+	return &IPVanishWireGuardProvider{live: map[int64]*wgTunnel{}, ranker: newServerRanker()}, nil
 }
 
 func (p *IPVanishWireGuardProvider) Close() {
@@ -86,9 +90,32 @@ func (p *IPVanishWireGuardProvider) Close() {
 	}
 }
 
+// nextCandidate thử server đã chứng minh đáng tin qua traffic thật trước
+// (p.ranker.rankedGood, xem server_ranker.go), bỏ qua server đang cooldown
+// sau lần fail gần nhất; hết server tốt thì rơi xuống round-robin bình
+// thường qua ipvanishServerList như cũ.
 func (p *IPVanishWireGuardProvider) nextCandidate() ipvanishServer {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	for _, id := range p.ranker.rankedGood() {
+		if p.ranker.isPenalized(id) {
+			continue
+		}
+		for _, s := range ipvanishServerList {
+			if s.Host == id {
+				return s
+			}
+		}
+	}
+
+	for scanned := 0; scanned < len(ipvanishServerList); scanned++ {
+		s := ipvanishServerList[p.nextIdx%len(ipvanishServerList)]
+		p.nextIdx++
+		if !p.ranker.isPenalized(s.Host) {
+			return s
+		}
+	}
 	s := ipvanishServerList[p.nextIdx%len(ipvanishServerList)]
 	p.nextIdx++
 	return s
@@ -171,6 +198,7 @@ func (p *IPVanishWireGuardProvider) acquireLease() (Lease, error) {
 	for attempt := 0; attempt < wgMaxAcquireAttempts; attempt++ {
 		s := p.nextCandidate()
 		t, err := p.tryOne(s)
+		p.ranker.noteResult(s.Host, err == nil)
 		if err != nil {
 			lastErr = fmt.Errorf("%s: %w", s.Name, err)
 			continue

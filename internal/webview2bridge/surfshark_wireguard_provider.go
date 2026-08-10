@@ -42,6 +42,10 @@ type SurfsharkWireGuardProvider struct {
 	nextIdx int
 	genCtr  int64
 	live    map[int64]*wgTunnel
+	// ranker: trí nhớ theo TỪNG server (khoá bằng Host) — xem
+	// server_ranker.go. Trước 2026-08-10, nextCandidate chỉ round-robin
+	// thuần qua surfsharkServerList, không nhớ server nào vừa hỏng.
+	ranker *serverRanker
 }
 
 // surfsharkAddress/surfsharkDNS match a real config downloaded from
@@ -70,7 +74,7 @@ func NewSurfsharkWireGuardProvider(privateKeyB64 string) (*SurfsharkWireGuardPro
 	if len(surfsharkServerList) == 0 {
 		return nil, fmt.Errorf("no surfshark servers configured")
 	}
-	return &SurfsharkWireGuardProvider{privHex: privHex, live: map[int64]*wgTunnel{}}, nil
+	return &SurfsharkWireGuardProvider{privHex: privHex, live: map[int64]*wgTunnel{}, ranker: newServerRanker()}, nil
 }
 
 func (p *SurfsharkWireGuardProvider) Close() {
@@ -84,12 +88,35 @@ func (p *SurfsharkWireGuardProvider) Close() {
 	}
 }
 
+// nextCandidate thử server đã chứng minh đáng tin qua traffic thật trước
+// (p.ranker.rankedGood, xem server_ranker.go), bỏ qua server đang cooldown
+// sau lần fail gần nhất; hết server tốt thì rơi xuống round-robin bình
+// thường qua surfsharkServerList như cũ.
 func (p *SurfsharkWireGuardProvider) nextCandidate() struct {
 	Host   string
 	PubKey string
 } {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	for _, id := range p.ranker.rankedGood() {
+		if p.ranker.isPenalized(id) {
+			continue
+		}
+		for _, s := range surfsharkServerList {
+			if s.Host == id {
+				return s
+			}
+		}
+	}
+
+	for scanned := 0; scanned < len(surfsharkServerList); scanned++ {
+		s := surfsharkServerList[p.nextIdx%len(surfsharkServerList)]
+		p.nextIdx++
+		if !p.ranker.isPenalized(s.Host) {
+			return s
+		}
+	}
 	s := surfsharkServerList[p.nextIdx%len(surfsharkServerList)]
 	p.nextIdx++
 	return s
@@ -174,6 +201,7 @@ func (p *SurfsharkWireGuardProvider) acquireLease() (Lease, error) {
 	for attempt := 0; attempt < wgMaxAcquireAttempts; attempt++ {
 		s := p.nextCandidate()
 		t, err := p.tryOne(s.Host, s.PubKey)
+		p.ranker.noteResult(s.Host, err == nil)
 		if err != nil {
 			lastErr = fmt.Errorf("%s: %w", s.Host, err)
 			continue

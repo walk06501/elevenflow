@@ -88,6 +88,11 @@ type MullvadWireGuardProvider struct {
 	// nextServer()/checkoutKey() for unrelated in-flight acquires.
 	liveKeyMu sync.Mutex
 	liveKey   map[int64]int
+
+	// ranker: trí nhớ theo TỪNG server (khoá bằng hostname) — xem
+	// server_ranker.go. Trước 2026-08-10, nextServer chỉ round-robin
+	// thuần qua p.servers, không nhớ server nào vừa hỏng.
+	ranker *serverRanker
 }
 
 type mullvadKey struct {
@@ -190,6 +195,7 @@ func NewMullvadWireGuardProvider(accountNumber string) (*MullvadWireGuardProvide
 		account:    accountNumber,
 		live:       map[int64]*wgTunnel{},
 		liveKey:    map[int64]int{},
+		ranker:     newServerRanker(),
 	}
 
 	loaded, err := loadMullvadKeys(accountNumber)
@@ -418,11 +424,34 @@ func (p *MullvadWireGuardProvider) refreshServers() error {
 	return nil
 }
 
+// nextServer thử server đã chứng minh đáng tin qua traffic thật trước
+// (p.ranker.rankedGood, xem server_ranker.go), bỏ qua server đang cooldown
+// sau lần fail gần nhất; hết server tốt thì rơi xuống round-robin bình
+// thường như cũ.
 func (p *MullvadWireGuardProvider) nextServer() (mullvadServer, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.servers) == 0 {
 		return mullvadServer{}, fmt.Errorf("no Mullvad relays loaded")
+	}
+
+	for _, id := range p.ranker.rankedGood() {
+		if p.ranker.isPenalized(id) {
+			continue
+		}
+		for _, s := range p.servers {
+			if s.hostname == id {
+				return s, nil
+			}
+		}
+	}
+
+	for scanned := 0; scanned < len(p.servers); scanned++ {
+		s := p.servers[p.nextIdx%len(p.servers)]
+		p.nextIdx++
+		if !p.ranker.isPenalized(s.hostname) {
+			return s, nil
+		}
 	}
 	s := p.servers[p.nextIdx%len(p.servers)]
 	p.nextIdx++
@@ -536,6 +565,7 @@ func (p *MullvadWireGuardProvider) acquireLease() (Lease, error) {
 		}
 		t0 := time.Now()
 		t, err := p.tryOne(k, s)
+		p.ranker.noteResult(s.hostname, err == nil)
 		if err != nil {
 			log.Printf("[mullvad] attempt %d FAIL %s (%s): %v (%.1fs)", attempt, s.hostname, s.entryIP, err, time.Since(t0).Seconds())
 			lastErr = err
