@@ -106,9 +106,18 @@ type CyberGhostWireGuardProvider struct {
 	token       string
 	tokenSecret string
 	servers     []cgServer
-	nextIdx     int
-	genCtr      int64
-	live        map[int64]*wgTunnel
+	// byCountry: last-known-good server list per country, kept across
+	// refresh cycles independently of whether THIS cycle's fetch for that
+	// country succeeded. refreshServers only overwrites a country's entry
+	// when it actually got fresh data — a country that 429s through both
+	// its retry and the cleanup pass keeps whatever it had from the last
+	// successful fetch (persisted run-to-run too, see the doc comment on
+	// refreshServers) rather than dropping out of the pool entirely until
+	// the next cycle. servers is always the flattened union of this map.
+	byCountry map[string][]cgServer
+	nextIdx   int
+	genCtr    int64
+	live      map[int64]*wgTunnel
 }
 
 type cgServer struct {
@@ -296,9 +305,10 @@ const cgServerRefreshInterval = 6 * time.Hour
 // populate it (see above).
 func NewCyberGhostWireGuardProvider(username, password string) (*CyberGhostWireGuardProvider, error) {
 	p := &CyberGhostWireGuardProvider{
-		username: username,
-		password: password,
-		live:     map[int64]*wgTunnel{},
+		username:  username,
+		password:  password,
+		live:      map[int64]*wgTunnel{},
+		byCountry: map[string][]cgServer{},
 	}
 
 	jwt, err := p.login()
@@ -337,6 +347,9 @@ func NewCyberGhostWireGuardProvider(username, password string) (*CyberGhostWireG
 	} else if len(cached) > 0 {
 		p.mu.Lock()
 		p.servers = cached
+		for _, s := range cached {
+			p.byCountry[s.countryCode] = append(p.byCountry[s.countryCode], s)
+		}
 		p.mu.Unlock()
 		log.Printf("[CyberGhost-WG] Ready immediately: %d cached server(s) from %s (refreshing in background)", len(cached), cgServersCachePath(username))
 	} else {
@@ -528,13 +541,30 @@ func (p *CyberGhostWireGuardProvider) fetchCountryServers(headers map[string]str
 // another streak), so a country caught in one streak often succeeds fine
 // once retried later with the streak's window long expired, even though
 // its own immediate cgFetch429RetryDelay retry (5s) landed inside the
-// same streak and failed too. A country still failing after BOTH the
-// per-country retry and this cleanup pass is logged and skipped rather
-// than failing the whole provider — losing a handful of the 100 still
-// leaves a large, usable pool.
+// same streak and failed too.
+//
+// A country still failing after BOTH the per-country retry and this
+// cleanup pass does NOT get zeroed out — p.byCountry only gets touched
+// for countries this call actually fetched successfully (updateCountry
+// below), so a country that fails this entire cycle simply keeps
+// whatever server list it already had from a previous successful cycle
+// (in-memory from earlier this run, or loaded from disk at startup).
+// This matters specifically because backgroundServerRefreshLoop re-sweeps
+// ALL 100 countries every cgServerRefreshInterval, not just the ones that
+// were missing — without this, a country that's perfectly fine but just
+// unlucky enough to 429 during one refresh cycle would vanish from the
+// pool for that whole cycle even though its server list from six hours
+// ago is still almost certainly valid. Only a country that has NEVER
+// once succeeded (no entry in byCountry at all, e.g. first run ever)
+// actually contributes zero servers.
 func (p *CyberGhostWireGuardProvider) refreshServers(jwt string) error {
 	headers := map[string]string{"x-app-key": cgAppKey, "Authorization": "Bearer " + jwt}
-	var servers []cgServer
+	updateCountry := func(cc string, got []cgServer) {
+		p.mu.Lock()
+		p.byCountry[cc] = got
+		p.mu.Unlock()
+	}
+
 	var failed []string
 	for i, cc := range cgCountries {
 		if i > 0 {
@@ -546,7 +576,7 @@ func (p *CyberGhostWireGuardProvider) refreshServers(jwt string) error {
 			failed = append(failed, cc)
 			continue
 		}
-		servers = append(servers, got...)
+		updateCountry(cc, got)
 	}
 
 	if len(failed) > 0 {
@@ -561,19 +591,36 @@ func (p *CyberGhostWireGuardProvider) refreshServers(jwt string) error {
 				stillFailed = append(stillFailed, cc)
 				continue
 			}
-			servers = append(servers, got...)
+			updateCountry(cc, got)
 		}
 		if len(stillFailed) > 0 {
-			log.Printf("[CyberGhost-WG] %d/%d countries skipped after main sweep + cleanup pass: %s", len(stillFailed), len(cgCountries), strings.Join(stillFailed, ","))
+			p.mu.Lock()
+			var neverSucceeded []string
+			for _, cc := range stillFailed {
+				if len(p.byCountry[cc]) == 0 {
+					neverSucceeded = append(neverSucceeded, cc)
+				}
+			}
+			p.mu.Unlock()
+			if len(neverSucceeded) > 0 {
+				log.Printf("[CyberGhost-WG] %d/%d countries have NO server list at all (never succeeded): %s", len(neverSucceeded), len(cgCountries), strings.Join(neverSucceeded, ","))
+			}
+			log.Printf("[CyberGhost-WG] %d/%d countries kept their previous-cycle server list this round (429 through retry + cleanup): %s", len(stillFailed), len(cgCountries), strings.Join(stillFailed, ","))
 		}
 	}
 
-	if len(servers) == 0 {
+	p.mu.Lock()
+	var servers []cgServer
+	for _, list := range p.byCountry {
+		servers = append(servers, list...)
+	}
+	p.servers = servers
+	n := len(servers)
+	p.mu.Unlock()
+
+	if n == 0 {
 		return fmt.Errorf("no servers loaded across %d countries", len(cgCountries))
 	}
-	p.mu.Lock()
-	p.servers = servers
-	p.mu.Unlock()
 	return nil
 }
 
