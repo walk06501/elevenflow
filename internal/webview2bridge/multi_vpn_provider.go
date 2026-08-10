@@ -179,6 +179,74 @@ func (m *MultiVPNProvider) statsLogger() {
 	}
 }
 
+// Ngưỡng xếp hạng provider theo lịch sử thật (Stats) — y hệt ngưỡng
+// NordVPNWireGuardProvider.rankedGoodKeysLocked dùng cho các key con của
+// riêng nó, áp lên 1 tầng cao hơn: xếp hạng GIỮA CÁC HÃNG thay vì giữa các
+// server/key trong cùng 1 hãng. Thêm 2026-08-10 sau khi operator hỏi có
+// cách nào biết trước 1 lease có ổn không trước khi giao cho worker thật —
+// câu trả lời đã tồn tại trong chính codebase này (worker.go's doc comment
+// về navTimeout/stallTimeout): 1 lần GET/handshake nhẹ lúc Acquire() không
+// đủ chứng minh tunnel chịu nổi tải trang thật, nên KHÔNG thêm 1 bài test
+// nhẹ mới (dễ cho qua nhầm/loại nhầm so với tải trang thật). Thay vào đó
+// tận dụng đúng dữ liệu THẬT đã tích luỹ từ chính các lần thử thật
+// (navTimeout/stallTimeout/HTTP lỗi đều đã phản ánh vào recordAttempt) để
+// đổi THỨ TỰ thử giữa các hãng — hãng đang chạy tốt được thử trước, hãng
+// đang chạy tệ bị đẩy xuống cuối, nhưng KHÔNG hãng nào bị loại hẳn (đúng
+// triết lý xuyên suốt file này: không phụ thuộc/loại bỏ vĩnh viễn 1 nguồn).
+const (
+	vpnRankMinAttempts = 5   // dưới ngưỡng này: chưa đủ dữ liệu, coi như "chưa biết" — không được thử sớm hơn (may mắn vài lần đầu không đủ), cũng không bị đẩy xuống cuối
+	vpnRankGoodRate    = 0.7 // >= ngưỡng này (đủ dữ liệu): "đang chạy tốt", ưu tiên thử trước
+	vpnRankBadRate     = 0.4 // < ngưỡng này (đủ dữ liệu): "đang chạy tệ", đẩy xuống thử cuối cùng, không loại hẳn
+)
+
+// rankedProviders sắp lại thứ tự thử trong `all` (đã dedupe theo trọng số ở
+// distinctProviders) thành 3 nhóm, mỗi nhóm giữ nguyên thứ tự round-robin
+// nội bộ trừ 2 nhóm đầu/cuối được sắp theo tỉ lệ thành công thật:
+//  1. "Tốt" (đủ mẫu, tỉ lệ >= vpnRankGoodRate) — thử trước, tỉ lệ cao nhất
+//     trước tiên.
+//  2. "Chưa rõ" (chưa đủ mẫu, hoặc đủ mẫu nhưng ở khoảng giữa) — giữ đúng
+//     thứ tự round-robin bình thường, đây cũng chính là cách 1 hãng mới/ít
+//     dữ liệu được thăm dò tự nhiên thay vì bị cả 2 nhóm kia che mất.
+//  3. "Tệ" (đủ mẫu, tỉ lệ < vpnRankBadRate) — thử cuối cùng, vẫn được thử
+//     khi 2 nhóm kia đều hết chứ không bị loại hẳn.
+func (m *MultiVPNProvider) rankedProviders(all []ProxyProvider) []ProxyProvider {
+	snap := m.Stats()
+	type scored struct {
+		p    ProxyProvider
+		rate float64
+	}
+	var good, bad []scored
+	mid := make([]ProxyProvider, 0, len(all))
+	for _, p := range all {
+		st, ok := snap[providerName(p)]
+		if !ok || st.Attempts < vpnRankMinAttempts {
+			mid = append(mid, p)
+			continue
+		}
+		rate := float64(st.Successes) / float64(st.Attempts)
+		switch {
+		case rate >= vpnRankGoodRate:
+			good = append(good, scored{p, rate})
+		case rate < vpnRankBadRate:
+			bad = append(bad, scored{p, rate})
+		default:
+			mid = append(mid, p)
+		}
+	}
+	sort.Slice(good, func(i, j int) bool { return good[i].rate > good[j].rate })
+	sort.Slice(bad, func(i, j int) bool { return bad[i].rate > bad[j].rate })
+
+	out := make([]ProxyProvider, 0, len(all))
+	for _, g := range good {
+		out = append(out, g.p)
+	}
+	out = append(out, mid...)
+	for _, b := range bad {
+		out = append(out, b.p)
+	}
+	return out
+}
+
 // acquireFrom thử lần lượt từng nguồn cho tới khi có lease. Trước đây chỉ
 // thử ĐÚNG 1 nguồn rồi trả lỗi thẳng — nghĩa là 1 nguồn đang kẹt (hết hạn
 // mức kết nối đồng thời, hạ tầng nhà cung cấp trục trặc…) làm job fail hẳn
@@ -186,7 +254,7 @@ func (m *MultiVPNProvider) statsLogger() {
 // nguồn nào, nên phải thực sự dùng chúng khi cần.
 func (m *MultiVPNProvider) acquireFrom(ctx context.Context, workerID int, emit func(string)) (Lease, error) {
 	var lastErr error
-	for _, p := range m.distinctProviders() {
+	for _, p := range m.rankedProviders(m.distinctProviders()) {
 		if err := ctx.Err(); err != nil {
 			return Lease{}, err
 		}
