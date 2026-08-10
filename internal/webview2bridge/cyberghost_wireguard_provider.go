@@ -123,19 +123,24 @@ const (
 	// per-user secret.
 	cgAppKey = "QzgDsDNUXlgF9jehkTHHtBJwwI4RyInkZQDRJfLyz"
 
-	// cgCountryFetchDelay: pause between per-country server-list calls at
-	// startup — see type doc comment on why the full 100-country sweep
-	// needs pacing to avoid Cloudflare's rate limit. 15 requests at 0.4s
-	// each ran clean; back-to-back batches (two provider inits within
-	// ~10s of each other) started tripping 429s partway through the
-	// second batch, so this leaves real margin rather than just clearing
-	// the exact number observed to work once.
-	cgCountryFetchDelay = 600 * time.Millisecond
+	// cgCountryFetchDelay: pause between per-country server-list calls.
+	// Raised from 600ms to 1.5s on 2026-08-10 after the sweep moved to a
+	// background goroutine (see NewCyberGhostWireGuardProvider) — nothing
+	// blocks on this anymore, so trading a slower sweep for meaningfully
+	// fewer Cloudflare 429s (confirmed live: even 600ms still hit ~9-12/100
+	// countries every run, in the same handful of consecutive-streak
+	// clusters each time) costs nothing real. Still not a guarantee — see
+	// cgFetch429RetryDelay and the cleanup pass in refreshServers for what
+	// happens to whatever this doesn't prevent.
+	cgCountryFetchDelay = 1500 * time.Millisecond
 
 	// cgFetch429RetryDelay: on a 429 specifically (confirmed transient —
 	// see type doc comment), wait this long and retry the SAME country
 	// once before giving up on it. Not applied to any other failure kind.
-	cgFetch429RetryDelay = 5 * time.Second
+	// Raised from 5s alongside cgCountryFetchDelay for the same reason —
+	// a longer backoff before retrying costs nothing now that nothing
+	// waits on this sweep.
+	cgFetch429RetryDelay = 8 * time.Second
 )
 
 // cgCountries: the full country catalog CyberGhost's own GET
