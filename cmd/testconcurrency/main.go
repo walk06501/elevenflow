@@ -8,7 +8,7 @@
 // Usage:
 //
 //	go run ./cmd/testconcurrency -provider pia -user <PIA_USER> -pass <PIA_PASS> -count 10
-//	go run ./cmd/testconcurrency -provider surfshark -sf-user <SURFSHARK_USER> -sf-pass <SURFSHARK_PASS> -count 10
+//	go run ./cmd/testconcurrency -provider surfshark -key <SURFSHARK_PRIVATE_KEY> -count 10
 //	go run ./cmd/testconcurrency -provider cyberghost -cg-user <CG_USER> -cg-pass <CG_PASS> -count 10
 package main
 
@@ -33,8 +33,7 @@ func main() {
 	providerName := flag.String("provider", "", "\"pia\", \"surfshark\", \"proton\", \"ipvanish\", or \"cyberghost\"")
 	user := flag.String("user", os.Getenv("ELEVEN_PIA_USERNAME"), "PIA username (provider=pia)")
 	pass := flag.String("pass", os.Getenv("ELEVEN_PIA_PASSWORD"), "PIA password (provider=pia)")
-	sfUser := flag.String("sf-user", os.Getenv("ELEVEN_SURFSHARK_USERNAME"), "Surfshark username (provider=surfshark)")
-	sfPass := flag.String("sf-pass", os.Getenv("ELEVEN_SURFSHARK_PASSWORD"), "Surfshark password (provider=surfshark)")
+	key := flag.String("key", os.Getenv("ELEVEN_SURFSHARK_PRIVATE_KEY"), "Surfshark private key (provider=surfshark)")
 	protonUser := flag.String("proton-user", os.Getenv("ELEVEN_PROTON_USERNAME"), "ProtonVPN username (provider=proton)")
 	protonPass := flag.String("proton-pass", os.Getenv("ELEVEN_PROTON_PASSWORD"), "ProtonVPN password (provider=proton)")
 	cgUser := flag.String("cg-user", os.Getenv("ELEVEN_CYBERGHOST_USERNAME"), "CyberGhost username (provider=cyberghost)")
@@ -53,11 +52,11 @@ func main() {
 		fmt.Println("Building PIAWireGuardProvider...")
 		p, err = webview2bridge.NewPIAWireGuardProvider(*user, *pass)
 	case "surfshark":
-		if *sfUser == "" || *sfPass == "" {
-			log.Fatal("need -sf-user/-sf-pass or ELEVEN_SURFSHARK_USERNAME/ELEVEN_SURFSHARK_PASSWORD")
+		if *key == "" {
+			log.Fatal("need -key or ELEVEN_SURFSHARK_PRIVATE_KEY")
 		}
 		fmt.Println("Building SurfsharkWireGuardProvider...")
-		p, err = webview2bridge.NewSurfsharkWireGuardProvider(*sfUser, *sfPass)
+		p, err = webview2bridge.NewSurfsharkWireGuardProvider(*key)
 	case "proton":
 		if *protonUser == "" || *protonPass == "" {
 			log.Fatal("need -proton-user/-proton-pass or ELEVEN_PROTON_USERNAME/ELEVEN_PROTON_PASSWORD")

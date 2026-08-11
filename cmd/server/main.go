@@ -95,13 +95,15 @@ func main() {
 	//     dùng chung khoá tĩnh ắt bị tranh đường dữ liệu như NordVPN; đó là
 	//     giới hạn RIÊNG của backend NordVPN, không phải quy luật chung của
 	//     WireGuard. NHƯNG sau đó rớt xuống 0% kéo dài (2026-08-10), không rõ
-	//     nguyên nhân — tới 2026-08-12 mới lộ ra: khoá tĩnh đó cần được ĐĂNG
-	//     KÝ qua login+API của Surfshark và đăng ký đó CÓ HẠN, không phải
-	//     "gắn 1 lần dùng mãi" như code cũ giả định (xem
-	//     SurfsharkWireGuardProvider's doc comment) — đã sửa sang tự đăng ký
-	//     khoá mới mỗi lease, giống PIA. Độ trễ vẫn tăng rõ khi tải cao trong
-	//     đo cũ (7-11s sau lease thứ ~13, có thể do chỉ ~140 host cố định),
-	//     nên giữ trọng số vừa phải cho tới khi có đo lại sau fix.
+	//     nguyên nhân. 2026-08-12: thử sửa sang tự đăng ký khoá mới mỗi lease
+	//     qua login+API của Surfshark (nghi ngờ khoá tĩnh cũ hết hạn đăng ký),
+	//     nhưng phải REVERT — API đó nằm sau Cloudflare Bot Management, chặn
+	//     MỌI client không phải trình duyệt thật (xác nhận từ nhiều IP khác
+	//     nhau, không riêng VPS này — xem SurfsharkWireGuardProvider's doc
+	//     comment). Quay lại khoá tĩnh do người thật trích xuất qua trình
+	//     duyệt, không có cách nào code tự làm mới khoá được nữa. Độ trễ vẫn
+	//     tăng rõ khi tải cao trong đo cũ (7-11s sau lease thứ ~13, có thể do
+	//     chỉ ~140 host cố định), nên giữ trọng số vừa phải.
 	//   - NordVPN-SOCKS5 (1): ổn định và nhanh nhất (~2-14s tải xong trang)
 	//     nhưng chỉ có 12 host cố định. Dồn tải vào đây sẽ tự chuốc lấy
 	//     cờ "hoạt động bất thường" — dùng như đường dự phòng đáng tin, chứ
@@ -246,7 +248,7 @@ func main() {
 	if len(surfsharkAccounts) > 0 {
 		sfInit := 0
 		for _, a := range surfsharkAccounts {
-			surfshark, err := webview2bridge.NewSurfsharkWireGuardProvider(a.Username, a.Secret)
+			surfshark, err := webview2bridge.NewSurfsharkWireGuardProvider(a.Secret)
 			if err != nil {
 				log.Printf("Surfshark provider init failed, skipping: %v", err)
 				continue

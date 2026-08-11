@@ -2,14 +2,7 @@ package webview2bridge
 
 import (
 	"context"
-	"crypto/ecdh"
-	"crypto/rand"
-	"encoding/base64"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/netip"
@@ -25,62 +18,56 @@ import (
 // SurfsharkWireGuardProvider mirrors NordVPNWireGuardProvider's
 // retry-until-works design (see that type's doc comment for the full
 // reasoning — no server can be trusted as "will work" ahead of time,
-// only a live handshake + real HTTP round trip proves it), but differs
-// from both NordVPN and PIA in its key lifecycle:
+// only a live handshake + real HTTP round trip proves it), but its setup
+// is the simplest of the three:
 //
-//   - REWRITTEN 2026-08-12 (see login/registerKey below): an earlier
-//     version used ONE static private key for the provider's entire
-//     lifetime, taken directly from the account (the same key the
-//     Surfshark app itself uses) with no API call involved at all. That
-//     was wrong — reading Surfshark's own real client implementations
-//     (e.g. github.com/yazdan/openwrt-surfshark-wireguard's
-//     gen_wg_config.bash) showed Surfshark's WireGuard keys are NOT
-//     fire-and-forget: a key only works once registered via
-//     POST /v1/account/users/public-keys using a JWT from
-//     POST /v1/auth/login, and that registration has its own expiresAt —
-//     structurally the same "register a fresh key per session" contract
-//     PIA's addKey uses (see PIAWireGuardProvider), just with a
-//     login+register call pair instead of PIA's single addKey. A single
-//     long-lived static key with no renewal logic explains the sustained
-//     0% success rate seen 2026-08-10 far better than anything server-side:
-//     the account's one hardcoded key's registration had every opportunity
-//     to have quietly expired or been superseded (e.g. by the Surfshark
-//     app itself re-registering a new key later) with nothing in this
-//     codebase able to notice or recover.
-//   - Now generates a fresh X25519 keypair and registers it PER LEASE,
-//     exactly like PIA — the fix for the same underlying reason PIA
-//     already works this way: never depending on a key's registration
-//     still being valid days or weeks later.
-//   - Still no server-list API for the SERVER side (see surfsharkServerList
-//     in surfshark_servers.go) — Surfshark does publish one
-//     (api.surfshark.com/v4/server/clusters/, confirmed live 2026-08-12,
-//     and its pubKey values matched every embedded entry checked), but
-//     switching to it is a separate, lower-priority improvement from the
-//     key-lifecycle bug this rewrite actually fixes; the embedded list
-//     was NOT the problem (its keys are the SERVERS' own long-lived
-//     identity keys, unrelated to the CLIENT key rewritten here).
-//   - Interface address and DNS (surfsharkAddress/surfsharkDNS below)
-//     stay fixed regardless of which key is registered — unlike PIA's
-//     addKey, Surfshark's registration response carries no per-key peer
-//     IP assignment (confirmed from the same reference script), so every
-//     registered key uses this same client-side address.
+//   - No per-connection registration like PIA's addKey at LEASE time —
+//     one WireGuard private key, provided directly, fixed for the life of
+//     this provider.
+//   - No server-list API used for the SERVER side — the hostname + server
+//     public key pairs in surfshark_servers.go are a fixed, embedded
+//     list (Surfshark does publish one, api.surfshark.com/v4/server/clusters/,
+//     confirmed live 2026-08-12 with pubKey values matching every embedded
+//     entry checked, but nothing here currently uses it). Each hostname's
+//     IP is resolved via plain DNS at lease time (not cached at startup),
+//     since Surfshark load-balances behind DNS.
+//   - Its own fixed interface address and DNS (see surfsharkAddress/
+//     surfsharkDNS below) — these are Surfshark-specific, not NordVPN's;
+//     an earlier version of this file guessed NordVPN's values instead,
+//     which let the handshake complete but silently dropped all data.
+//
+// HISTORY (2026-08-12): briefly rewritten to generate a fresh key and
+// register it per lease via POST /v1/auth/login + POST
+// /v1/account/users/public-keys, matching how Surfshark's own real client
+// tools (github.com/yazdan/openwrt-surfshark-wireguard, github.com/Eryk-J/
+// surfshark-wg, and others) work, on the theory that the account's one
+// static key's registration had quietly expired (explaining the sustained
+// 0% seen since 2026-08-10). That theory may still be right, but the fix
+// was reverted: Surfshark's auth API sits behind Cloudflare Bot Management,
+// confirmed (2026-08-12) to return 403 for a plain HTTP client — curl, this
+// codebase's net/http, and by extension every one of those reference
+// scripts too — REGARDLESS of source IP (tested from this VPS, a second
+// unrelated VPS, and a residential machine, all blocked identically; even
+// a realistic browser User-Agent didn't help, and the response carries
+// Cloudflare's __cf_bm bot-management cookie, which is TLS/JA3-fingerprint
+// based, not header-based). The only real client tooling found that gets
+// past this (github.com/MSalman5230/surfshark-wireguard-config-generator)
+// does so with Selenium driving an actual browser, seeded with cookies
+// from a real prior human login — i.e. there is no login/registration path
+// available to a plain Go HTTP client at all right now, only to a genuine
+// browser session. Routing through this codebase's own WebView2 browser
+// automation would work but is a real engineering project or its own,
+// not justified for a source that only ever carries a small weight in the
+// pool — so back to a human periodically extracting a fresh private key
+// via a real browser (Surfshark app or my.surfshark.com's manual-setup
+// page) and handing it in directly, same as before 2026-08-12.
 type SurfsharkWireGuardProvider struct {
-	username, password string
+	privHex string
 
 	mu      sync.Mutex
-	token   string
 	nextIdx int
 	genCtr  int64
 	live    map[int64]*wgTunnel
-	// loginMu serializes RE-login specifically (see reloginIfStillStale) —
-	// separate from mu, which only ever guards short field reads/writes.
-	// Without this, N concurrent registerKey calls all seeing the same
-	// expired token would each fire their own POST /v1/auth/login at once;
-	// harmless to correctness (last write wins, p.mu still protects the
-	// field) but wasteful and looks like credential-stuffing-shaped traffic
-	// from Surfshark's side for no benefit — one relogin already fixes it
-	// for everyone waiting.
-	loginMu sync.Mutex
 	// ranker: trí nhớ theo TỪNG server (khoá bằng Host) — xem
 	// server_ranker.go. Trước 2026-08-10, nextCandidate chỉ round-robin
 	// thuần qua surfsharkServerList, không nhớ server nào vừa hỏng.
@@ -96,132 +83,29 @@ type SurfsharkWireGuardProvider struct {
 // Surfshark's server only recognizes 10.14.0.2 as this key's assigned
 // address and silently drops packets claiming to be from anything else.
 const (
-	surfsharkAddress  = "10.14.0.2"
-	surfsharkDNS      = "162.252.172.57"
-	surfsharkPort     = "51820"
-	surfsharkLoginURL = "https://api.surfshark.com/v1/auth/login"
-	surfsharkKeyURL   = "https://api.surfshark.com/v1/account/users/public-keys"
+	surfsharkAddress = "10.14.0.2"
+	surfsharkDNS     = "162.252.172.57"
+	surfsharkPort    = "51820"
 )
 
-// NewSurfsharkWireGuardProvider takes the account's real login
-// username/password (the same credentials the Surfshark app itself signs
-// in with) rather than a raw private key — see the type doc comment for
-// why: a key only works after being registered through this same login,
-// and that registration expires, so there is no long-lived static secret
-// to hand in directly anymore. Fails fast if login itself fails, same
-// reasoning as PIA/NordVPN: a credential that can't authenticate now will
-// never serve a request later either.
-func NewSurfsharkWireGuardProvider(username, password string) (*SurfsharkWireGuardProvider, error) {
+// NewSurfsharkWireGuardProvider takes the account's own WireGuard private
+// key directly (base64, extracted via a real browser session — see the
+// type doc comment for why this has to be a human-provided key rather
+// than something this codebase can log in and register itself) — there
+// is no API call that could fail the way NordVPN/PIA's credential fetch
+// can, so this only fails on a malformed key. Whoever supplies the key is
+// responsible for refreshing it (via the admin panel) if it ever stops
+// working — nothing here can detect or renew an expired registration on
+// its own, since doing so would need the same Cloudflare-blocked API.
+func NewSurfsharkWireGuardProvider(privateKeyB64 string) (*SurfsharkWireGuardProvider, error) {
+	privHex, err := wgKeyToHex(privateKeyB64)
+	if err != nil {
+		return nil, fmt.Errorf("bad surfshark private key: %w", err)
+	}
 	if len(surfsharkServerList) == 0 {
 		return nil, fmt.Errorf("no surfshark servers configured")
 	}
-	p := &SurfsharkWireGuardProvider{username: username, password: password, live: map[int64]*wgTunnel{}, ranker: newServerRanker()}
-	if err := p.login(); err != nil {
-		return nil, fmt.Errorf("surfshark login: %w", err)
-	}
-	return p, nil
-}
-
-// login exchanges username/password for a JWT bearer token used to
-// register keys (registerKey). Same request shape as
-// github.com/yazdan/openwrt-surfshark-wireguard's wg_login, confirmed
-// against the real endpoint 2026-08-12.
-func (p *SurfsharkWireGuardProvider) login() error {
-	reqBody, _ := json.Marshal(map[string]string{"username": p.username, "password": p.password})
-	req, err := http.NewRequest("POST", surfsharkLoginURL, strings.NewReader(string(reqBody)))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, b)
-	}
-	var out struct {
-		Token string `json:"token"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return err
-	}
-	if out.Token == "" {
-		return fmt.Errorf("empty token in response")
-	}
-	p.mu.Lock()
-	p.token = out.Token
-	p.mu.Unlock()
-	log.Printf("[Surfshark-WG] Login OK for user: %s", p.username)
-	return nil
-}
-
-// reloginIfStillStale re-authenticates only if the token is STILL whatever
-// staleToken was when the caller decided to relogin — if another goroutine
-// already refreshed it in the meantime (a real possibility: many concurrent
-// registerKey calls can all observe the same expired token at once), this
-// is a no-op and the caller just picks up the already-fresh token. loginMu
-// (not p.mu) serializes this check-then-act across goroutines so at most
-// one real HTTP login happens per actual expiry, not one per caller that
-// noticed.
-func (p *SurfsharkWireGuardProvider) reloginIfStillStale(staleToken string) error {
-	p.loginMu.Lock()
-	defer p.loginMu.Unlock()
-	p.mu.Lock()
-	current := p.token
-	p.mu.Unlock()
-	if current != staleToken {
-		return nil // someone else already refreshed it while we waited for loginMu
-	}
-	return p.login()
-}
-
-// registerKey activates one freshly generated public key so Surfshark's
-// servers will complete a handshake against it — an unregistered key
-// handshakes with nobody (silently, same failure shape as an expired
-// registration), so this must succeed before tryOne attempts a tunnel.
-// On a 401 (token expired — the same signal
-// github.com/yazdan/openwrt-surfshark-wireguard's wg_reg_pubkey checks
-// for), re-logs in (deduplicated across concurrent callers — see
-// reloginIfStillStale) and retries exactly once, mirroring that reference
-// script's own retry-after-relogin behavior.
-func (p *SurfsharkWireGuardProvider) registerKey(pubKeyB64 string) error {
-	for attempt := 0; attempt < 2; attempt++ {
-		p.mu.Lock()
-		token := p.token
-		p.mu.Unlock()
-
-		reqBody, _ := json.Marshal(map[string]string{"pubKey": pubKeyB64})
-		req, err := http.NewRequest("POST", surfsharkKeyURL, strings.NewReader(string(reqBody)))
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+token)
-		resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
-		if err != nil {
-			return err
-		}
-		b, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if resp.StatusCode == http.StatusUnauthorized && attempt == 0 {
-			if err := p.reloginIfStillStale(token); err != nil {
-				return fmt.Errorf("token expired, re-login failed: %w", err)
-			}
-			continue
-		}
-		// 200/201/202 all seen as success shapes across Surfshark's own
-		// client tooling (yazdan's script accepts the same range) — not
-		// just 200, so match that instead of a single exact code.
-		if resp.StatusCode < 200 || resp.StatusCode > 202 {
-			return fmt.Errorf("HTTP %d: %s", resp.StatusCode, b)
-		}
-		return nil
-	}
-	return fmt.Errorf("registerKey: exhausted retries")
+	return &SurfsharkWireGuardProvider{privHex: privHex, live: map[int64]*wgTunnel{}, ranker: newServerRanker()}, nil
 }
 
 func (p *SurfsharkWireGuardProvider) Close() {
@@ -269,25 +153,12 @@ func (p *SurfsharkWireGuardProvider) nextCandidate() struct {
 	return s
 }
 
-// tryOne generates a fresh keypair and registers it (registerKey — see the
-// type doc comment for why a key must be freshly registered, not reused),
-// resolves the candidate hostname, builds the tunnel, waits briefly for a
-// real handshake, then proves data actually flows with one real HTTP round
-// trip — same verification the other two WireGuard providers do and for
-// the same reason (a completed handshake alone isn't proof the data path
-// works).
+// tryOne resolves the candidate hostname, builds the tunnel, waits
+// briefly for a real handshake, then proves data actually flows with one
+// real HTTP round trip — same verification the other two WireGuard
+// providers do and for the same reason (a completed handshake alone
+// isn't proof the data path works).
 func (p *SurfsharkWireGuardProvider) tryOne(host, pubKeyB64 string) (*wgTunnel, error) {
-	curve := ecdh.X25519()
-	myPriv, err := curve.GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("generate keypair: %w", err)
-	}
-	myPubB64 := base64.StdEncoding.EncodeToString(myPriv.PublicKey().Bytes())
-	if err := p.registerKey(myPubB64); err != nil {
-		return nil, fmt.Errorf("register key: %w", err)
-	}
-	myPrivHex := hex.EncodeToString(myPriv.Bytes())
-
 	ips, err := net.LookupHost(host)
 	if err != nil || len(ips) == 0 {
 		return nil, fmt.Errorf("resolve %s: %w", host, err)
@@ -311,7 +182,7 @@ func (p *SurfsharkWireGuardProvider) tryOne(host, pubKeyB64 string) (*wgTunnel, 
 
 	ipc := fmt.Sprintf(
 		"private_key=%s\npublic_key=%s\nendpoint=%s:%s\nallowed_ip=0.0.0.0/0\npersistent_keepalive_interval=25\n",
-		myPrivHex, pubHex, ip, surfsharkPort,
+		p.privHex, pubHex, ip, surfsharkPort,
 	)
 	if err := dev.IpcSet(ipc); err != nil {
 		dev.Close()
