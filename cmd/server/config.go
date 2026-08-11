@@ -51,10 +51,19 @@ type Config struct {
 	PIAPassword      string // ELEVEN_PIA_PASSWORD: Private Internet Access account password
 	NordVPNWireGuard bool   // ELEVEN_NORDVPN_WIREGUARD: also add the WireGuard-tunnel-based NordVPN source (opt-in — heavier per-lease than the SOCKS5 source, see NordVPNWireGuardProvider's doc comment)
 	PIAWireGuard     bool   // ELEVEN_PIA_WIREGUARD: also add the WireGuard-tunnel-based PIA source (opt-in — same reasoning as NordVPNWireGuard, see PIAWireGuardProvider's doc comment)
-	SurfsharkKey     string // ELEVEN_SURFSHARK_PRIVATE_KEY: Surfshark account's own WireGuard private key (base64) — same key the Surfshark app itself uses, not fetched from any API
-	ProtonUsername   string // ELEVEN_PROTON_USERNAME: ProtonVPN account username (2FA must be OFF — no interactive prompt in a server process)
-	ProtonPassword   string // ELEVEN_PROTON_PASSWORD: ProtonVPN account password
-	ProtonWireGuard  bool   // ELEVEN_PROTON_WIREGUARD: also add the WireGuard-tunnel-based ProtonVPN source (opt-in, unmeasured under concurrency — see ProtonVPNWireGuardProvider's doc comment)
+	// SurfsharkUsername/SurfsharkPassword: real Surfshark account login
+	// credentials — CHANGED 2026-08-12 from a single static WireGuard
+	// private key. A key only works after being registered via Surfshark's
+	// own login+public-keys API and that registration expires, so there is
+	// no longer a static secret to configure directly; see
+	// SurfsharkWireGuardProvider's doc comment for the full reasoning
+	// (this mirrors PIAUsername/PIAPassword's shape, not the old
+	// SurfsharkKey's).
+	SurfsharkUsername string // ELEVEN_SURFSHARK_USERNAME
+	SurfsharkPassword string // ELEVEN_SURFSHARK_PASSWORD
+	ProtonUsername    string // ELEVEN_PROTON_USERNAME: ProtonVPN account username (2FA must be OFF — no interactive prompt in a server process)
+	ProtonPassword    string // ELEVEN_PROTON_PASSWORD: ProtonVPN account password
+	ProtonWireGuard   bool   // ELEVEN_PROTON_WIREGUARD: also add the WireGuard-tunnel-based ProtonVPN source (opt-in, unmeasured under concurrency — see ProtonVPNWireGuardProvider's doc comment)
 	// MullvadAccountNumber: bare account number (no username/password/2FA —
 	// see MullvadWireGuardProvider's doc comment). Only 1 account supported
 	// via .env fallback (unlike NordVPNTokens' comma-list) since this whole
@@ -162,7 +171,8 @@ func LoadConfig() *Config {
 		PIAPassword:          getEnv("ELEVEN_PIA_PASSWORD", ""),
 		NordVPNWireGuard:     getEnv("ELEVEN_NORDVPN_WIREGUARD", "") == "true",
 		PIAWireGuard:         getEnv("ELEVEN_PIA_WIREGUARD", "") == "true",
-		SurfsharkKey:         getEnv("ELEVEN_SURFSHARK_PRIVATE_KEY", ""),
+		SurfsharkUsername:    getEnv("ELEVEN_SURFSHARK_USERNAME", ""),
+		SurfsharkPassword:    getEnv("ELEVEN_SURFSHARK_PASSWORD", ""),
 		ProtonUsername:       getEnv("ELEVEN_PROTON_USERNAME", ""),
 		ProtonPassword:       getEnv("ELEVEN_PROTON_PASSWORD", ""),
 		ProtonWireGuard:      getEnv("ELEVEN_PROTON_WIREGUARD", "") == "true",

@@ -5,7 +5,7 @@
 //
 // Usage:
 //
-//	go run ./cmd/testsurfshark -key <SURFSHARK_PRIVATE_KEY_B64>
+//	go run ./cmd/testsurfshark -user <SURFSHARK_USER> -pass <SURFSHARK_PASS>
 package main
 
 import (
@@ -25,14 +25,15 @@ import (
 )
 
 func main() {
-	key := flag.String("key", os.Getenv("ELEVEN_SURFSHARK_PRIVATE_KEY"), "Surfshark WireGuard private key (base64)")
+	user := flag.String("user", os.Getenv("ELEVEN_SURFSHARK_USERNAME"), "Surfshark account username")
+	pass := flag.String("pass", os.Getenv("ELEVEN_SURFSHARK_PASSWORD"), "Surfshark account password")
 	flag.Parse()
-	if *key == "" {
-		log.Fatal("need -key or ELEVEN_SURFSHARK_PRIVATE_KEY")
+	if *user == "" || *pass == "" {
+		log.Fatal("need -user/-pass or ELEVEN_SURFSHARK_USERNAME/ELEVEN_SURFSHARK_PASSWORD")
 	}
 
 	fmt.Println("1. Building SurfsharkWireGuardProvider...")
-	p, err := webview2bridge.NewSurfsharkWireGuardProvider(*key)
+	p, err := webview2bridge.NewSurfsharkWireGuardProvider(*user, *pass)
 	if err != nil {
 		log.Fatalf("   FAILED: %v", err)
 	}

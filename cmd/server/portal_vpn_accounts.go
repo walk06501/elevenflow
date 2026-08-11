@@ -16,8 +16,10 @@ import (
 // returns it (see web-portal's apps/api/app/routes/eleven_public.py).
 // web-portal is now the single source of truth for these credentials — the
 // admin console's VPN (ElevenFlow) tab is where they are actually managed,
-// not this server's .env. Username is empty for token/key-only providers
-// (nordvpn, surfshark).
+// not this server's .env. Username is empty for token-only providers
+// (nordvpn). Surfshark used to be key-only too but isn't anymore (see
+// SurfsharkWireGuardProvider's doc comment, 2026-08-12) — Username/Secret
+// here now hold its real login username/password, same shape as pia/proton.
 type portalVPNAccount struct {
 	Provider string `json:"provider"`
 	Label    string `json:"label"`
@@ -99,9 +101,9 @@ func envVPNAccounts(cfg *Config) map[string][]portalVPNAccount {
 			Provider: "pia", Label: "pia (.env)", Username: cfg.PIAUsername, Secret: cfg.PIAPassword,
 		})
 	}
-	if cfg.SurfsharkKey != "" {
+	if cfg.SurfsharkUsername != "" && cfg.SurfsharkPassword != "" {
 		grouped["surfshark"] = append(grouped["surfshark"], portalVPNAccount{
-			Provider: "surfshark", Label: "surfshark (.env)", Secret: cfg.SurfsharkKey,
+			Provider: "surfshark", Label: "surfshark (.env)", Username: cfg.SurfsharkUsername, Secret: cfg.SurfsharkPassword,
 		})
 	}
 	if cfg.ProtonUsername != "" && cfg.ProtonPassword != "" {
