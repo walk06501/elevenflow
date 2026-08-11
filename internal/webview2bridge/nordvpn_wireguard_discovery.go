@@ -70,10 +70,21 @@ func (p *NordVPNWireGuardProvider) discoveryLoop(ctx context.Context) {
 }
 
 // runDiscoveryTick tests exactly 1 not-yet-classified key group per call,
-// skipping entirely if this account currently has any real lease open —
-// discovery deliberately never competes with production traffic for slots;
-// it only spends capacity this account isn't using for anything else right
-// now.
+// skipping entirely if this account currently has any real lease open right
+// now — discovery only spends capacity this account isn't using for
+// anything else AT THE MOMENT IT STARTS. This is a snapshot check, not a
+// lock held for the whole test: the batch below (a handful of concurrent
+// handshakes, done in a few seconds via tryOne, same as a real probeRound)
+// deliberately bypasses tryAcquireSlotLocked/slotsByKey entirely so it can
+// test capacity an unproven key isn't yet trusted for — which also means a
+// real request that starts mid-batch and happens to land on the SAME
+// untested key (only reachable via nextCandidate's round-robin fallback,
+// since discovery only ever targets keys with no rankedGoodKeysLocked
+// standing yet) isn't blocked by it either. That overlap is rare by
+// construction and self-heals the same way any other transient handshake
+// hiccup does (noteFailure/rotation/MultiVPNProvider falling back to
+// another source) — not prevented outright, just made unlikely and cheap
+// when it happens.
 func (p *NordVPNWireGuardProvider) runDiscoveryTick() {
 	p.mu.Lock()
 	if len(p.live) != 0 {
@@ -136,11 +147,20 @@ func (p *NordVPNWireGuardProvider) runDiscoveryTick() {
 
 // nextDiscoveryCandidateLocked picks the next key group worth testing:
 // large enough to matter (nordWGDiscoveryMinHosts) and not already
-// classified one way or the other (present in either the hand-curated
-// nordWGPoolKeyCapacity or the already-discovered map). Rotates through
-// them largest-first via discoveryCursor so the biggest, statistically most
-// promising groups (today's one real pool was the single largest group
-// tested) get tried before small ones. Caller must hold p.mu.
+// CONFIRMED a pool (present in either the hand-curated nordWGPoolKeyCapacity
+// or the already-discovered map). A key that tested below
+// nordWGDiscoveryPromoteBar is NOT excluded here and stays eligible for a
+// later re-test — there is no separate "confirmed ordinary" memory. This is
+// deliberate, not a missed case: a tick only ever runs when the account
+// would otherwise sit fully idle (see runDiscoveryTick), so re-testing an
+// already-ordinary key costs nothing that would have gone to something more
+// useful, and it's the only way this ever notices NordVPN promoting a
+// previously-ordinary server into a real pool later.
+//
+// Rotates through eligible groups largest-first via discoveryCursor so the
+// biggest, statistically most promising groups (today's one real pool was
+// the single largest group tested) get tried before small ones. Caller
+// must hold p.mu.
 func (p *NordVPNWireGuardProvider) nextDiscoveryCandidateLocked() (string, []wgServer, bool) {
 	type group struct {
 		key   string

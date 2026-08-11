@@ -307,7 +307,7 @@ type NordVPNWireGuardProvider struct {
 	// slotsByKey giới hạn số kết nối WireGuard tồn tại cùng lúc trên tài
 	// khoản — tính CẢ tunnel đang sống LẪN probe đang dò — nhưng giờ tách
 	// RIÊNG theo từng public key thay vì 1 trần chung cho cả tài khoản (xem
-	// nordWGPoolKeyCapacity/nordWGCapacityForKey): 1 key "pool" đã chứng
+	// nordWGPoolKeyCapacity/capacityForKeyLocked): 1 key "pool" đã chứng
 	// minh chịu được nhiều kết nối không nên bị trần của key "dedicated"
 	// thường (1) kéo xuống, và ngược lại — 1 key thường tràn slot không được
 	// phép mượn "chỗ" của key pool khác. Tạo lười (lazy) theo từng key gặp
