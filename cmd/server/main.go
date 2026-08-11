@@ -104,12 +104,18 @@ func main() {
 	//     KHÔNG phải nguồn gánh chính.
 	//   - NordVPN-WireGuard (1): 8500+ server nhưng mỗi tài khoản chỉ giữ
 	//     được ĐÚNG 1 đường dữ liệu trên phần lớn server (xem
-	//     nordWGMaxConcurrentConns) — trừ một số cụm hạ tầng cho đa phiên
-	//     thật (đã dò ra bằng cmd/scanwgpools, và NordVPNWireGuardProvider
-	//     giờ tự học ưu tiên các cụm đó qua traffic thật, xem
-	//     rankedGoodKeysLocked). Vẫn là nguồn yếu nhất trong 4, giữ trọng số
-	//     thấp; nhiều tài khoản (ELEVEN_NORDVPN_TOKENS) mới thực sự tăng
-	//     được sức chứa, không phải tăng weight.
+	//     nordWGDefaultMaxConcurrentConns) — trừ 1 số ít cụm hạ tầng "pool"
+	//     đo được chịu NHIỀU đường dữ liệu đồng thời thật (cmd/scanwgpools;
+	//     2026-08-11 xác nhận lại: 828-host pool = 10/10 đồng thời, còn
+	//     1 pool 61-host = 5/10). Từ 2026-08-11, NordVPNWireGuardProvider
+	//     không chỉ HỌC ưu tiên các key đó qua traffic thật
+	//     (rankedGoodKeysLocked) mà còn THỰC SỰ cấp nhiều slot đồng thời hơn
+	//     cho đúng những key đã chứng minh (nordWGPoolKeyCapacity), tự lùi về
+	//     an toàn nếu tỉ lệ thành công SỐNG của key đó tụt (xem
+	//     capacityForKeyLocked) — không còn chỉ dựa vào 1 lần đo tĩnh mãi mãi.
+	//     Vẫn giữ trọng số thấp vì phần lớn 8500+ server vẫn đúng là 1
+	//     đường/tài khoản; nhiều tài khoản (ELEVEN_NORDVPN_TOKENS) vẫn là
+	//     cách chính để tăng sức chứa, các pool key chỉ là phần cộng thêm.
 	//   - ProtonVPN-WireGuard (3): đo được 30/30 thành công (2026-08-05) SAU
 	//     KHI sửa 1 lỗi tự gây ra: refreshServers() từng liệt kê nhiều tên
 	//     "logical" server trỏ chung 1 EntryIP vật lý (vd SK#1..SK#8 cùng
@@ -193,12 +199,13 @@ func main() {
 	// config, since there's no reason to keep a known-bad source wired in.
 	if len(nordAccounts) > 0 && cfg.NordVPNWireGuard {
 		// One NordVPNWireGuardProvider instance per account: each instance
-		// owns its own private key and its own 1-slot semaphore
-		// (nordWGMaxConcurrentConns — confirmed by hand, real handshake
-		// tests, that a NordVPN account's WireGuard key sustains exactly 1
-		// concurrent data path regardless of server or VPS hardware). N
-		// accounts therefore means N independent slots, not 1 shared
-		// across all of them — the whole reason to add more than one.
+		// owns its own private key and its own per-public-key slot map (see
+		// nordvpn_wireguard_provider.go's nordWGDefaultMaxConcurrentConns /
+		// nordWGPoolKeyCapacity doc — most keys sustain exactly 1 concurrent
+		// data path per account, a hand-verified few "pool" keys sustain
+		// several). N accounts means N independent copies of that whole
+		// per-key slot map, not 1 shared across all of them — the whole
+		// reason to add more than one.
 		nordWGInit := 0
 		for _, a := range nordAccounts {
 			nordWG, err := webview2bridge.NewNordVPNWireGuardProvider(a.Secret)
@@ -212,7 +219,7 @@ func main() {
 			nordWGInit++
 		}
 		if nordWGInit > 0 {
-			log.Printf("NordVPN WireGuard proxy source active: %d account(s), %d concurrent slot(s) total (weight %d each, opt-in, heavier per-lease — see doc comment)", nordWGInit, nordWGInit, nordWGWeight)
+			log.Printf("NordVPN WireGuard proxy source active: %d account(s) (weight %d each, opt-in, heavier per-lease — see doc comment; per-key slot capacity, not a flat %d concurrent — see nordWGPoolKeyCapacity)", nordWGInit, nordWGWeight, nordWGInit)
 		}
 	}
 	if len(piaAccounts) > 0 && cfg.PIAWireGuard {

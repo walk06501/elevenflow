@@ -2,6 +2,7 @@ package webview2bridge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -454,7 +455,16 @@ func (m *MultiVPNProvider) acquireFrom(ctx context.Context, workerID int, emit f
 		m.reserve(name)
 		t0 := time.Now()
 		lease, err := p.Acquire(ctx, workerID, emit)
-		m.recordAttempt(name, err == nil, time.Since(t0))
+		// errNordWGNoSlots (NordVPN-WG's hard 1-connection-per-account cap,
+		// see its doc comment) means this attempt never touched a real
+		// server — counting it in recordAttempt would make the account-cap
+		// contention that shows up under concurrent load look identical to
+		// a real bad-handshake failure, unfairly dragging down the quality
+		// ranking (rankedProviders) for a provider whose actual per-server
+		// picking is fine.
+		if !errors.Is(err, errNordWGNoSlots) {
+			m.recordAttempt(name, err == nil, time.Since(t0))
+		}
 		if err != nil {
 			m.releaseActive(name)
 			lastErr = err

@@ -32,11 +32,26 @@ type wgServer struct {
 type wgTunnel struct {
 	dev   *device.Device
 	socks *localSOCKS5Server
+	// pubHex: which key's slot this tunnel is holding — needed so
+	// closeLease/Close release into the SAME per-key channel it was
+	// acquired from (see nordWGChanCapacityForKey/slotChanLocked).
+	pubHex string
 }
 
-// errNordWGNoSlots: tài khoản đã dùng hết số kết nối WireGuard đồng thời
-// cho phép (xem nordWGMaxConcurrentConns). Là lỗi "thử nguồn khác đi", KHÔNG
-// phải "server này hỏng" — nên không được retry trong nội bộ provider.
+// errNordWGNoSlots: MỌI candidate quét được trong 1 lượt probeRound đều rơi
+// vào key đã hết chỗ đồng thời (xem tryAcquireSlotLocked/capacityForKeyLocked)
+// — lỗi "thử nguồn khác đi", KHÔNG phải "server này hỏng" — nên không được
+// retry trong nội bộ provider.
+//
+// probeRound wrap sentinel này khi trả lỗi, để MultiVPNProvider.acquireFrom
+// nhận ra và KHÔNG tính vào thống kê chất lượng (recordAttempt) — một lượt
+// bị chặn vì hết slot chưa từng chạm tới 1 server thật nào, nên không nói
+// lên được gì về việc "chọn server có tốt không". Trước khi có chỗ phân biệt
+// này, mọi lần bị chặn hết slot bị tính y hệt 1 lần bắt tay thất bại thật,
+// kéo tụt success_rate đo được của NordVPN-WG một cách sai lệch — nhìn giống
+// hệt "chọn server tệ" trong khi thực ra là do trần kết nối đồng thời của
+// đúng (các) key vừa được thử bị chạm (xem nordWGDefaultMaxConcurrentConns/
+// nordWGPoolKeyCapacity).
 var errNordWGNoSlots = errors.New("hết slot kết nối NordVPN WireGuard")
 
 const (
@@ -77,33 +92,28 @@ const (
 	// PIA/Surfshark/NordVPN-SOCKS5 nhanh hơn hẳn cho người dùng.
 	nordWGRetryUntilCtxDone = false
 
-	// nordWGMaxConcurrentConns: trần CỨNG cho TỔNG số kết nối WireGuard tồn
-	// tại cùng lúc trên 1 tài khoản NordVPN — tính CẢ tunnel đang phục vụ
-	// LẪN probe đang dò. NordVPN giới hạn ~10 kết nối đồng thời; vượt trần
-	// thì server lặng lẽ không trả handshake, nhìn từ client giống hệt
-	// "server hỏng", nên càng retry càng tệ.
+	// nordWGDefaultMaxConcurrentConns: trần mặc định cho TỔNG số kết nối
+	// WireGuard tồn tại cùng lúc trên 1 tài khoản NordVPN, cho MỌI public
+	// key KHÔNG có mặt trong nordWGPoolKeyCapacity bên dưới — tính CẢ tunnel
+	// đang phục vụ LẪN probe đang dò. Vượt trần thì server lặng lẽ không trả
+	// handshake, nhìn từ client giống hệt "server hỏng", nên càng retry
+	// càng tệ.
 	//
-	// Cưỡng chế bằng semaphore (trường slots) chứ KHÔNG phải bằng cách đếm
-	// map tunnel đang sống: cách đếm đó bỏ sót probe đang bay, nên nhiều
-	// session cùng dò một lúc vẫn vượt trần dễ dàng — quan sát thật
-	// (2026-08-04): 3 session cùng dò × 4 probe = 12 kết nối, và MỌI
-	// handshake hỏng cho tới khi chúng thôi chồng lấn.
+	// Đặt 1 sau khi đo trên VPS thật (2026-08-04): với 1 server "dedicated"
+	// thường, NordVPN chỉ giữ được ĐÚNG MỘT đường dữ liệu WireGuard trên 1
+	// khoá tài khoản. Bằng chứng: tunnel vượt qua bài tự kiểm tra (handshake
+	// + 1 GET thật) nhưng rồi WebView2 KHÔNG tải nổi trang, luôn timeout
+	// 30s — vì tới lúc đó 1 tunnel khác vừa lập xong đã chiếm mất đường dữ
+	// liệu; cùng lúc đó NordVPN-SOCKS5 tải trang trong ~2s.
 	//
-	// Cần trần này vì SessionPool giữ nguyên lease của session đang rảnh
-	// (idle-close chỉ đóng cửa sổ WebView2, không đổi IP — đúng yêu cầu
-	// "chỉ đổi khi bị ban"), nên với 50 session, về lý thuyết có thể có tới
-	// 50 tunnel mở cùng lúc. Chạm trần thì trả lỗi NGAY để MultiVPNProvider
-	// chuyển sang nguồn khác (PIA/Surfshark/NordVPN-SOCKS5) thay vì để job
-	// chết — xem MultiVPNProvider.acquireFrom.
-	// Đặt 1 sau khi đo trên VPS thật (2026-08-04): NordVPN chỉ giữ được ĐÚNG
-	// MỘT đường dữ liệu WireGuard trên 1 khoá tài khoản. Bằng chứng: tunnel
-	// vượt qua bài tự kiểm tra (handshake + 1 GET thật) nhưng rồi WebView2
-	// KHÔNG tải nổi trang, luôn timeout 30s — vì tới lúc đó 1 tunnel khác
-	// vừa lập xong đã chiếm mất đường dữ liệu; cùng lúc đó NordVPN-SOCKS5
-	// tải trang trong ~2s. Nhiều tunnel Nord song song không chỉ vô ích mà
-	// còn phá lẫn nhau, nên trần ở đây là 1 chứ không phải "10 thiết bị"
-	// như tài liệu NordVPN gợi ý.
-	nordWGMaxConcurrentConns = 1
+	// QUAN TRỌNG (2026-08-11, xem nordWGPoolKeyCapacity ngay dưới): kết luận
+	// "1 kết nối" này chỉ đúng cho server "dedicated" thường — cmd/scanwgpools
+	// đã đo thật và tìm ra 1 số ít backend "pool" (nhóm hostname dùng chung
+	// 1 public key) chịu được NHIỀU kết nối đồng thời hơn hẳn. Trần này vẫn
+	// là mặc định AN TOÀN cho phần còn lại (38/40 nhóm lớn nhất đo lại vẫn
+	// đúng 0/10 ở lần scan 2026-08-11) — không hạ thấp barrier chứng minh
+	// cho MỌI key, chỉ nới riêng cho những key đã có bằng chứng thật.
+	nordWGDefaultMaxConcurrentConns = 1
 
 	// nordWGProbeFanOut: số ứng viên thử CÙNG LÚC mỗi vòng (xem acquireLease).
 	//
@@ -126,6 +136,79 @@ const (
 	// sẽ loại oan hàng loạt server tốt chỉ vì 1 sự cố phía mình.
 	nordWGFailCooldown = 10 * time.Minute
 )
+
+// nordWGPoolKeyCapacity: WireGuard public keys (hex) confirmed by REAL
+// concurrent-handshake testing (cmd/scanwgpools) to be "virtual server
+// pool" backends that sustain far more than nordWGDefaultMaxConcurrentConns
+// data paths per account at once — unlike an ordinary dedicated server's
+// key, where the same test always gets 0/10.
+//
+// Public keys are backend identity, not account identity (see the type doc
+// below: 224 keys shared across 8803+ hostnames) — a key proven here to
+// support N concurrent connections supports N per ANY NordVPN account
+// configured, old or new, not just the one the scan token belonged to.
+//
+// Capacity is set to the highest count ACTUALLY OBSERVED, never
+// extrapolated upward — cmd/scanwgpools's -per-group only went to 10, so
+// these numbers are a proven FLOOR on real capacity, not necessarily the
+// ceiling. Re-run with a higher -per-group against a key already listed
+// here to find out if it goes higher before raising its number.
+//
+// Re-verify periodically (server pools are NordVPN's own infrastructure
+// choice, not contractually stable) — last confirmed 2026-08-11 against
+// the 40 largest key groups (min 6 hosts each); only these 2 cleared the
+// >=5/10 bar out of 40 tested:
+//
+//	go run ./cmd/scanwgpools -token <ELEVEN_NORDVPN_TOKEN> -min-hosts 6 -max-groups 40 -per-group 10
+var nordWGPoolKeyCapacity = map[string]int{
+	// uk1784.nordvpn.com's backend, 828 hosts sharing this key — 10/10
+	// concurrent handshakes succeeded (perfect score, likely higher than 10
+	// in reality — untested past the scan's batch size).
+	"2b9de5db03881d4df6eb6b17e4dff9900bc2bede2be7994dba2df411bbda0e51": 10,
+	// au569.nordvpn.com's backend, 61 hosts — 5/10, borderline: real but
+	// weaker than the uk1784 pool, kept conservative rather than rounded up.
+	"7fec68f613a3544907564189a30b91194e541044970a9888df06024193d28a5b": 5,
+}
+
+// nordWGChanCapacityForKey sizes the (fixed-size, created-once) buffered
+// channel backing a key's slots — always the highest this key could ever
+// legitimately need, i.e. the static scanwgpools-proven ceiling, or the
+// safe default for every other key. A Go channel's buffer can't be resized
+// after creation, so this is deliberately the STATIC max; the actual
+// currently-TRUSTED cap (which can be lower, see capacityForKeyLocked) is
+// enforced separately by comparing len(ch) against it before sending.
+func nordWGChanCapacityForKey(pubHex string) int {
+	if n, ok := nordWGPoolKeyCapacity[pubHex]; ok {
+		return n
+	}
+	return nordWGDefaultMaxConcurrentConns
+}
+
+// capacityForKeyLocked returns how many concurrent connections this key is
+// CURRENTLY trusted for: the scanwgpools-proven ceiling (nordWGPoolKeyCapacity)
+// unless live traffic through this very process disagrees. If the key has
+// racked up enough real attempts (same bar as rankedGoodKeysLocked) and its
+// live success rate has fallen below "good", something changed since the
+// scan (NordVPN resized/retired the pool, etc.) — continuing to trust the
+// old number would just manufacture more failures, so it's treated as an
+// ordinary key until a fresh cmd/scanwgpools run re-proves it. This is what
+// makes the hardcoded table safe to leave stale for a while: it can only
+// ever get MORE conservative on its own, never silently keep trusting a
+// number reality has stopped matching. Caller must hold p.mu.
+func (p *NordVPNWireGuardProvider) capacityForKeyLocked(pubHex string) int {
+	proven, isPool := nordWGPoolKeyCapacity[pubHex]
+	if !isPool {
+		return nordWGDefaultMaxConcurrentConns
+	}
+	const minAttempts = 5
+	const minSuccessRate = 0.7
+	if st, ok := p.keyStats[pubHex]; ok && st.attempts >= minAttempts {
+		if rate := float64(st.successes) / float64(st.attempts); rate < minSuccessRate {
+			return nordWGDefaultMaxConcurrentConns
+		}
+	}
+	return proven
+}
 
 // NordVPNWireGuardProvider hands out leases backed by real per-lease
 // WireGuard tunnels to NordVPN's full server list (thousands of hosts,
@@ -188,16 +271,65 @@ type NordVPNWireGuardProvider struct {
 	failedUntil map[string]time.Time
 	// keyStats: public key → thống kê thật đã tích luỹ (xem keyStat).
 	keyStats map[string]*keyStat
+	// keyHostIdx: public key → con trỏ xoay vòng trong byKey[key] (xem
+	// nextCandidate's ranked-key loop) — để các lần gọi liên tiếp trải đều
+	// ra nhiều hostname khác nhau của cùng 1 key thay vì luôn trả về đúng
+	// hostname đầu tiên.
+	keyHostIdx map[string]int
 
-	// slots giới hạn TỔNG số kết nối WireGuard tồn tại cùng lúc trên tài
-	// khoản — tính CẢ tunnel đang sống LẪN probe đang dò. Đây là điểm mấu
-	// chốt: chỉ đếm tunnel sống là không đủ, vì nhiều session có thể cùng
-	// dò một lúc (mỗi session bắn nordWGProbeFanOut probe), nên 3 session
-	// dò song song đã là 12 kết nối — vượt trần ~10 của NordVPN và làm
-	// TOÀN BỘ handshake im lặng hỏng, đúng triệu chứng quan sát được.
-	slots chan struct{}
+	// slotsByKey giới hạn số kết nối WireGuard tồn tại cùng lúc trên tài
+	// khoản — tính CẢ tunnel đang sống LẪN probe đang dò — nhưng giờ tách
+	// RIÊNG theo từng public key thay vì 1 trần chung cho cả tài khoản (xem
+	// nordWGPoolKeyCapacity/nordWGCapacityForKey): 1 key "pool" đã chứng
+	// minh chịu được nhiều kết nối không nên bị trần của key "dedicated"
+	// thường (1) kéo xuống, và ngược lại — 1 key thường tràn slot không được
+	// phép mượn "chỗ" của key pool khác. Tạo lười (lazy) theo từng key gặp
+	// lần đầu, xem slotChanLocked. Vẫn cùng lý do cần đếm cả probe đang bay
+	// chứ không chỉ tunnel đã sống: nhiều session dò cùng 1 key một lúc vẫn
+	// phải cộng dồn đúng, nếu không sẽ lặp lại đúng triệu chứng đã thấy
+	// 2026-08-04 (nhiều probe chồng lấn phá lẫn nhau).
+	slotsByKey map[string]chan struct{}
 
 	refreshCancel context.CancelFunc
+}
+
+// slotChanLocked returns the channel backing one public key's slots,
+// creating it (buffer sized per nordWGChanCapacityForKey's STATIC max) the
+// first time this key is seen. Caller must hold p.mu. Only for
+// release/lookup — acquiring a slot goes through tryAcquireSlotLocked
+// instead, which additionally enforces the possibly-lower CURRENT trust
+// level (capacityForKeyLocked) on top of this fixed buffer.
+func (p *NordVPNWireGuardProvider) slotChanLocked(pubHex string) chan struct{} {
+	if ch, ok := p.slotsByKey[pubHex]; ok {
+		return ch
+	}
+	ch := make(chan struct{}, nordWGChanCapacityForKey(pubHex))
+	p.slotsByKey[pubHex] = ch
+	return ch
+}
+
+// tryAcquireSlotLocked attempts to claim 1 concurrent-connection slot for
+// pubHex, gated by the CURRENT trusted capacity (capacityForKeyLocked) —
+// which can be lower than the channel's static buffer size if live traffic
+// has shown this key degrading (see that function's doc). Non-blocking:
+// returns ok=false immediately if at capacity, never waits. Caller must
+// hold p.mu; the returned channel (when ok) is what the caller must later
+// receive from to release the slot.
+func (p *NordVPNWireGuardProvider) tryAcquireSlotLocked(pubHex string) (chan struct{}, bool) {
+	ch := p.slotChanLocked(pubHex)
+	if len(ch) >= p.capacityForKeyLocked(pubHex) {
+		return nil, false
+	}
+	select {
+	case ch <- struct{}{}:
+		return ch, true
+	default:
+		// Buffer momentarily full even though our trusted cap said there was
+		// room — a race with another goroutine between the len() check and
+		// this send. Vanishingly rare and harmless: caller just treats it as
+		// "no room right now", same as the len() check failing outright.
+		return nil, false
+	}
 }
 
 // NewNordVPNWireGuardProvider fetches the WireGuard private key and the
@@ -217,7 +349,8 @@ func NewNordVPNWireGuardProvider(token string) (*NordVPNWireGuardProvider, error
 		live:        map[int64]*wgTunnel{},
 		failedUntil: map[string]time.Time{},
 		keyStats:    map[string]*keyStat{},
-		slots:       make(chan struct{}, nordWGMaxConcurrentConns),
+		keyHostIdx:  map[string]int{},
+		slotsByKey:  map[string]chan struct{}{},
 	}
 	if err := p.refreshServers(); err != nil {
 		return nil, fmt.Errorf("nordvpn wireguard server list: %w", err)
@@ -243,7 +376,10 @@ func (p *NordVPNWireGuardProvider) Close() {
 	for _, t := range live {
 		t.socks.Close()
 		t.dev.Close()
-		<-p.slots
+		p.mu.Lock()
+		slotCh := p.slotChanLocked(t.pubHex)
+		p.mu.Unlock()
+		<-slotCh
 	}
 }
 
@@ -412,12 +548,29 @@ func (p *NordVPNWireGuardProvider) nextCandidate() (wgServer, error) {
 	now := time.Now()
 
 	for _, key := range p.rankedGoodKeysLocked() {
-		for _, s := range p.byKey[key] {
+		hosts := p.byKey[key]
+		if len(hosts) == 0 {
+			continue
+		}
+		// Rotate through this key's OWN hostnames (keyHostIdx) instead of
+		// always starting from hosts[0] — used to not matter (every
+		// hostname of a key is the same 1-connection backend), but matters
+		// now that a proven "pool" key (nordWGPoolKeyCapacity) can serve
+		// several REAL concurrent connections: cmd/scanwgpools proved that
+		// against several DIFFERENT hostnames of the same key tested at
+		// once, not the same one repeated, so repeated calls here (e.g.
+		// probeRound filling more than one slot) need to actually spread
+		// out to get that concurrency in practice instead of only ever
+		// offering hosts[0] again the instant it's back out of cooldown.
+		start := p.keyHostIdx[key]
+		for i := 0; i < len(hosts); i++ {
+			s := hosts[(start+i)%len(hosts)]
 			until, penalised := p.failedUntil[s.hostname]
 			if !penalised || now.After(until) {
 				if penalised {
 					delete(p.failedUntil, s.hostname)
 				}
+				p.keyHostIdx[key] = (start + i + 1) % len(hosts)
 				return s, nil
 			}
 		}
@@ -544,13 +697,10 @@ func (p *NordVPNWireGuardProvider) tryOne(s wgServer) (*wgTunnel, error) {
 // Vẫn KHÔNG nhớ "server nào tốt" — xem doc của type để biết vì sao điều đó
 // không đáng tin ở NordVPN.
 func (p *NordVPNWireGuardProvider) acquireLease(ctx context.Context, emit func(string)) (Lease, error) {
-	// Không còn slot nào trống → trả lỗi ngay, KHÔNG chờ và KHÔNG retry:
-	// mở thêm kết nối lúc này chắc chắn hỏng (xem nordWGMaxConcurrentConns),
-	// và chờ ở đây chỉ làm job đứng im trong khi 3 nguồn VPN khác đang rảnh.
-	// Trả lỗi để MultiVPNProvider chuyển nguồn là nhanh nhất cho người dùng.
-	if len(p.slots) >= nordWGMaxConcurrentConns {
-		return Lease{}, fmt.Errorf("đã đạt trần %d kết nối NordVPN WireGuard đồng thời", nordWGMaxConcurrentConns)
-	}
+	// The old upfront "any slot free at all?" fast-fail is gone: capacity is
+	// per-key now (see nordWGPoolKeyCapacity), so "no room" can only be
+	// answered per-candidate, not for the account as a whole before even
+	// picking one — that check now lives inside probeRound/nextCandidate.
 
 	var lastErr error
 	for attempt := 0; ; attempt += nordWGProbeFanOut {
@@ -597,61 +747,68 @@ func (p *NordVPNWireGuardProvider) acquireLease(ctx context.Context, emit func(s
 // nghĩa là rò rỉ đúng kiểu đã làm hỏng cả nguồn NordVPN hôm nay (xem
 // MultiVPNProvider.Release), nên hàm này luôn dọn hết phần thừa, kể cả khi
 // tunnel về muộn sau khi đã có người thắng.
+//
+// Khác bản cũ (trước 2026-08-11): trước đây giành TRƯỚC nordWGProbeFanOut
+// "chỗ" từ 1 trần chung cho cả tài khoản, RỒI mới chọn candidate — không
+// còn hợp lý khi mỗi public key có trần riêng (xem nordWGPoolKeyCapacity),
+// vì lúc giành chỗ chưa biết candidate sẽ rơi vào key nào. Giờ chọn
+// candidate TRƯỚC (nextCandidate, đã ưu tiên key tốt + xoay vòng hostname
+// trong key đó), rồi xin đúng 1 chỗ trong slot RIÊNG của key đó
+// (tryAcquireSlotLocked); nếu key đó vừa hết chỗ, thử candidate kế tiếp
+// (nextCandidate tự xoay sang hostname/key khác) — quét tối đa 1 lượt toàn
+// bộ server để không xoay vòng vô hạn khi tài khoản thật sự hết chỗ ở mọi
+// nơi.
 func (p *NordVPNWireGuardProvider) probeRound(ctx context.Context) (*wgTunnel, error) {
-	type probeResult struct {
-		tunnel *wgTunnel
-		err    error
+	type picked struct {
+		s    wgServer
+		slot chan struct{}
 	}
 
-	// Chỉ dò được bấy nhiêu ứng viên như số slot giành được — mỗi probe giữ
-	// 1 slot suốt thời gian nó tồn tại (xem nordWGMaxConcurrentConns).
-	// Giành slot không chặn: hết slot thì vòng này dò ít hơn, còn hơn là
-	// đứng chờ trong khi vẫn còn nguồn VPN khác dùng được.
-	acquired := 0
-grab:
-	for acquired < nordWGProbeFanOut {
-		select {
-		case p.slots <- struct{}{}:
-			acquired++
-		default:
-			break grab // hết slot — dò với số ứng viên đang có
-		}
-	}
-	if acquired == 0 {
-		return nil, errNordWGNoSlots
-	}
-
-	candidates := make([]wgServer, 0, acquired)
+	var candidates []picked
 	p.mu.Lock()
-	for i := 0; i < acquired; i++ {
+	if len(p.servers) == 0 {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("no NordVPN WireGuard servers loaded")
+	}
+	for scanned := 0; len(candidates) < nordWGProbeFanOut && scanned < len(p.servers); scanned++ {
 		s, err := p.nextCandidate()
 		if err != nil {
-			p.mu.Unlock()
-			for j := 0; j < acquired; j++ {
-				<-p.slots
-			}
-			return nil, err
+			break
 		}
-		candidates = append(candidates, s)
+		slot, ok := p.tryAcquireSlotLocked(s.pubHex)
+		if !ok {
+			continue // key này vừa hết chỗ — nextCandidate() đã tự xoay, thử vòng sau
+		}
+		candidates = append(candidates, picked{s: s, slot: slot})
 	}
 	p.mu.Unlock()
 
+	if len(candidates) == 0 {
+		return nil, errNordWGNoSlots
+	}
+
+	type probeResult struct {
+		tunnel *wgTunnel
+		slot   chan struct{}
+		err    error
+	}
 	results := make(chan probeResult, len(candidates))
-	for _, s := range candidates {
-		go func(s wgServer) {
-			t, err := p.tryOne(s)
+	for _, c := range candidates {
+		go func(c picked) {
+			t, err := p.tryOne(c.s)
 			if err != nil {
-				p.noteFailure(s.hostname)
-				p.noteKeyResult(s.pubHex, false)
-				<-p.slots // probe hỏng → trả slot ngay
-				results <- probeResult{err: fmt.Errorf("%s: %w", s.hostname, err)}
+				p.noteFailure(c.s.hostname)
+				p.noteKeyResult(c.s.pubHex, false)
+				<-c.slot // probe hỏng → trả slot ngay
+				results <- probeResult{err: fmt.Errorf("%s: %w", c.s.hostname, err)}
 				return
 			}
-			p.noteKeyResult(s.pubHex, true)
+			p.noteKeyResult(c.s.pubHex, true)
+			t.pubHex = c.s.pubHex
 			// Probe thắng thì GIỮ nguyên slot (tunnel sống tiếp tục chiếm 1
 			// kết nối); probe thua sẽ trả slot lúc bị đóng ở dưới.
-			results <- probeResult{tunnel: t}
-		}(s)
+			results <- probeResult{tunnel: t, slot: c.slot}
+		}(c)
 	}
 
 	// Nhận kết quả đầu tiên thành công; phần còn lại vẫn phải nhận đủ để
@@ -680,10 +837,10 @@ grab:
 				if r.tunnel != nil {
 					// Probe thắng-sau: đóng tunnel VÀ trả slot nó đang giữ.
 					// Bỏ sót bước trả slot ở đây sẽ làm số slot khả dụng rò rỉ
-					// dần về 0 và khoá hẳn nguồn NordVPN-WG.
+					// dần về 0 và khoá hẳn key đó.
 					r.tunnel.socks.Close()
 					r.tunnel.dev.Close()
-					<-p.slots
+					<-r.slot
 				}
 			}
 		}(remaining)
@@ -735,7 +892,10 @@ func (p *NordVPNWireGuardProvider) closeLease(gen int64) {
 	if ok {
 		t.socks.Close()
 		t.dev.Close()
-		<-p.slots // trả lại slot kết nối tunnel này đang giữ
+		p.mu.Lock()
+		slotCh := p.slotChanLocked(t.pubHex)
+		p.mu.Unlock()
+		<-slotCh // trả lại slot kết nối tunnel này đang giữ, đúng key của nó
 	}
 }
 

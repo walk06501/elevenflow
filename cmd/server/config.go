@@ -39,12 +39,14 @@ type Config struct {
 	NordVPNToken  string   // ELEVEN_NORDVPN_TOKEN: NordVPN Access Token (first/only account)
 	NordVPNTokens []string // ELEVEN_NORDVPN_TOKENS: comma-separated, one per NordVPN account.
 	// Each account's WireGuard key sustains exactly 1 concurrent data path
-	// (see nordvpn_wireguard_provider.go's nordWGMaxConcurrentConns doc) —
-	// there is no way to get more concurrent NordVPN-WG slots than accounts.
-	// N accounts here means N separate NordVPNWireGuardProvider instances in
-	// main.go, each with its own token/key/slot, giving N total slots instead
-	// of 1. Falls back to [NordVPNToken] when unset, so a single-account
-	// setup needs no config change.
+	// on an ordinary server, more on a hand-verified "pool" backend (see
+	// nordvpn_wireguard_provider.go's nordWGDefaultMaxConcurrentConns /
+	// nordWGPoolKeyCapacity doc) — either way, more accounts is still the
+	// only way to multiply that per-account capacity. N accounts here means
+	// N separate NordVPNWireGuardProvider instances in main.go, each with
+	// its own token/key/slot map, giving N× the slots of one account
+	// instead of 1×. Falls back to [NordVPNToken] when unset, so a
+	// single-account setup needs no config change.
 	PIAUsername      string // ELEVEN_PIA_USERNAME: Private Internet Access account username
 	PIAPassword      string // ELEVEN_PIA_PASSWORD: Private Internet Access account password
 	NordVPNWireGuard bool   // ELEVEN_NORDVPN_WIREGUARD: also add the WireGuard-tunnel-based NordVPN source (opt-in — heavier per-lease than the SOCKS5 source, see NordVPNWireGuardProvider's doc comment)
