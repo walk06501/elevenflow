@@ -3,6 +3,7 @@ package webview2bridge
 import (
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestRankedGoodKeysLocked(t *testing.T) {
@@ -168,6 +169,38 @@ func TestCapacityForKeyLocked(t *testing.T) {
 	}
 }
 
+// TestDiscoveryPromotion_DoesNotSelfInvalidate is a regression test for a
+// real self-consistency bug found during review: nordvpn_wireguard_discovery.go
+// feeds its own test results into the SAME keyStats capacityForKeyLocked
+// checks to decide whether to keep trusting a promotion. If the promotion
+// bar (nordWGDiscoveryPromoteBar) were lower than the trust bar (70%, see
+// capacityForKeyLocked), a batch that just barely cleared promotion (e.g.
+// 5 or 6 out of 10) would immediately fail the trust check on THOSE SAME
+// stats and silently demote itself back to the default a moment after
+// being promoted. This locks in that the two bars are compatible: a
+// discovered key, right after being promoted with a result exactly at
+// nordWGDiscoveryPromoteBar, must still read back its promoted capacity.
+func TestDiscoveryPromotion_DoesNotSelfInvalidate(t *testing.T) {
+	const key = "freshly-discovered-key"
+
+	p := &NordVPNWireGuardProvider{
+		discoveredPoolCapacity: map[string]int{key: nordWGDiscoveryPromoteBar},
+		keyStats: map[string]*keyStat{
+			// Exactly what a discovery batch scoring right at the promotion
+			// bar would have just recorded via noteKeyResult.
+			key: {attempts: nordWGDiscoveryPerGroup, successes: nordWGDiscoveryPromoteBar},
+		},
+	}
+
+	got := p.capacityForKeyLocked(key)
+	if got != nordWGDiscoveryPromoteBar {
+		t.Fatalf(
+			"capacityForKeyLocked(%q) = %d right after being promoted at exactly the promotion bar — want %d (the promotion self-invalidated)",
+			key, got, nordWGDiscoveryPromoteBar,
+		)
+	}
+}
+
 // TestTryAcquireSlotLocked verifies the per-key slot gate actually enforces
 // its capacity (no more than N concurrent grabs succeed) and that releasing
 // a slot (draining the channel, as closeLease does) frees it back up for a
@@ -207,5 +240,83 @@ func TestTryAcquireSlotLocked(t *testing.T) {
 	// blocked by "pool" being fully held.
 	if _, ok := p.tryAcquireSlotLocked("ordinary"); !ok {
 		t.Fatal("an unrelated key's slot must not be affected by another key being full")
+	}
+}
+
+// TestNextCandidate_SkipsKeysAtCapacity is a regression test for a real bug
+// found during review: nextCandidate only advances past a ranked-good key
+// once every one of its hostnames is in failedUntil cooldown — but a key
+// being SLOT-SATURATED (all its capacity already held by real leases) never
+// puts any hostname into failedUntil (that only happens on a genuine
+// handshake failure). Without skipKeys, probeRound's picking loop would
+// keep receiving hostnames from the very same saturated top-ranked key on
+// every call (nextCandidate has plenty of non-cooldown hostnames to rotate
+// through via keyHostIdx) and burn through up to len(p.servers) wasted
+// iterations before giving up — never reaching a second, less-good key (or
+// plain round-robin) that might have real room right now.
+func TestNextCandidate_SkipsKeysAtCapacity(t *testing.T) {
+	good1Hosts := []wgServer{
+		{hostname: "good1-a", station: "1.1.1.1", pubHex: "good1"},
+		{hostname: "good1-b", station: "1.1.1.2", pubHex: "good1"},
+	}
+	good2Hosts := []wgServer{
+		{hostname: "good2-a", station: "2.2.2.1", pubHex: "good2"},
+	}
+	var allServers []wgServer
+	allServers = append(allServers, good1Hosts...)
+	allServers = append(allServers, good2Hosts...)
+
+	p := &NordVPNWireGuardProvider{
+		servers: allServers,
+		byKey: map[string][]wgServer{
+			"good1": good1Hosts,
+			"good2": good2Hosts,
+		},
+		keyStats: map[string]*keyStat{
+			// good1 ranks first (100% > 90%) — the one probeRound would
+			// have skip-marked after confirming it's out of capacity.
+			"good1": {attempts: 10, successes: 10},
+			"good2": {attempts: 10, successes: 9},
+		},
+		keyHostIdx:  map[string]int{},
+		failedUntil: map[string]time.Time{},
+	}
+
+	// Baseline: with nothing skipped, the top-ranked key (good1) is offered.
+	s, err := p.nextCandidate(map[string]bool{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if s.pubHex != "good1" {
+		t.Fatalf("baseline: got key %q, want the top-ranked key good1", s.pubHex)
+	}
+
+	// good1 marked as just-confirmed-full (what probeRound does after a
+	// failed tryAcquireSlotLocked) — must now skip straight to good2,
+	// not cycle through good1's other hostname first.
+	s, err = p.nextCandidate(map[string]bool{"good1": true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if s.pubHex != "good2" {
+		t.Fatalf("got key %q, want good2 (good1 should have been skipped entirely)", s.pubHex)
+	}
+
+	// Both good keys skipped — must fall through to the plain round-robin
+	// over p.servers rather than erroring out (matches the "try a possibly-
+	// broken server rather than refuse service" fallback philosophy).
+	s, err = p.nextCandidate(map[string]bool{"good1": true, "good2": true})
+	if err != nil {
+		t.Fatalf("unexpected error falling back to round-robin: %v", err)
+	}
+	found := false
+	for _, want := range allServers {
+		if s.hostname == want.hostname {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("round-robin fallback returned unrecognized server %+v", s)
 	}
 }

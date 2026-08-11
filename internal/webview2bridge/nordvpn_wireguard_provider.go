@@ -34,7 +34,7 @@ type wgTunnel struct {
 	socks *localSOCKS5Server
 	// pubHex: which key's slot this tunnel is holding — needed so
 	// closeLease/Close release into the SAME per-key channel it was
-	// acquired from (see nordWGChanCapacityForKey/slotChanLocked).
+	// acquired from (see slotChanLocked).
 	pubHex string
 }
 
@@ -170,19 +170,23 @@ var nordWGPoolKeyCapacity = map[string]int{
 	"7fec68f613a3544907564189a30b91194e541044970a9888df06024193d28a5b": 5,
 }
 
-// nordWGChanCapacityForKey sizes the (fixed-size, created-once) buffered
-// channel backing a key's slots — always the highest this key could ever
-// legitimately need, i.e. the static scanwgpools-proven ceiling, or the
-// safe default for every other key. A Go channel's buffer can't be resized
-// after creation, so this is deliberately the STATIC max; the actual
-// currently-TRUSTED cap (which can be lower, see capacityForKeyLocked) is
-// enforced separately by comparing len(ch) against it before sending.
-func nordWGChanCapacityForKey(pubHex string) int {
-	if n, ok := nordWGPoolKeyCapacity[pubHex]; ok {
-		return n
-	}
-	return nordWGDefaultMaxConcurrentConns
-}
+// nordWGSlotChanBuffer: fixed buffer size for EVERY key's slot channel,
+// regardless of that key's actual trusted capacity. A Go channel's buffer
+// can't grow after creation, but a key's trusted capacity CAN grow after
+// its channel already exists — nordvpn_wireguard_discovery.go promotes a
+// key from the default the first time it's seen to a proven number well
+// after slotChanLocked may have already created a 1-slot channel for it
+// (e.g. it briefly appeared as a round-robin fallback candidate before
+// discovery ever tested it). Sizing every channel to this one constant up
+// front sidesteps that instead of tracking "was this channel created before
+// or after promotion" — it's just a physical upper bound, not the
+// enforcement itself: tryAcquireSlotLocked's len(ch) check against
+// capacityForKeyLocked() is what actually holds an ordinary/degraded key to
+// nordWGDefaultMaxConcurrentConns regardless of how much spare buffer it
+// sits in. Matches nordWGDiscoveryPerGroup, the highest concurrency this
+// codebase ever tests for — proven capacity, hand-curated or discovered,
+// can never legitimately exceed it.
+const nordWGSlotChanBuffer = nordWGDiscoveryPerGroup
 
 // capacityForKeyLocked returns how many concurrent connections this key is
 // CURRENTLY trusted for: the scanwgpools-proven ceiling (nordWGPoolKeyCapacity)
@@ -198,7 +202,16 @@ func nordWGChanCapacityForKey(pubHex string) int {
 func (p *NordVPNWireGuardProvider) capacityForKeyLocked(pubHex string) int {
 	proven, isPool := nordWGPoolKeyCapacity[pubHex]
 	if !isPool {
-		return nordWGDefaultMaxConcurrentConns
+		// Not in the hand-curated table — check whether discoveryLoop found
+		// this one on its own (nordvpn_wireguard_discovery.go). Same
+		// live-degrade protection applies below either way, so a
+		// discovered key is trusted exactly as much as a hand-curated one,
+		// never more.
+		discovered, ok := p.discoveredPoolCapacity[pubHex]
+		if !ok {
+			return nordWGDefaultMaxConcurrentConns
+		}
+		proven = discovered
 	}
 	const minAttempts = 5
 	const minSuccessRate = 0.7
@@ -277,6 +290,20 @@ type NordVPNWireGuardProvider struct {
 	// hostname đầu tiên.
 	keyHostIdx map[string]int
 
+	// discoveredPoolCapacity: public key → trần đồng thời tự phát hiện được
+	// LÚC CHẠY (xem nordvpn_wireguard_discovery.go), song song với bảng tay
+	// nordWGPoolKeyCapacity chứ không thay thế — quét thủ công 1 lần
+	// (cmd/scanwgpools) chỉ bắt được ảnh chụp tại thời điểm chạy, không tự
+	// phát hiện pool MỚI NordVPN thêm sau này; discoveryLoop lấp đúng chỗ
+	// đó, chạy nền suốt vòng đời tiến trình. KHÔNG lưu đĩa, giống keyStats —
+	// quán tính trong 1 lần chạy dài là đủ, và mất đi sau restart chỉ khiến
+	// nó dò lại chứ không mất an toàn (bảng tay vẫn còn nguyên).
+	discoveredPoolCapacity map[string]int
+	// discoveryCursor: con trỏ xoay vòng qua các nhóm key chưa được phân
+	// loại (xem nextDiscoveryCandidateLocked), để discoveryLoop rải đều việc
+	// dò qua nhiều lần chạy thay vì cứ thử đi thử lại đúng 1 nhóm.
+	discoveryCursor int
+
 	// slotsByKey giới hạn số kết nối WireGuard tồn tại cùng lúc trên tài
 	// khoản — tính CẢ tunnel đang sống LẪN probe đang dò — nhưng giờ tách
 	// RIÊNG theo từng public key thay vì 1 trần chung cho cả tài khoản (xem
@@ -294,16 +321,16 @@ type NordVPNWireGuardProvider struct {
 }
 
 // slotChanLocked returns the channel backing one public key's slots,
-// creating it (buffer sized per nordWGChanCapacityForKey's STATIC max) the
-// first time this key is seen. Caller must hold p.mu. Only for
-// release/lookup — acquiring a slot goes through tryAcquireSlotLocked
-// instead, which additionally enforces the possibly-lower CURRENT trust
-// level (capacityForKeyLocked) on top of this fixed buffer.
+// creating it (buffer fixed at nordWGSlotChanBuffer) the first time this
+// key is seen. Caller must hold p.mu. Only for release/lookup — acquiring a
+// slot goes through tryAcquireSlotLocked instead, which additionally
+// enforces the possibly-lower CURRENT trust level (capacityForKeyLocked) on
+// top of this fixed buffer.
 func (p *NordVPNWireGuardProvider) slotChanLocked(pubHex string) chan struct{} {
 	if ch, ok := p.slotsByKey[pubHex]; ok {
 		return ch
 	}
-	ch := make(chan struct{}, nordWGChanCapacityForKey(pubHex))
+	ch := make(chan struct{}, nordWGSlotChanBuffer)
 	p.slotsByKey[pubHex] = ch
 	return ch
 }
@@ -345,12 +372,13 @@ func NewNordVPNWireGuardProvider(token string) (*NordVPNWireGuardProvider, error
 		return nil, fmt.Errorf("bad private key: %w", err)
 	}
 	p := &NordVPNWireGuardProvider{
-		privHex:     privHex,
-		live:        map[int64]*wgTunnel{},
-		failedUntil: map[string]time.Time{},
-		keyStats:    map[string]*keyStat{},
-		keyHostIdx:  map[string]int{},
-		slotsByKey:  map[string]chan struct{}{},
+		privHex:                privHex,
+		live:                   map[int64]*wgTunnel{},
+		failedUntil:            map[string]time.Time{},
+		keyStats:               map[string]*keyStat{},
+		keyHostIdx:             map[string]int{},
+		discoveredPoolCapacity: map[string]int{},
+		slotsByKey:             map[string]chan struct{}{},
 	}
 	if err := p.refreshServers(); err != nil {
 		return nil, fmt.Errorf("nordvpn wireguard server list: %w", err)
@@ -359,6 +387,7 @@ func NewNordVPNWireGuardProvider(token string) (*NordVPNWireGuardProvider, error
 	ctx, cancel := context.WithCancel(context.Background())
 	p.refreshCancel = cancel
 	go p.refreshLoop(ctx)
+	go p.discoveryLoop(ctx)
 
 	return p, nil
 }
@@ -527,7 +556,9 @@ func (p *NordVPNWireGuardProvider) rankedGoodKeysLocked() []string {
 }
 
 // nextCandidate returns the next server in the round-robin, bỏ qua những
-// server vừa hỏng còn trong thời gian phạt (xem nordWGFailCooldown).
+// server vừa hỏng còn trong thời gian phạt (xem nordWGFailCooldown) VÀ
+// những public key đã biết hết chỗ đồng thời trong lượt probeRound này
+// (skipKeys — xem doc comment tham số).
 // Caller must hold p.mu.
 //
 // Trước tiên thử lần lượt các public key đã chứng minh đáng tin qua traffic
@@ -537,17 +568,31 @@ func (p *NordVPNWireGuardProvider) rankedGoodKeysLocked() []string {
 // Chỉ khi TOÀN BỘ key tốt đều không còn hostname dùng được (mọi key tốt
 // cùng lúc bị phạt hết — hiếm) mới rơi xuống round-robin thường như cũ.
 //
-// Quét tối đa 1 vòng danh sách: nếu MỌI server đều đang bị phạt (dấu hiệu
-// sự cố diện rộng — thường là phía tài khoản mình, không phải server), thì
-// trả về ứng viên kế tiếp như bình thường thay vì báo "hết server". Thà thử
-// 1 server có thể hỏng còn hơn từ chối phục vụ hoàn toàn.
-func (p *NordVPNWireGuardProvider) nextCandidate() (wgServer, error) {
+// skipKeys: các public key mà probeRound VỪA xác nhận hết chỗ đồng thời
+// (tryAcquireSlotLocked trả false) trong CHÍNH lượt gọi này — bắt buộc phải
+// có tham số này kể từ khi trần chuyển sang theo từng key (2026-08-11):
+// hết chỗ đồng thời KHÔNG đưa hostname vào failedUntil (đó chỉ dành cho bắt
+// tay thất bại thật), nên nếu không có skipKeys, 1 key pool lớn (vd 828
+// host) đang bị chiếm hết chỗ sẽ khiến hàm này cứ trả về hostname CỦA CHÍNH
+// KEY ĐÓ mãi (xoay qua keyHostIdx, luôn có hostname "chưa bị phạt" vì hết
+// chỗ khác hẳn bị phạt) — không bao giờ rơi xuống key tốt kế tiếp hay
+// round-robin, dù ở đó thật sự còn chỗ trống.
+//
+// Quét tối đa 1 vòng danh sách: nếu MỌI server đều đang bị phạt hoặc thuộc
+// key trong skipKeys (dấu hiệu sự cố diện rộng — thường là phía tài khoản
+// mình, không phải server), thì trả về ứng viên kế tiếp như bình thường
+// thay vì báo "hết server". Thà thử 1 server có thể hỏng còn hơn từ chối
+// phục vụ hoàn toàn.
+func (p *NordVPNWireGuardProvider) nextCandidate(skipKeys map[string]bool) (wgServer, error) {
 	if len(p.servers) == 0 {
 		return wgServer{}, fmt.Errorf("no NordVPN WireGuard servers loaded")
 	}
 	now := time.Now()
 
 	for _, key := range p.rankedGoodKeysLocked() {
+		if skipKeys[key] {
+			continue
+		}
 		hosts := p.byKey[key]
 		if len(hosts) == 0 {
 			continue
@@ -581,6 +626,9 @@ func (p *NordVPNWireGuardProvider) nextCandidate() (wgServer, error) {
 	for scanned := 0; scanned < len(p.servers); scanned++ {
 		s := p.servers[p.nextIdx%len(p.servers)]
 		p.nextIdx++
+		if skipKeys[s.pubHex] {
+			continue
+		}
 		until, penalised := p.failedUntil[s.hostname]
 		if !penalised || now.After(until) {
 			if penalised {
@@ -765,19 +813,26 @@ func (p *NordVPNWireGuardProvider) probeRound(ctx context.Context) (*wgTunnel, e
 	}
 
 	var candidates []picked
+	// skipKeys: key nào vừa xác nhận hết chỗ trong CHÍNH lượt này thì không
+	// hỏi lại nextCandidate() nữa — bắt buộc phải có, xem nextCandidate's
+	// doc comment về vì sao thiếu nó sẽ làm hàm này quét cả len(p.servers)
+	// vô ích mỗi khi đúng key tốt nhất (thường là 1 pool lớn) đang bị chiếm
+	// hết chỗ, thay vì rơi xuống key/server khác thật sự còn trống ngay.
+	skipKeys := map[string]bool{}
 	p.mu.Lock()
 	if len(p.servers) == 0 {
 		p.mu.Unlock()
 		return nil, fmt.Errorf("no NordVPN WireGuard servers loaded")
 	}
 	for scanned := 0; len(candidates) < nordWGProbeFanOut && scanned < len(p.servers); scanned++ {
-		s, err := p.nextCandidate()
+		s, err := p.nextCandidate(skipKeys)
 		if err != nil {
 			break
 		}
 		slot, ok := p.tryAcquireSlotLocked(s.pubHex)
 		if !ok {
-			continue // key này vừa hết chỗ — nextCandidate() đã tự xoay, thử vòng sau
+			skipKeys[s.pubHex] = true // key này hết chỗ — đừng hỏi lại nữa trong lượt này
+			continue
 		}
 		candidates = append(candidates, picked{s: s, slot: slot})
 	}
