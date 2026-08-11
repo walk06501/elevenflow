@@ -136,14 +136,13 @@ func main() {
 		nordSOCKS5Weight = 1
 		nordWGWeight     = 1
 		piaWGWeight      = 6
-		// surfsharkWeight: hạ từ 2 xuống 1 tạm thời (2026-08-10) — stress
-		// test thật cho thấy 0/7 = 0% qua cơ chế thăm dò định kỳ (không
-		// phải dữ liệu cũ đóng băng, đã xác nhận đang được thử lại thật).
-		// Chưa có nguyên nhân gốc xác định (khác CyberGhost, Surfshark
-		// không có vòng quét nền để nghi ngờ) — hạ trọng số vì bằng chứng
-		// còn ít (7 mẫu) hơn CyberGhost, chưa loại hẳn. Nâng lại 2 khi xác
-		// nhận đã ổn định qua theo dõi [vpn-stats] thêm.
-		surfsharkWeight = 1
+		// surfsharkWeight: nâng lại 2 (2026-08-12) — nguyên nhân 0% hôm
+		// 2026-08-10 đã xác định: private key cũ hết hạn đăng ký, không
+		// phải lỗi hệ thống. Đã thay key mới, xác nhận qua stress test
+		// thật weight=30: 14/26 = 54% (xem commit "Revert Surfshark-WG to
+		// a human-provided private key") — quay lại đúng giá trị trước
+		// regression.
+		surfsharkWeight = 2
 		protonWGWeight  = 3
 		// cyberghostWGWeight: hạ từ 6 xuống 1 tạm thời (2026-08-10) — dữ
 		// liệu cũ bên dưới (25/25, 2026-08-09) vẫn đúng lúc đo, nhưng
