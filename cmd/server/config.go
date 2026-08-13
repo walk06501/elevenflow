@@ -128,6 +128,19 @@ type Config struct {
 	// independent, so interactive and SYSTEM runs always share the same
 	// (working) profile instead of silently using two different ones.
 	PersistentPoolDataRoot string // ELEVEN_PERSISTENT_POOL_DATA_ROOT
+
+	// PersistentPoolVisible: show each session's WebView2 window on screen
+	// instead of the default hidden/off-screen window — for watching what a
+	// session is actually doing (hCaptcha, page load, etc.) instead of only
+	// reading log lines. Default off: up to NumSessions windows appearing
+	// at once (25 by default) is a lot of screen real estate, and there is
+	// no product reason to render anything when nobody's watching. Only
+	// takes effect running INTERACTIVELY (logged-in desktop session) — a
+	// process launched via Scheduled Task as SYSTEM runs in Session 0,
+	// which Windows never shows on any real desktop regardless of this
+	// flag; stop the task and run the .exe directly from an interactive
+	// PowerShell/terminal to actually see windows.
+	PersistentPoolVisible bool // ELEVEN_PERSISTENT_POOL_VISIBLE
 }
 
 func loadEnvFile(path string) {
@@ -187,6 +200,7 @@ func LoadConfig() *Config {
 		PersistentPoolSessions:         getEnvInt("ELEVEN_PERSISTENT_POOL_SESSIONS", 0),
 		PersistentPoolIdleCloseSeconds: getEnvInt("ELEVEN_PERSISTENT_POOL_IDLE_CLOSE_SECONDS", 180),
 		PersistentPoolDataRoot:         getEnv("ELEVEN_PERSISTENT_POOL_DATA_ROOT", defaultPersistentPoolDataRoot()),
+		PersistentPoolVisible:          getEnv("ELEVEN_PERSISTENT_POOL_VISIBLE", "") == "true",
 	}
 }
 

@@ -384,13 +384,18 @@ func main() {
 			Provider:       vpnProvider,
 			IdleCloseAfter: time.Duration(cfg.PersistentPoolIdleCloseSeconds) * time.Second,
 			DataRoot:       cfg.PersistentPoolDataRoot,
+			Visible:        cfg.PersistentPoolVisible,
 		})
 		if err != nil {
 			log.Fatalf("SessionPool init failed: %v", err)
 		}
 		sessionPool = sp
-		log.Printf("Persistent session pool active: %d sessions, idle-close after %ds, data root %s",
-			numSessions, cfg.PersistentPoolIdleCloseSeconds, cfg.PersistentPoolDataRoot)
+		visibleNote := "hidden windows"
+		if cfg.PersistentPoolVisible {
+			visibleNote = "VISIBLE windows (only actually shows if running interactively, not as a SYSTEM scheduled task)"
+		}
+		log.Printf("Persistent session pool active: %d sessions, idle-close after %ds, data root %s, %s",
+			numSessions, cfg.PersistentPoolIdleCloseSeconds, cfg.PersistentPoolDataRoot, visibleNote)
 	}
 
 	// Register routes
