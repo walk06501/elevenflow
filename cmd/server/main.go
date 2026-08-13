@@ -134,8 +134,16 @@ func main() {
 	//     cao hơn Surfshark một chút.
 	const (
 		nordSOCKS5Weight = 1
-		nordWGWeight     = 1
-		piaWGWeight      = 6
+		// nordWGWeight: tắt hẳn (2026-08-14) — theo dõi thực tế nhiều ngày
+		// liên tiếp (2026-08-12 → 2026-08-14, cả trước và sau khi đủ 6 tài
+		// khoản VPN khác) cho kết quả nhất quán 11-25% thành công, thấp hơn
+		// hẳn mọi nguồn khác (PIA/Proton/Surfshark/Mullvad đều 45-77% cùng
+		// giai đoạn); discovery loop trong cùng thời gian không tìm thêm
+		// được pool key nào mới đạt ngưỡng thăng hạng. Giữ ở 1 chỉ tạo thêm
+		// vòng "mạng không ổn" → rotate vô ích dưới tải cao. Đặt 0 (không
+		// xoá code) để dễ bật lại nếu sau này có bằng chứng cải thiện thật.
+		nordWGWeight = 0
+		piaWGWeight  = 6
 		// surfsharkWeight: nâng lại 2 (2026-08-12) — nguyên nhân 0% hôm
 		// 2026-08-10 đã xác định: private key cũ hết hạn đăng ký, không
 		// phải lỗi hệ thống. Đã thay key mới, xác nhận qua stress test

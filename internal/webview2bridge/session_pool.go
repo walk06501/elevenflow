@@ -61,6 +61,20 @@ type SessionPool struct {
 
 	activeSessions atomic.Int32 // đang có WebView2 mở (không tính lúc idle-closed)
 
+	// coldStartSem: giới hạn số session đang acquireProxyAndSpawn (VPN
+	// handshake MỚI HOÀN TOÀN + mở WebView2 lần đầu) cùng lúc — xem
+	// handleJob's case w.currentLease.URL == "". Không đụng tới lease đã có
+	// (rotate/wake-from-idle không qua đây), nên hành vi ổn định lúc pool
+	// đã "ấm" giữ nguyên y hệt trước — chỉ nắn lại đúng khoảnh khắc NHIỀU
+	// session cùng cold-spawn 1 lúc (job lớn đầu tiên sau khi server khởi
+	// động, hoặc sau 1 đợt idle-close đồng loạt): quan sát thật 2026-08-14
+	// cho thấy 25 session cùng mở tunnel VPN + cửa sổ Chromium trong đúng 1
+	// giây tạo ra 1 đợt "mạng không ổn" hàng loạt ngay ở mốc navTimeout/
+	// stallTimeout (45-75s sau) — nhiều khả năng do chính cú dồn tải đó,
+	// không phải do provider VPN nào cụ thể. Vốn dùng 1 chan struct{} (không
+	// phải sync.Semaphore) để cấp phát/giải phóng qua send/receive đơn giản.
+	coldStartSem chan struct{}
+
 	// Đếm cộng dồn số chunk đã ĐƯA VÀO mỗi hàng (không phải số đã xử lý
 	// xong) — đủ để trả lời "job nhỏ có thực sự chiếm được ưu tiên không"
 	// qua /health hoặc log định kỳ (statsLogger), không cần công cụ đo
@@ -145,6 +159,12 @@ const defaultSmallJobChunkThreshold = 5
 // chặn đói vô thời hạn, không phải chia đều 50/50).
 const defaultBigJobReservedFraction = 4
 
+// coldStartConcurrencyLimit: xem SessionPool.coldStartSem doc comment. 8
+// chọn tay, không đo — đủ nhỏ để không tạo lại đúng cú dồn tải đã thấy
+// (25 cùng lúc), đủ lớn để không biến "job lớn đầu tiên sau khi khởi động"
+// thành 1 hàng chờ dài giả tạo trên 1 con số quá chặt.
+const coldStartConcurrencyLimit = 8
+
 type sessionJob struct {
 	ctx    context.Context
 	chunk  Chunk
@@ -213,6 +233,11 @@ func NewSessionPool(cfg SessionPoolConfig) (*SessionPool, error) {
 		jobs:      make(chan sessionJob, cfg.JobQueueSize),
 		smallJobs: make(chan sessionJob, cfg.JobQueueSize),
 		closed:    make(chan struct{}),
+		// Bounded regardless of NumSessions on purpose: the point is to cap
+		// how many brand-new VPN tunnels get negotiated in the same instant,
+		// not to scale with pool size — a bigger pool hitting the same burst
+		// pattern would just make the thundering herd worse, not better.
+		coldStartSem: make(chan struct{}, coldStartConcurrencyLimit),
 	}
 
 	diaglog.Append("session_pool_start", map[string]any{
@@ -639,7 +664,18 @@ func (sp *SessionPool) sessionLoop(id int, bigOnly bool) {
 			var spawnErr error
 			switch {
 			case w.currentLease.URL == "":
-				spawnErr = w.acquireProxyAndSpawn(job.ctx)
+				// coldStartSem (see SessionPool doc comment): bounds how many
+				// sessions negotiate a BRAND NEW VPN tunnel at the exact same
+				// moment. Waiting here does not touch idleTimer/spawned — a
+				// session queued behind the semaphore is simply not yet
+				// "spawned", same state as before this job arrived.
+				select {
+				case sp.coldStartSem <- struct{}{}:
+					spawnErr = w.acquireProxyAndSpawn(job.ctx)
+					<-sp.coldStartSem
+				case <-job.ctx.Done():
+					spawnErr = job.ctx.Err()
+				}
 			case probeLeaseAlive(w.currentLease, 6*time.Second) != nil:
 				spawnErr = w.rotateAndRespawn(job.ctx, job.chunk.ID, "kết nối rảnh lâu đã hết hạn")
 			default:
