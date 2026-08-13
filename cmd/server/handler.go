@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -28,6 +30,57 @@ type Handler struct {
 	vpnProvider    webview2bridge.ProxyProvider // NordVPN today; built once in main.go, nil if no token configured
 	sessionPool    *webview2bridge.SessionPool  // opt-in persistent pool (Config.UsePersistentPool); nil = use webview2bridge.Run per request as before
 	concurrencySem chan struct{}                // Limits total inflight synthesis calls
+
+	// progress: live done/total per in-flight request, keyed by the
+	// caller's own JobID (req.JobID — same id already used for chunk
+	// caching, see SynthesizeRequest.JobID doc comment). Exists because
+	// /synthesize is a single blocking call for the whole request (up to
+	// hundreds of internal chunks merged before responding) — the caller
+	// (web-portal) otherwise has zero visibility into how far along a
+	// long-running request is until it finishes entirely. Read via
+	// GET /synthesize-progress?job_id=... (see HandleSynthesizeProgress),
+	// written by HandleSynthesize's emit closure, deleted when that
+	// request returns. Empty JobID (source never sends one, or an older
+	// caller) means "don't bother tracking" — never populated, lookups on
+	// "" simply miss, same as any other job_id nobody ever wrote.
+	progress sync.Map // string (jobID) -> *progressState
+}
+
+// progressState is read by a DIFFERENT request's goroutine than the one
+// writing it (HandleSynthesize's emit closure writes; HandleSynthesizeProgress
+// reads), so every field access goes through mu — a raw struct swapped into
+// the sync.Map would still race two goroutines reading/writing the SAME
+// *progressState's fields concurrently once retrieved.
+type progressState struct {
+	mu      sync.Mutex
+	done    int
+	total   int
+	message string
+}
+
+func (p *progressState) update(done, total int, message string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// total arrives as -1 on some emit calls (see EmitFn doc comment) —
+	// only overwrite once a real total is known, never regress back to
+	// unknown. done is never sent as a real running count by any emit call
+	// today (always -1 — see worker.go's call sites); the real "how many
+	// chunks actually finished" signal is the "Xong dòng" message on a
+	// phase=tts event with a real chunkID, detected by the caller (see
+	// HandleSynthesize) rather than trusted from the done parameter itself.
+	if total > 0 {
+		p.total = total
+	}
+	if done > p.done {
+		p.done = done
+	}
+	p.message = message
+}
+
+func (p *progressState) snapshot() (done, total int, message string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.done, p.total, p.message
 }
 
 // SynthesizeRequest is the JSON body for POST /synthesize and /synthesize-srt.
@@ -118,10 +171,46 @@ func (h *Handler) HandleSynthesize(forceSRT bool) http.HandlerFunc {
 		}
 		defer os.RemoveAll(tmpDir) // Cleanup after response
 
+		// completedChunks: distinct chunk IDs seen finishing successfully —
+		// the ONLY reliable "how many actually done" signal available (see
+		// progressState.update's doc comment: emit's own `done` parameter is
+		// always -1 in every call site today). "Xong dòng" is worker.go's
+		// exact success message (phase=tts, real chunkID, right before
+		// returning res.OK=true) — matched by prefix rather than adding a
+		// new EmitFn field, since EmitFn is shared with the Wails desktop
+		// app's own progress UI and changing its shape would ripple there
+		// for no benefit to that caller. A retried chunk fires this same
+		// message again on eventual success; completedChunks is a set
+		// specifically so a retry never double-counts.
+		var progressMu sync.Mutex
+		completedChunks := make(map[int]bool)
 		emit := func(workerID int, chunkID int, phase, message string, done, total int) {
 			reqID := r.Header.Get("X-Request-Id")
 			log.Printf("[%s] worker=%d chunk=%d phase=%s msg=%s (%d/%d)",
 				reqID, workerID, chunkID, phase, message, done, total)
+
+			if req.JobID == "" {
+				return
+			}
+			if phase == "tts" && chunkID >= 0 && strings.HasPrefix(message, "Xong dòng") {
+				progressMu.Lock()
+				completedChunks[chunkID] = true
+				doneCount := len(completedChunks)
+				progressMu.Unlock()
+				ps, _ := h.progress.LoadOrStore(req.JobID, &progressState{})
+				ps.(*progressState).update(doneCount, total, message)
+			} else if total > 0 {
+				// Not a completion event, but still worth recording the
+				// real total + latest activity message as soon as it's
+				// known (e.g. the very first "Đang tìm server..." rotate
+				// event) — a caller polling before any chunk has finished
+				// yet still sees a real total instead of nothing at all.
+				ps, _ := h.progress.LoadOrStore(req.JobID, &progressState{})
+				ps.(*progressState).update(-1, total, message)
+			}
+		}
+		if req.JobID != "" {
+			defer h.progress.Delete(req.JobID)
 		}
 
 		var chunkResults []webview2bridge.ChunkResult
@@ -307,6 +396,44 @@ func (h *Handler) buildSRT(results []webview2bridge.ChunkResult) string {
 		log.Printf("buildSRT error: %v", err)
 	}
 	return ""
+}
+
+// HandleSynthesizeProgress handles GET /synthesize-progress?job_id=... — a
+// caller with a long-running POST /synthesize in flight (up to hundreds of
+// internal chunks, see Handler.progress doc comment) polls this from a
+// SEPARATE request to see how far along it is, since /synthesize itself
+// doesn't respond until the whole thing finishes. Same auth as every other
+// route (AuthMiddleware wraps the whole mux, see main.go) — no extra check
+// needed here.
+//
+// Always 200 with total=0 for an unknown/finished/never-tracked job_id
+// (empty JobID on the original request, a job_id typo, or polling after the
+// real request already returned and cleaned up its entry) rather than 404 —
+// a caller polling in a loop shouldn't have to special-case "not found yet"
+// vs "not found because it's over" vs "not found because there's a typo";
+// total=0 reads the same as "nothing to report" in all three, and the
+// caller already has the real terminal result from /synthesize's own
+// response for the case that matters (did it actually succeed).
+func (h *Handler) HandleSynthesizeProgress(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	jobID := r.URL.Query().Get("job_id")
+	w.Header().Set("Content-Type", "application/json")
+	if jobID == "" {
+		w.Write([]byte(`{"done":0,"total":0,"message":""}`))
+		return
+	}
+	v, ok := h.progress.Load(jobID)
+	if !ok {
+		w.Write([]byte(`{"done":0,"total":0,"message":""}`))
+		return
+	}
+	done, total, message := v.(*progressState).snapshot()
+	json.NewEncoder(w).Encode(map[string]any{
+		"done": done, "total": total, "message": message,
+	})
 }
 
 // HandleHealth returns server health status and capacity info.

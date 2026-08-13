@@ -460,6 +460,7 @@ func registerRoutes(mux *http.ServeMux, cfg *Config, proxyClient *proxyserver.Cl
 	}
 	mux.HandleFunc("/synthesize", h.HandleSynthesize(false))
 	mux.HandleFunc("/synthesize-srt", h.HandleSynthesize(true))
+	mux.HandleFunc("/synthesize-progress", h.HandleSynthesizeProgress)
 	mux.HandleFunc("/health", h.HandleHealth)
 	mux.HandleFunc("/models", h.HandleModels)
 }
