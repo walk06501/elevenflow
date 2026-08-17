@@ -3,6 +3,7 @@ package webview2bridge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -114,108 +115,179 @@ func parseHostPort(s string) (string, int, bool) {
 	return host, port, true
 }
 
-// callAPI does one GET to proxyxoay.shop and classifies the result:
-// ok=true on status 100, dead=true on 101/102 (permanent), otherwise a
-// transient error the caller should just retry later.
-func (p *ProxyxoayKeyProvider) callAPI(ctx context.Context) (httpURL string, dead bool, err error) {
+// proxyxoayResult is callAPI's full classification of one get.php call.
+type proxyxoayResult struct {
+	url             string
+	dead            bool // permanently dead (key not found / out of credit) — stop trying
+	ttlSeconds      int  // > 0 on success: how long THIS proxy is good for, parsed from message
+	cooldownSeconds int  // > 0 on a "wait N more seconds" rejection — transient, NOT dead
+}
+
+// proxyxoayCooldownPattern matches the vendor's own rate-limit rejection,
+// e.g. "Con 8s moi co the doi proxy" ("còn 8s mới có thể đổi proxy" without
+// diacritics) — confirmed live 2026-08-18: this comes back under the SAME
+// status code (101) the vendor also uses for a truly dead key, so status
+// alone cannot tell the two apart. The message text is the only reliable
+// signal. Checked BEFORE the status-code switch below for exactly that
+// reason: a cooldown is never permanent, regardless of which status number
+// carries it.
+var proxyxoayCooldownPattern = regexp.MustCompile(`(?i)con\s*(\d+)\s*s\b`)
+
+// proxyxoayTTLPattern parses a successful response's own "proxy nay se die
+// sau 1318s" message so refreshOnce can schedule the next call at the
+// vendor's real expiry instead of a guessed fixed interval — calling before
+// the key's own cooldown window elapses is exactly what produces the
+// rejection proxyxoayCooldownPattern matches (confirmed live: a fixed 50s
+// ticker fired earlier than a ~60s+ real window and got rejected every
+// single cycle).
+var proxyxoayTTLPattern = regexp.MustCompile(`sau\s*(\d+)s`)
+
+// callAPI does one GET to proxyxoay.shop and classifies the result. dead is
+// true ONLY for a message with no cooldown hint under status 101/102 (key
+// not found / out of credit) — see proxyxoayCooldownPattern's doc comment
+// for why the cooldown case is checked first and never treated as dead.
+func (p *ProxyxoayKeyProvider) callAPI(ctx context.Context) (proxyxoayResult, error) {
 	u := fmt.Sprintf(
 		"%s?key=%s&nhamang=random&tinhthanh=0&whitelist=%s",
 		proxyxoayBaseURL, url.QueryEscape(p.apiKey), url.QueryEscape(p.whitelist),
 	)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return "", false, err
+		return proxyxoayResult{}, err
 	}
 	client := &http.Client{Timeout: proxyxoayHTTPTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", false, fmt.Errorf("proxyxoay unreachable: %w", err)
+		return proxyxoayResult{}, fmt.Errorf("proxyxoay unreachable: %w", err)
 	}
 	defer resp.Body.Close()
 
 	var data proxyxoayAPIResponse
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return "", false, fmt.Errorf("proxyxoay invalid response: %w", err)
+		return proxyxoayResult{}, fmt.Errorf("proxyxoay invalid response: %w", err)
 	}
 	msg := data.Message
 	if msg == "" {
 		msg = data.Comen
 	}
 
+	if m := proxyxoayCooldownPattern.FindStringSubmatch(msg); m != nil {
+		secs, _ := strconv.Atoi(m[1])
+		if secs <= 0 {
+			secs = 5
+		}
+		return proxyxoayResult{}, fmt.Errorf("proxyxoay cooldown, %ds left: %w",
+			secs, &proxyxoayCooldownError{seconds: secs, msg: msg})
+	}
+
 	switch data.Status {
 	case 100:
 		host, port, ok := parseHostPort(data.ProxyHTTP)
 		if !ok {
-			return "", false, fmt.Errorf("proxyxoay: response missing usable proxyhttp (%q)", data.ProxyHTTP)
+			return proxyxoayResult{}, fmt.Errorf("proxyxoay: response missing usable proxyhttp (%q)", data.ProxyHTTP)
 		}
-		return fmt.Sprintf("http://%s:%d", host, port), false, nil
+		ttl := 0
+		if m := proxyxoayTTLPattern.FindStringSubmatch(msg); m != nil {
+			ttl, _ = strconv.Atoi(m[1])
+		}
+		return proxyxoayResult{url: fmt.Sprintf("http://%s:%d", host, port), ttlSeconds: ttl}, nil
 	case 101, 102:
 		if msg == "" {
 			msg = fmt.Sprintf("status=%d", data.Status)
 		}
-		return "", true, fmt.Errorf("proxyxoay key dead: %s", msg)
+		return proxyxoayResult{}, fmt.Errorf("proxyxoay key dead: %s", &proxyxoayDeadError{msg: msg})
 	default:
 		if msg == "" {
 			msg = fmt.Sprintf("status=%d", data.Status)
 		}
-		return "", false, fmt.Errorf("proxyxoay transient: %s", msg)
+		return proxyxoayResult{}, fmt.Errorf("proxyxoay transient: %s", msg)
 	}
 }
 
-var proxyxoayTTLPattern = regexp.MustCompile(`(\d+)\s*s\b`)
+// proxyxoayCooldownError/proxyxoayDeadError let refreshOnce/Acquire tell the
+// 3 outcomes (ok / cooldown-transient / permanently-dead) apart via
+// errors.As without string-matching error text a second time.
+type proxyxoayCooldownError struct {
+	seconds int
+	msg     string
+}
 
-// refreshLoop calls the API once immediately, then every
-// proxyxoayRefreshInterval — well before the vendor's own session TTL — so
-// an already-running WebView2 session's configured proxy stays valid across
-// long sessions without every caller having to know about the vendor's
-// timer. dead keys are retried on the same cadence (in case the operator
-// tops up credit) rather than stopping forever, since there is no DB row
-// here to delete like the Vercel relay's admin flow does.
+func (e *proxyxoayCooldownError) Error() string { return e.msg }
+
+type proxyxoayDeadError struct{ msg string }
+
+func (e *proxyxoayDeadError) Error() string { return e.msg }
+
+// refreshLoop calls the API once immediately, then reschedules itself after
+// EVERY call based on what that call actually told us: a live TTL (wait
+// until just before it expires), a cooldown (wait exactly that long), or
+// neither (fall back to proxyxoayRefreshInterval as a safe default so a
+// malformed/unexpected response can never spin-loop the vendor's API).
+// Fixed-ticker was the original design and is exactly what caused the
+// live 2026-08-18 bug (see proxyxoayCooldownPattern's doc comment) — a
+// dynamic timer means the interval now always comes from the vendor's own
+// answer instead of a guess.
 func (p *ProxyxoayKeyProvider) refreshLoop() {
-	p.refreshOnce(context.Background())
-	t := time.NewTicker(proxyxoayRefreshInterval)
-	defer t.Stop()
 	for {
+		wait := p.refreshOnce(context.Background())
 		select {
 		case <-p.stop:
 			return
-		case <-t.C:
-			p.refreshOnce(context.Background())
+		case <-time.After(wait):
 		}
 	}
 }
 
-func (p *ProxyxoayKeyProvider) refreshOnce(ctx context.Context) {
+// refreshOnce makes one call and returns how long to wait before the next
+// one — see refreshLoop's doc comment for why this is dynamic now.
+func (p *ProxyxoayKeyProvider) refreshOnce(ctx context.Context) time.Duration {
 	ctx, cancel := context.WithTimeout(ctx, proxyxoayHTTPTimeout+5*time.Second)
 	defer cancel()
-	url, dead, err := p.callAPI(ctx)
+	res, err := p.callAPI(ctx)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if err != nil {
+
+	var cooldown *proxyxoayCooldownError
+	if errors.As(err, &cooldown) {
+		// Transient rate-limit, not dead — keep whatever lease we already
+		// have (still valid) and just wait out the vendor's own countdown.
 		p.lastErr = err.Error()
-		if dead && !p.dead {
-			log.Printf("[proxyxoay] %s: key marked dead: %v", p.name, err)
-		}
-		p.dead = p.dead || dead
-		return
+		return time.Duration(cooldown.seconds+2) * time.Second
 	}
+	var deadErr *proxyxoayDeadError
+	if errors.As(err, &deadErr) {
+		p.lastErr = err.Error()
+		if !p.dead {
+			log.Printf("[proxyxoay] %s: key marked dead: %v", p.name, deadErr)
+		}
+		p.dead = true
+		return proxyxoayRefreshInterval
+	}
+	if err != nil {
+		// Network hiccup / malformed response — transient, retry on the
+		// default cadence, never mark dead over this.
+		p.lastErr = err.Error()
+		return proxyxoayRefreshInterval
+	}
+
 	p.dead = false
 	p.lastErr = ""
-	if p.current.URL != url {
+	if p.current.URL != res.url {
 		p.generation++
-		p.current = Lease{URL: url, AcquiredAt: time.Now(), Generation: p.generation}
-		log.Printf("[proxyxoay] %s: proxy ready (%s)", p.name, redactProxyxoayURL(url))
+		p.current = Lease{URL: res.url, AcquiredAt: time.Now(), Generation: p.generation}
+		log.Printf("[proxyxoay] %s: proxy ready (%s, ttl=%ds)", p.name, res.url, res.ttlSeconds)
 	}
+	if res.ttlSeconds > proxyxoaySafetyMarginSeconds {
+		return time.Duration(res.ttlSeconds-proxyxoaySafetyMarginSeconds) * time.Second
+	}
+	return proxyxoayRefreshInterval
 }
 
-func redactProxyxoayURL(u string) string {
-	// No credentials embedded (auth is IP-whitelist/session-based), so there
-	// is nothing sensitive to strip — kept as its own function anyway so a
-	// future format change with embedded creds does not leak into logs by
-	// accident without someone having to remember to add this.
-	return u
-}
+// proxyxoaySafetyMarginSeconds: refresh this many seconds before the
+// vendor's own reported expiry, not exactly at it — avoids a request being
+// mid-flight through the old proxy right as it dies.
+const proxyxoaySafetyMarginSeconds = 5
 
 func (p *ProxyxoayKeyProvider) Acquire(ctx context.Context, workerID int, emit func(string)) (Lease, error) {
 	p.mu.Lock()
@@ -233,11 +305,12 @@ func (p *ProxyxoayKeyProvider) Acquire(ctx context.Context, workerID int, emit f
 	// First call raced ahead of refreshLoop's initial fetch (started
 	// asynchronously in New) — do one synchronous attempt instead of
 	// blocking the caller on the loop's own timing.
-	url, dead, err := p.callAPI(ctx)
+	res, err := p.callAPI(ctx)
 	if err != nil {
+		var deadErr *proxyxoayDeadError
 		p.mu.Lock()
 		p.lastErr = err.Error()
-		p.dead = p.dead || dead
+		p.dead = p.dead || errors.As(err, &deadErr)
 		p.mu.Unlock()
 		return Lease{}, err
 	}
@@ -245,7 +318,7 @@ func (p *ProxyxoayKeyProvider) Acquire(ctx context.Context, workerID int, emit f
 	defer p.mu.Unlock()
 	if p.current.URL == "" {
 		p.generation++
-		p.current = Lease{URL: url, AcquiredAt: time.Now(), Generation: p.generation}
+		p.current = Lease{URL: res.url, AcquiredAt: time.Now(), Generation: p.generation}
 	}
 	return p.current, nil
 }
@@ -254,7 +327,12 @@ func (p *ProxyxoayKeyProvider) Acquire(ctx context.Context, workerID int, emit f
 // waiting for the next scheduled refresh — this IS proxyxoay's own rotate
 // mechanism (calling get.php again is how the vendor hands back a fresh
 // exit IP), so a caller-detected failure (ElevenLabs 401 flag) gets a new
-// identity right away rather than waiting up to proxyxoayRefreshInterval.
+// identity right away rather than waiting up to the next scheduled refresh.
+// A cooldown rejection here just means the vendor will not hand back a
+// DIFFERENT IP yet — not an error worth failing the caller over — so this
+// falls back to the still-valid current lease instead of propagating it,
+// same as VPN providers do not fail a lease just because rotation itself
+// is temporarily unavailable.
 func (p *ProxyxoayKeyProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, emit func(string)) (Lease, error) {
 	if emit == nil {
 		emit = func(string) {}
@@ -270,12 +348,18 @@ func (p *ProxyxoayKeyProvider) MarkUnhealthyAndRotate(ctx context.Context, worke
 	p.mu.Unlock()
 
 	emit("Đang đổi địa chỉ mạng…")
-	url, dead, err := p.callAPI(ctx)
+	res, err := p.callAPI(ctx)
 	if err != nil {
+		var cooldown *proxyxoayCooldownError
+		var deadErr *proxyxoayDeadError
 		p.mu.Lock()
 		p.lastErr = err.Error()
-		p.dead = p.dead || dead
+		p.dead = p.dead || errors.As(err, &deadErr)
+		cur := p.current
 		p.mu.Unlock()
+		if errors.As(err, &cooldown) && cur.URL != "" {
+			return cur, nil
+		}
 		return Lease{}, err
 	}
 	p.mu.Lock()
@@ -283,7 +367,7 @@ func (p *ProxyxoayKeyProvider) MarkUnhealthyAndRotate(ctx context.Context, worke
 	p.dead = false
 	p.lastErr = ""
 	p.generation++
-	p.current = Lease{URL: url, AcquiredAt: time.Now(), Generation: p.generation}
+	p.current = Lease{URL: res.url, AcquiredAt: time.Now(), Generation: p.generation}
 	return p.current, nil
 }
 
