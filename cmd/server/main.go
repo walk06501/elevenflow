@@ -170,6 +170,14 @@ func main() {
 		// nhân gốc được xác nhận đã hết (vd đổi IP, liên hệ CyberGhost),
 		// nâng lại 6 và xoá đoạn ghi chú này.
 		cyberghostWGWeight = 1
+		// proxyxoayWeight: 1 — not a real VPN, a rotating-IP proxy API key
+		// (proxyxoay.shop), added 2026-08-18 as a temporary fallback while
+		// VPN sources are IP-blocked across their whole range (operator's
+		// call). Weight 1 per key means each key's soft concurrent cap is
+		// 1×vpnCapSlack (see multi_vpn_provider.go) — matches the operator's
+		// "mỗi cửa sổ 1 key xoay" intent without hard-blocking a second
+		// concurrent attempt on the same key if everything else is busy.
+		proxyxoayWeight = 1
 	)
 
 	// See loadVPNAccounts (portal_vpn_accounts.go): web-portal's admin
@@ -186,6 +194,7 @@ func main() {
 	protonAccounts := vpnAccounts["proton"]
 	mullvadAccounts := vpnAccounts["mullvad"]
 	cyberghostAccounts := vpnAccounts["cyberghost"]
+	proxyxoayAccounts := vpnAccounts["proxyxoay"]
 
 	var vpnProviders []webview2bridge.ProxyProvider
 	if len(nordAccounts) > 0 {
@@ -342,6 +351,20 @@ func main() {
 			}
 			log.Printf("IPVanish WireGuard proxy source active: %d embedded server(s), weight %d (opt-in, unverified under load — see doc comment)", webview2bridge.IPVanishServerCount(), ipvanishWeight)
 		}
+	}
+	if len(proxyxoayAccounts) > 0 {
+		// No opt-in flag (unlike the *WireGuard sources) — this is a plain
+		// HTTP proxy client, not a heavy tunnel, and it is here specifically
+		// because the operator wants it active right now. One provider
+		// instance per key, each with its own background refresh loop (see
+		// proxyxoay_provider.go) — no shared state between keys.
+		for _, a := range proxyxoayAccounts {
+			px := webview2bridge.NewProxyxoayKeyProvider(a.Label, a.Secret, "")
+			for i := 0; i < proxyxoayWeight; i++ {
+				vpnProviders = append(vpnProviders, px)
+			}
+		}
+		log.Printf("proxyxoay proxy source active: %d key(s) (weight %d each, direct — no Vercel relay)", len(proxyxoayAccounts), proxyxoayWeight)
 	}
 	// Combined round-robin when more than one VPN source is configured —
 	// every configured source contributes leases instead of only the
