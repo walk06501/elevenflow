@@ -2,7 +2,12 @@ package webview2bridge
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"sort"
 	"time"
 )
@@ -55,6 +60,72 @@ const (
 	// looser and why au569 (5/10) was still fine to accept there by hand.
 	nordWGDiscoveryPromoteBar = 7
 )
+
+// nordWGDiscoveryPath returns a stable per-account file for persisting
+// discoveredPoolCapacity across restarts — named from a hash of the
+// account's private key (never the key itself) so the account isn't
+// exposed via a filename or directory listing. Added 2026-08-19: without
+// this, every restart wiped discoveredPoolCapacity back to empty
+// (deliberately, per the original doc comment's "quán tính trong 1 lần
+// chạy dài là đủ" reasoning) — a fine assumption if the process ran for
+// weeks uninterrupted, but this VPS gets restarted for deploys often
+// enough (twice in one day, this session) that days of a 20-min-per-tick
+// background scan (nordWGDiscoveryInterval, ~224 key groups total) kept
+// getting thrown away before ever covering the list. Mirrors
+// mullvad_wireguard_provider.go's mullvadKeysPath/loadMullvadKeys pattern,
+// which fixed the same class of "restart loses accumulated state" bug for
+// Mullvad's device registrations.
+func nordWGDiscoveryPath(privHex string) string {
+	sum := sha256.Sum256([]byte(privHex))
+	return filepath.Join(".", fmt.Sprintf("nordvpn_discovered_pools_%x.json", sum[:6]))
+}
+
+type nordWGDiscoveredEntry struct {
+	Key      string `json:"key"`
+	Capacity int    `json:"capacity"`
+}
+
+// loadNordWGDiscovered reads a previously-saved discovery cache. A missing
+// file (first run, or an account never scanned before) is not an error —
+// returns nil, nil so the caller starts from an empty map exactly like
+// before this fix existed.
+func loadNordWGDiscovered(privHex string) (map[string]int, error) {
+	path := nordWGDiscoveryPath(privHex)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var saved []nordWGDiscoveredEntry
+	if err := json.Unmarshal(data, &saved); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	out := make(map[string]int, len(saved))
+	for _, s := range saved {
+		if s.Key != "" && s.Capacity > 0 {
+			out[s.Key] = s.Capacity
+		}
+	}
+	return out, nil
+}
+
+// saveNordWGDiscovered persists the full current discovery map, overwriting
+// whatever was there before — called after every new promotion so the next
+// restart resumes with everything found so far instead of only the latest
+// single result.
+func saveNordWGDiscovered(privHex string, m map[string]int) error {
+	saved := make([]nordWGDiscoveredEntry, 0, len(m))
+	for k, v := range m {
+		saved = append(saved, nordWGDiscoveredEntry{Key: k, Capacity: v})
+	}
+	data, err := json.MarshalIndent(saved, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(nordWGDiscoveryPath(privHex), data, 0o600)
+}
 
 func (p *NordVPNWireGuardProvider) discoveryLoop(ctx context.Context) {
 	t := time.NewTicker(nordWGDiscoveryInterval)
@@ -141,8 +212,15 @@ func (p *NordVPNWireGuardProvider) runDiscoveryTick() {
 	if okCount > p.discoveredPoolCapacity[key] {
 		p.discoveredPoolCapacity[key] = okCount
 	}
+	snapshot := make(map[string]int, len(p.discoveredPoolCapacity))
+	for k, v := range p.discoveredPoolCapacity {
+		snapshot[k] = v
+	}
 	p.mu.Unlock()
 	log.Printf("[NordVPN-WG] Discovery: key %s... (%d hosts, vd %s) — %d/%d concurrent — NEW POOL FOUND, capacity promoted to %d", key[:12], len(hosts), candidates[0].hostname, okCount, len(candidates), okCount)
+	if err := saveNordWGDiscovered(p.privHex, snapshot); err != nil {
+		log.Printf("[NordVPN-WG] Warning: failed to persist discovered pool cache: %v", err)
+	}
 }
 
 // nextDiscoveryCandidateLocked picks the next key group worth testing:

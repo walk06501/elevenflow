@@ -384,6 +384,13 @@ func NewNordVPNWireGuardProvider(token string) (*NordVPNWireGuardProvider, error
 		return nil, fmt.Errorf("nordvpn wireguard server list: %w", err)
 	}
 
+	if discovered, err := loadNordWGDiscovered(privHex); err != nil {
+		log.Printf("[NordVPN-WG] Warning: failed to load discovered pool cache: %v", err)
+	} else if len(discovered) > 0 {
+		p.discoveredPoolCapacity = discovered
+		log.Printf("[NordVPN-WG] Loaded %d previously-discovered pool key(s) from cache", len(discovered))
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	p.refreshCancel = cancel
 	go p.refreshLoop(ctx)
