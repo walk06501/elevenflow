@@ -105,7 +105,7 @@ func NewSurfsharkWireGuardProvider(privateKeyB64 string) (*SurfsharkWireGuardPro
 	if len(surfsharkServerList) == 0 {
 		return nil, fmt.Errorf("no surfshark servers configured")
 	}
-	return &SurfsharkWireGuardProvider{privHex: privHex, live: map[int64]*wgTunnel{}, ranker: newServerRanker()}, nil
+	return &SurfsharkWireGuardProvider{privHex: privHex, live: map[int64]*wgTunnel{}, ranker: newServerRanker("surfshark:" + privHex)}, nil
 }
 
 func (p *SurfsharkWireGuardProvider) Close() {
@@ -237,6 +237,7 @@ func (p *SurfsharkWireGuardProvider) acquireLease() (Lease, error) {
 			lastErr = fmt.Errorf("%s: %w", s.Host, err)
 			continue
 		}
+		t.hostname = s.Host
 		p.mu.Lock()
 		p.genCtr++
 		gen := p.genCtr
@@ -259,11 +260,33 @@ func (p *SurfsharkWireGuardProvider) Acquire(ctx context.Context, workerID int, 
 }
 
 func (p *SurfsharkWireGuardProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error) {
+	p.mu.Lock()
+	t, ok := p.live[oldLease.Generation]
+	p.mu.Unlock()
+	if ok && t.hostname != "" {
+		switch kind {
+		case FailureBan:
+			p.ranker.noteBan(t.hostname)
+		case FailureNetwork:
+			p.ranker.noteNetworkIssue(t.hostname)
+		}
+	}
 	p.closeLease(oldLease.Generation)
 	if emit != nil {
 		emit("Đang đổi sang server Surfshark khác…")
 	}
 	return p.acquireLease()
+}
+
+// NoteChunkOK implements networkHealthNotifier (see provider.go) — resets
+// the network backoff ladder for whichever hostname served this lease.
+func (p *SurfsharkWireGuardProvider) NoteChunkOK(lease Lease) {
+	p.mu.Lock()
+	t, ok := p.live[lease.Generation]
+	p.mu.Unlock()
+	if ok && t.hostname != "" {
+		p.ranker.noteChunkOK(t.hostname)
+	}
 }
 
 func (p *SurfsharkWireGuardProvider) Release(workerID int, lease Lease) {

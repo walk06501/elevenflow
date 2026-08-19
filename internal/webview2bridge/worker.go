@@ -238,6 +238,13 @@ func (w *worker) processChunkWithRetry(ctx context.Context, chunk Chunk) ChunkRe
 
 		align, err := w.processChunkOnce(ctx, chunk)
 		if err == nil {
+			// Tín hiệu tích cực: hostname đang giữ lease này vừa phục vụ
+			// trót lọt 1 chunk — reset nấc phạt "mạng không ổn" của nó về
+			// đáy thang, nếu provider hiện tại có theo dõi (xem
+			// networkHealthNotifier's doc comment ở provider.go).
+			if nn, ok := w.currentLease.owner.(networkHealthNotifier); ok {
+				nn.NoteChunkOK(w.currentLease)
+			}
 			res.OK = true
 			res.Message = "ok"
 			res.Alignment = align

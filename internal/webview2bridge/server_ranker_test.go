@@ -3,7 +3,7 @@ package webview2bridge
 import "testing"
 
 func TestServerRanker_RankedGoodThreshold(t *testing.T) {
-	r := newServerRanker()
+	r := newServerRanker("")
 
 	// "a": 4 lần, 100% — dưới ngưỡng serverRankMinAttempts=5, chưa được
 	// tính là tốt dù tỉ lệ hoàn hảo.
@@ -42,7 +42,7 @@ func TestServerRanker_RankedGoodThreshold(t *testing.T) {
 }
 
 func TestServerRanker_FailurePenalizesThenRecovers(t *testing.T) {
-	r := newServerRanker()
+	r := newServerRanker("")
 
 	if r.isPenalized("x") {
 		t.Fatal("a server with no history must not start penalized")
@@ -60,7 +60,7 @@ func TestServerRanker_FailurePenalizesThenRecovers(t *testing.T) {
 }
 
 func TestServerRanker_NoDataNeverRanked(t *testing.T) {
-	r := newServerRanker()
+	r := newServerRanker("")
 	if good := r.rankedGood(); len(good) != 0 {
 		t.Fatalf("rankedGood() on empty ranker = %v, want empty", good)
 	}

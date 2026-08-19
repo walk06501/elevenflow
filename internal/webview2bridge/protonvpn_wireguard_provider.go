@@ -145,7 +145,7 @@ func NewProtonVPNWireGuardProvider(username, password string) (*ProtonVPNWireGua
 		httpClient: &http.Client{Timeout: 20 * time.Second},
 		apiBase:    protonAPIBase,
 		live:       map[int64]*wgTunnel{},
-		ranker:     newServerRanker(),
+		ranker:     newServerRanker("protonvpn:" + username),
 	}
 
 	if err := p.login(username, password); err != nil {
@@ -577,6 +577,7 @@ func (p *ProtonVPNWireGuardProvider) acquireLease() (Lease, error) {
 			continue
 		}
 		log.Printf("[proton] attempt %d OK %s (%s) (%.1fs)", attempt, s.name, s.entryIP, time.Since(t0).Seconds())
+		t.hostname = s.name
 		p.mu.Lock()
 		p.genCtr++
 		gen := p.genCtr
@@ -599,11 +600,32 @@ func (p *ProtonVPNWireGuardProvider) Acquire(ctx context.Context, workerID int, 
 }
 
 func (p *ProtonVPNWireGuardProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error) {
+	p.mu.Lock()
+	t, ok := p.live[oldLease.Generation]
+	p.mu.Unlock()
+	if ok && t.hostname != "" {
+		switch kind {
+		case FailureBan:
+			p.ranker.noteBan(t.hostname)
+		case FailureNetwork:
+			p.ranker.noteNetworkIssue(t.hostname)
+		}
+	}
 	p.closeLease(oldLease.Generation)
 	if emit != nil {
 		emit("Đang đổi sang server ProtonVPN khác…")
 	}
 	return p.acquireLease()
+}
+
+// NoteChunkOK implements networkHealthNotifier (see provider.go).
+func (p *ProtonVPNWireGuardProvider) NoteChunkOK(lease Lease) {
+	p.mu.Lock()
+	t, ok := p.live[lease.Generation]
+	p.mu.Unlock()
+	if ok && t.hostname != "" {
+		p.ranker.noteChunkOK(t.hostname)
+	}
 }
 
 func (p *ProtonVPNWireGuardProvider) Release(workerID int, lease Lease) {

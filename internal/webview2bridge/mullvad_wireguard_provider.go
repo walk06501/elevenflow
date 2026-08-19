@@ -195,7 +195,7 @@ func NewMullvadWireGuardProvider(accountNumber string) (*MullvadWireGuardProvide
 		account:    accountNumber,
 		live:       map[int64]*wgTunnel{},
 		liveKey:    map[int64]int{},
-		ranker:     newServerRanker(),
+		ranker:     newServerRanker("mullvad:" + accountNumber),
 	}
 
 	loaded, err := loadMullvadKeys(accountNumber)
@@ -572,6 +572,7 @@ func (p *MullvadWireGuardProvider) acquireLease() (Lease, error) {
 			continue
 		}
 		log.Printf("[mullvad] attempt %d OK %s (%s) (%.1fs)", attempt, s.hostname, s.entryIP, time.Since(t0).Seconds())
+		t.hostname = s.hostname
 		p.mu.Lock()
 		p.genCtr++
 		gen := p.genCtr
@@ -598,11 +599,36 @@ func (p *MullvadWireGuardProvider) Acquire(ctx context.Context, workerID int, em
 }
 
 func (p *MullvadWireGuardProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error) {
+	// Chỉ phạt theo SERVER (xem ranker) — không đụng gì tới key checkout
+	// pool (liveKey/checkoutKey), đó là 1 tài nguyên khác hẳn (trần cứng 5
+	// key/tài khoản, không phải "server có thể tránh") không phù hợp với
+	// khái niệm ban/cooldown theo hostname.
+	p.mu.Lock()
+	t, ok := p.live[oldLease.Generation]
+	p.mu.Unlock()
+	if ok && t.hostname != "" {
+		switch kind {
+		case FailureBan:
+			p.ranker.noteBan(t.hostname)
+		case FailureNetwork:
+			p.ranker.noteNetworkIssue(t.hostname)
+		}
+	}
 	p.closeLease(oldLease.Generation)
 	if emit != nil {
 		emit("Đang đổi sang server Mullvad khác…")
 	}
 	return p.acquireLease()
+}
+
+// NoteChunkOK implements networkHealthNotifier (see provider.go).
+func (p *MullvadWireGuardProvider) NoteChunkOK(lease Lease) {
+	p.mu.Lock()
+	t, ok := p.live[lease.Generation]
+	p.mu.Unlock()
+	if ok && t.hostname != "" {
+		p.ranker.noteChunkOK(t.hostname)
+	}
 }
 
 func (p *MullvadWireGuardProvider) Release(workerID int, lease Lease) {

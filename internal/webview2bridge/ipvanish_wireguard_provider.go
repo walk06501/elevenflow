@@ -76,7 +76,7 @@ func NewIPVanishWireGuardProvider() (*IPVanishWireGuardProvider, error) {
 	if len(ipvanishServerList) == 0 {
 		return nil, fmt.Errorf("no ipvanish servers embedded (ipvanish_servers.go empty)")
 	}
-	return &IPVanishWireGuardProvider{live: map[int64]*wgTunnel{}, ranker: newServerRanker()}, nil
+	return &IPVanishWireGuardProvider{live: map[int64]*wgTunnel{}, ranker: newServerRanker("ipvanish")}, nil
 }
 
 func (p *IPVanishWireGuardProvider) Close() {
@@ -203,6 +203,7 @@ func (p *IPVanishWireGuardProvider) acquireLease() (Lease, error) {
 			lastErr = fmt.Errorf("%s: %w", s.Name, err)
 			continue
 		}
+		t.hostname = s.Host
 		p.mu.Lock()
 		p.genCtr++
 		gen := p.genCtr
@@ -225,11 +226,32 @@ func (p *IPVanishWireGuardProvider) Acquire(ctx context.Context, workerID int, e
 }
 
 func (p *IPVanishWireGuardProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error) {
+	p.mu.Lock()
+	t, ok := p.live[oldLease.Generation]
+	p.mu.Unlock()
+	if ok && t.hostname != "" {
+		switch kind {
+		case FailureBan:
+			p.ranker.noteBan(t.hostname)
+		case FailureNetwork:
+			p.ranker.noteNetworkIssue(t.hostname)
+		}
+	}
 	p.closeLease(oldLease.Generation)
 	if emit != nil {
 		emit("Đang đổi sang server IPVanish khác…")
 	}
 	return p.acquireLease()
+}
+
+// NoteChunkOK implements networkHealthNotifier (see provider.go).
+func (p *IPVanishWireGuardProvider) NoteChunkOK(lease Lease) {
+	p.mu.Lock()
+	t, ok := p.live[lease.Generation]
+	p.mu.Unlock()
+	if ok && t.hostname != "" {
+		p.ranker.noteChunkOK(t.hostname)
+	}
 }
 
 func (p *IPVanishWireGuardProvider) Release(workerID int, lease Lease) {

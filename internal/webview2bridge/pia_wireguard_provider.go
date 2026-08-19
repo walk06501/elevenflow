@@ -131,7 +131,7 @@ const (
 // NewPIAWireGuardProvider fetches an auth token and the current WireGuard
 // server list once. Returns an error if either fails.
 func NewPIAWireGuardProvider(username, password string) (*PIAWireGuardProvider, error) {
-	p := &PIAWireGuardProvider{username: username, password: password, live: map[int64]*wgTunnel{}, ranker: newServerRanker()}
+	p := &PIAWireGuardProvider{username: username, password: password, live: map[int64]*wgTunnel{}, ranker: newServerRanker("pia-wg:" + username)}
 	if err := p.fetchToken(); err != nil {
 		return nil, fmt.Errorf("pia wireguard token: %w", err)
 	}
@@ -471,6 +471,7 @@ func (p *PIAWireGuardProvider) acquireLease() (Lease, error) {
 			lastErr = fmt.Errorf("%s (%s): %w", s.ip, s.region, err)
 			continue
 		}
+		t.hostname = s.ip
 		p.mu.Lock()
 		p.genCtr++
 		gen := p.genCtr
@@ -493,11 +494,32 @@ func (p *PIAWireGuardProvider) Acquire(ctx context.Context, workerID int, emit f
 }
 
 func (p *PIAWireGuardProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error) {
+	p.mu.Lock()
+	t, ok := p.live[oldLease.Generation]
+	p.mu.Unlock()
+	if ok && t.hostname != "" {
+		switch kind {
+		case FailureBan:
+			p.ranker.noteBan(t.hostname)
+		case FailureNetwork:
+			p.ranker.noteNetworkIssue(t.hostname)
+		}
+	}
 	p.closeLease(oldLease.Generation)
 	if emit != nil {
 		emit("Đang đổi sang server PIA (WireGuard) khác…")
 	}
 	return p.acquireLease()
+}
+
+// NoteChunkOK implements networkHealthNotifier (see provider.go).
+func (p *PIAWireGuardProvider) NoteChunkOK(lease Lease) {
+	p.mu.Lock()
+	t, ok := p.live[lease.Generation]
+	p.mu.Unlock()
+	if ok && t.hostname != "" {
+		p.ranker.noteChunkOK(t.hostname)
+	}
 }
 
 func (p *PIAWireGuardProvider) Release(workerID int, lease Lease) {

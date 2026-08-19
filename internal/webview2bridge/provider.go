@@ -34,10 +34,24 @@ type ProxyProvider interface {
 	// ngay khi qua khỏi worker.go — MultiVPNProvider.recordAttempt ghi
 	// nhận 1 "thất bại" chung, không biết là IP bị cấm (đổi IP là đủ, nguồn
 	// VPN không có lỗi) hay tunnel/mạng thật sự tệ (nên giảm ưu tiên
-	// nguồn). Chỉ MultiVPNProvider thực sự DÙNG tham số này (tách riêng 2
-	// bộ đếm trong ProviderStat, xem recordAttempt) — mọi provider khác chỉ
-	// nhận rồi bỏ qua, không đổi hành vi rotate/chọn server nội bộ của
-	// chúng.
+	// nguồn). MultiVPNProvider dùng tham số này để tách riêng 2 bộ đếm
+	// trong ProviderStat (xem recordAttempt).
+	//
+	// CẬP NHẬT 2026-08-19 (cùng ngày, sau khi có bằng chứng thật từ
+	// production): 7 trong 13 provider — mọi provider WireGuard có danh
+	// sách nhiều server thật để chọn (NordVPN-WG bespoke +
+	// CyberGhost/IPVanish/Mullvad/PIA/ProtonVPN/Surfshark WG qua
+	// *serverRanker dùng chung, xem server_ranker.go) — GIỜ CŨNG dùng kind
+	// để tự phạt đúng hostname/id vừa gây lỗi: ban 24h khi
+	// kind==FailureBan (ElevenLabs tự flag), cooldown leo thang khi
+	// kind==FailureNetwork (xem serverRankBanCooldown/
+	// serverRankNetworkLadder). 6 provider còn lại (SharedCurrentProvider,
+	// PoolProvider, ProxyxoayKeyProvider, Mullvad's 5-key checkout pool, và
+	// 2 provider SOCKS5 nhỏ — NordVPNProvider/PIAProvider — có danh sách
+	// server thật nhưng KHÔNG có cơ chế round-robin-với-fallback-an-toàn
+	// nào sẵn để gắn ban/cooldown vào mà không rủi ro tự làm cạn kiệt 1
+	// pool nhỏ, hoặc không có khái niệm "server" nào cả) vẫn nhận kind rồi
+	// bỏ qua như trước — cần thiết kế riêng cho từng nhóm, không rush.
 	MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error)
 
 	// Release báo worker không còn dùng lease (kết thúc batch / shutdown).
@@ -45,10 +59,11 @@ type ProxyProvider interface {
 }
 
 // FailureKind phân biệt lý do MarkUnhealthyAndRotate được gọi — xem doc
-// comment của MarkUnhealthyAndRotate. Chỉ dùng cho việc GHI NHẬN/quan sát
-// (thêm 2026-08-19, S2 trong audit VPN); KHÔNG đổi cách bất kỳ provider nào
-// chọn/rotate server nội bộ — đó là quyết định tách riêng, có thể làm sau
-// khi đã có đủ số liệu ban=x/net=y thật để biết nên đổi gì.
+// comment của MarkUnhealthyAndRotate. Ban đầu (2026-08-19, S2 trong audit
+// VPN) chỉ dùng để GHI NHẬN/quan sát, không đổi hành vi chọn server nội bộ
+// của provider nào. CẬP NHẬT cùng ngày: 7/13 provider giờ DÙNG kind để tự
+// phạt (ban 24h / cooldown leo thang) đúng hostname vừa gây lỗi — xem
+// MarkUnhealthyAndRotate's doc comment ở trên.
 type FailureKind int
 
 const (
@@ -63,6 +78,18 @@ const (
 	// nguồn VPN đó.
 	FailureNetwork
 )
+
+// networkHealthNotifier: optional interface (type-assert, giống hardCapped
+// ở multi_vpn_provider.go) cho các provider có cooldown leo thang theo
+// từng server (xem serverRankNetworkLadder/noteNetworkIssue) — cần 1 tín
+// hiệu TÍCH CỰC khi 1 chunk hoàn tất trót lọt để reset nấc phạt của server
+// vừa phục vụ nó về đáy thang, thay vì cứ leo mãi. worker.go gọi
+// NoteChunkOK ngay sau mỗi chunk thành công (không rotate), qua
+// lease.owner — provider nào không quan tâm (chưa implement) thì lệnh gọi
+// type-assert đơn giản là no-op.
+type networkHealthNotifier interface {
+	NoteChunkOK(lease Lease)
+}
 
 // Lease là handle proxy đang gán cho 1 worker. Provider có thể attach
 // metadata (slot ID, expire time…) ngoài URL.

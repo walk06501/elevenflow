@@ -36,6 +36,13 @@ type wgTunnel struct {
 	// closeLease/Close release into the SAME per-key channel it was
 	// acquired from (see slotChanLocked).
 	pubHex string
+	// hostname: which server this tunnel's tunnel is actually exiting
+	// through — needed so MarkUnhealthyAndRotate can identify WHICH
+	// hostname to ban (see nordWGUnusualActivityBanCooldown) when
+	// ElevenLabs flags this lease's traffic as unusual activity. Set once,
+	// right after tryOne wins in probeRound — never changes for this
+	// tunnel's lifetime.
+	hostname string
 }
 
 // errNordWGNoSlots: MỌI candidate quét được trong 1 lượt probeRound đều rơi
@@ -146,6 +153,16 @@ const (
 	// sẽ loại oan hàng loạt server tốt chỉ vì 1 sự cố phía mình.
 	nordWGFailCooldown = 10 * time.Minute
 )
+
+// Ban 24h (unusual-activity) và cooldown leo thang (mạng không ổn) dùng
+// CHUNG 1 chính sách với mọi provider khác trong package — xem
+// serverRankBanCooldown/serverRankNetworkLadder ở server_ranker.go, đây
+// KHÔNG phải bản riêng của NordVPN-WG, chỉ là NordVPN-WG tự quản lý map
+// của nó (bannedHosts/networkPenalty) thay vì đi qua *serverRanker như 6
+// provider WireGuard còn lại (kiến trúc nextCandidate của Nord đã có sẵn
+// từ trước, phức tạp hơn — theo pool key, không chỉ theo hostname — nên
+// không refactor sang serverRanker chung; chỉ tái dùng đúng NGƯỠNG/HẰNG SỐ
+// và kiểu netBackoffState để 2 nơi không lệch chính sách nhau).
 
 // nordWGPoolKeyCapacity: WireGuard public keys (hex) confirmed by REAL
 // concurrent-handshake testing (cmd/scanwgpools) to be "virtual server
@@ -329,6 +346,21 @@ type NordVPNWireGuardProvider struct {
 	// failedUntil: hostname → thời điểm được phép thử lại (xem
 	// nordWGFailCooldown). Chỉ chứa server vừa hỏng, không phải server tốt.
 	failedUntil map[string]time.Time
+	// bannedHosts: hostname → thời điểm được phép thử lại, dành RIÊNG cho
+	// trường hợp ElevenLabs tự flag IP là unusual activity (xem
+	// nordWGUnusualActivityBanCooldown) — tách khỏi failedUntil vì TTL và
+	// mức độ tin cậy khác hẳn nhau (xem doc comment của hằng số). Lưu đĩa
+	// (nordvpn_wireguard_penalties.go) để restart không quên IP vừa bị
+	// ElevenLabs flag ngay trước đó.
+	bannedHosts map[string]time.Time
+	// networkPenalty: hostname → mức phạt leo thang hiện tại cho lỗi "mạng
+	// không ổn" (errTransient/FailureNetwork — xem
+	// serverRankNetworkLadder). Khác bannedHosts (flat, 1 mức) và
+	// failedUntil (flat, không lưu đĩa): mỗi lần hostname này lại gây lỗi
+	// mạng, mức phạt LEO THANG lên nấc tiếp theo thay vì lặp lại cùng 1
+	// khoảng; nấc reset về đáy ngay khi hostname phục vụ trót lọt 1 chunk
+	// (xem NoteChunkOK). Lưu đĩa cùng bannedHosts.
+	networkPenalty map[string]*netBackoffState
 	// keyStats: public key → thống kê thật đã tích luỹ (xem keyStat).
 	keyStats map[string]*keyStat
 	// keyHostIdx: public key → con trỏ xoay vòng trong byKey[key] (xem
@@ -444,6 +476,7 @@ func NewNordVPNWireGuardProvider(token string, label string) (*NordVPNWireGuardP
 		label:                  label,
 		live:                   map[int64]*wgTunnel{},
 		failedUntil:            map[string]time.Time{},
+		bannedHosts:            map[string]time.Time{},
 		keyStats:               map[string]*keyStat{},
 		discoveryStats:         map[string]*keyStat{},
 		keyHostIdx:             map[string]int{},
@@ -460,6 +493,25 @@ func NewNordVPNWireGuardProvider(token string, label string) (*NordVPNWireGuardP
 		p.discoveredPoolCapacity = capacity
 		p.discoveryStats = stats
 		log.Printf("[NordVPN-WG] Loaded %d previously-discovered pool key(s) from cache", len(capacity))
+	}
+
+	if bans, netPen, err := loadNordWGPenalties(privHex); err != nil {
+		log.Printf("[NordVPN-WG] Warning: failed to load penalty cache: %v", err)
+	} else {
+		now := time.Now()
+		for host, until := range bans {
+			if now.Before(until) {
+				p.bannedHosts[host] = until
+			}
+		}
+		for host, np := range netPen {
+			if now.Before(np.until) {
+				p.networkPenalty[host] = np
+			}
+		}
+		if len(p.bannedHosts) > 0 || len(p.networkPenalty) > 0 {
+			log.Printf("[NordVPN-WG] Loaded %d unusual-activity-banned host(s), %d network-penalised host(s) from cache", len(p.bannedHosts), len(p.networkPenalty))
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -591,9 +643,21 @@ func (p *NordVPNWireGuardProvider) refreshServers() error {
 			delete(p.failedUntil, host)
 		}
 	}
+	for host, until := range p.bannedHosts {
+		if now.After(until) {
+			delete(p.bannedHosts, host)
+		}
+	}
+	for host, st := range p.networkPenalty {
+		if now.After(st.until) {
+			delete(p.networkPenalty, host)
+		}
+	}
 	penalised := len(p.failedUntil)
+	banned := len(p.bannedHosts)
+	netPenalised := len(p.networkPenalty)
 	p.mu.Unlock()
-	log.Printf("[NordVPN-WG] Loaded %d online WireGuard servers (%d đang bị tạm bỏ qua do lỗi gần đây)", len(servers), penalised)
+	log.Printf("[NordVPN-WG] Loaded %d online WireGuard servers (%d đang bị tạm bỏ qua do lỗi gần đây, %d bị ban unusual-activity, %d đang phạt mạng leo thang)", len(servers), penalised, banned, netPenalised)
 	return nil
 }
 
@@ -664,6 +728,36 @@ func (p *NordVPNWireGuardProvider) rankedGoodKeysLocked() []string {
 // mình, không phải server), thì trả về ứng viên kế tiếp như bình thường
 // thay vì báo "hết server". Thà thử 1 server có thể hỏng còn hơn từ chối
 // phục vụ hoàn toàn.
+// isPenalisedLocked gộp cả 3 nguồn phạt (failedUntil 10 phút, bannedHosts
+// 24h, networkPenalty leo thang) cho 1 hostname, tự dọn mục đã hết hạn ở
+// mỗi nguồn. Caller phải giữ p.mu (dùng trong nextCandidate, vốn đã chạy
+// dưới lock của probeRound).
+func (p *NordVPNWireGuardProvider) isPenalisedLocked(hostname string, now time.Time) bool {
+	penalised := false
+	if until, ok := p.failedUntil[hostname]; ok {
+		if now.After(until) {
+			delete(p.failedUntil, hostname)
+		} else {
+			penalised = true
+		}
+	}
+	if until, ok := p.bannedHosts[hostname]; ok {
+		if now.After(until) {
+			delete(p.bannedHosts, hostname)
+		} else {
+			penalised = true
+		}
+	}
+	if st, ok := p.networkPenalty[hostname]; ok {
+		if now.After(st.until) {
+			delete(p.networkPenalty, hostname)
+		} else {
+			penalised = true
+		}
+	}
+	return penalised
+}
+
 func (p *NordVPNWireGuardProvider) nextCandidate(skipKeys map[string]bool) (wgServer, error) {
 	if len(p.servers) == 0 {
 		return wgServer{}, fmt.Errorf("no NordVPN WireGuard servers loaded")
@@ -691,14 +785,11 @@ func (p *NordVPNWireGuardProvider) nextCandidate(skipKeys map[string]bool) (wgSe
 		start := p.keyHostIdx[key]
 		for i := 0; i < len(hosts); i++ {
 			s := hosts[(start+i)%len(hosts)]
-			until, penalised := p.failedUntil[s.hostname]
-			if !penalised || now.After(until) {
-				if penalised {
-					delete(p.failedUntil, s.hostname)
-				}
-				p.keyHostIdx[key] = (start + i + 1) % len(hosts)
-				return s, nil
+			if p.isPenalisedLocked(s.hostname, now) {
+				continue
 			}
+			p.keyHostIdx[key] = (start + i + 1) % len(hosts)
+			return s, nil
 		}
 		// Mọi hostname của key này đang bị phạt hết — thử key tốt kế tiếp
 		// thay vì rơi thẳng xuống round-robin ngay.
@@ -710,11 +801,7 @@ func (p *NordVPNWireGuardProvider) nextCandidate(skipKeys map[string]bool) (wgSe
 		if skipKeys[s.pubHex] {
 			continue
 		}
-		until, penalised := p.failedUntil[s.hostname]
-		if !penalised || now.After(until) {
-			if penalised {
-				delete(p.failedUntil, s.hostname)
-			}
+		if !p.isPenalisedLocked(s.hostname, now) {
 			return s, nil
 		}
 	}
@@ -729,6 +816,96 @@ func (p *NordVPNWireGuardProvider) noteFailure(hostname string) {
 	p.mu.Lock()
 	p.failedUntil[hostname] = time.Now().Add(nordWGFailCooldown)
 	p.mu.Unlock()
+}
+
+// noteUnusualActivityBan đánh dấu hostname bị ban serverRankBanCooldown
+// (24h) — gọi khi kind==FailureBan (ElevenLabs tự flag unusual activity
+// trên lease đang dùng hostname này, xem MarkUnhealthyAndRotate).
+func (p *NordVPNWireGuardProvider) noteUnusualActivityBan(hostname string) {
+	p.mu.Lock()
+	p.bannedHosts[hostname] = time.Now().Add(serverRankBanCooldown)
+	bans := make(map[string]time.Time, len(p.bannedHosts))
+	for k, v := range p.bannedHosts {
+		bans[k] = v
+	}
+	netPen := make(map[string]*netBackoffState, len(p.networkPenalty))
+	for k, v := range p.networkPenalty {
+		cp := *v
+		netPen[k] = &cp
+	}
+	p.mu.Unlock()
+	log.Printf("[NordVPN-WG] %s: unusual activity detected, banning host %s for %s", p.Name(), hostname, serverRankBanCooldown)
+	if err := saveNordWGPenalties(p.privHex, bans, netPen); err != nil {
+		log.Printf("[NordVPN-WG] Warning: failed to persist penalty cache: %v", err)
+	}
+}
+
+// noteNetworkIssue leo hostname lên 1 nấc trong serverRankNetworkLadder —
+// gọi khi kind==FailureNetwork (lỗi mạng/timeout/5xx/429 ở worker.go).
+func (p *NordVPNWireGuardProvider) noteNetworkIssue(hostname string) {
+	p.mu.Lock()
+	st, ok := p.networkPenalty[hostname]
+	if !ok {
+		st = &netBackoffState{level: -1}
+		p.networkPenalty[hostname] = st
+	}
+	if st.level < len(serverRankNetworkLadder)-1 {
+		st.level++
+	}
+	st.until = time.Now().Add(serverRankNetworkLadder[st.level])
+	bans := make(map[string]time.Time, len(p.bannedHosts))
+	for k, v := range p.bannedHosts {
+		bans[k] = v
+	}
+	netPen := make(map[string]*netBackoffState, len(p.networkPenalty))
+	for k, v := range p.networkPenalty {
+		cp := *v
+		netPen[k] = &cp
+	}
+	p.mu.Unlock()
+	log.Printf("[NordVPN-WG] %s: network issue on host %s, cooldown escalated to level %d (%s)", p.Name(), hostname, st.level, serverRankNetworkLadder[st.level])
+	if err := saveNordWGPenalties(p.privHex, bans, netPen); err != nil {
+		log.Printf("[NordVPN-WG] Warning: failed to persist penalty cache: %v", err)
+	}
+}
+
+// noteNetworkOK xoá hẳn nấc phạt mạng hiện tại của hostname (nếu có) — xem
+// server_ranker.go's noteChunkOK doc comment, cùng lý do/hành vi.
+func (p *NordVPNWireGuardProvider) noteNetworkOK(hostname string) {
+	p.mu.Lock()
+	_, had := p.networkPenalty[hostname]
+	if !had {
+		p.mu.Unlock()
+		return
+	}
+	delete(p.networkPenalty, hostname)
+	bans := make(map[string]time.Time, len(p.bannedHosts))
+	for k, v := range p.bannedHosts {
+		bans[k] = v
+	}
+	netPen := make(map[string]*netBackoffState, len(p.networkPenalty))
+	for k, v := range p.networkPenalty {
+		cp := *v
+		netPen[k] = &cp
+	}
+	p.mu.Unlock()
+	if err := saveNordWGPenalties(p.privHex, bans, netPen); err != nil {
+		log.Printf("[NordVPN-WG] Warning: failed to persist penalty cache: %v", err)
+	}
+}
+
+// NoteChunkOK implements the package-level networkHealthNotifier interface
+// (see provider.go) — worker.go calls this right after a chunk completes
+// with no rotate needed, so whichever hostname served it gets its network
+// backoff ladder (if any) reset to the bottom.
+func (p *NordVPNWireGuardProvider) NoteChunkOK(lease Lease) {
+	p.mu.Lock()
+	t, ok := p.live[lease.Generation]
+	p.mu.Unlock()
+	if !ok || t.hostname == "" {
+		return
+	}
+	p.noteNetworkOK(t.hostname)
 }
 
 // noteKeyResult tích luỹ 1 kết quả THẬT (từ 1 lease phục vụ traffic thật,
@@ -998,6 +1175,7 @@ func (p *NordVPNWireGuardProvider) probeRound(ctx context.Context) (*wgTunnel, e
 			}
 			p.noteKeyResult(c.s.pubHex, true)
 			t.pubHex = c.s.pubHex
+			t.hostname = c.s.hostname
 			// Probe thắng thì GIỮ nguyên slot (tunnel sống tiếp tục chiếm 1
 			// kết nối); probe thua sẽ trả slot lúc bị đóng ở dưới.
 			results <- probeResult{tunnel: t, slot: c.slot}
@@ -1078,6 +1256,25 @@ func (p *NordVPNWireGuardProvider) Acquire(ctx context.Context, workerID int, em
 }
 
 func (p *NordVPNWireGuardProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error) {
+	// Xác định hostname của lease SẮP đóng TRƯỚC khi closeLease xoá nó khỏi
+	// p.live — kind cho biết ElevenLabs vừa flag hostname này (FailureBan)
+	// hay nó vừa gây lỗi mạng (FailureNetwork), cả 2 đều cần biết ĐÚNG
+	// hostname nào để phạt, không phải hostname sắp được cấp tiếp theo.
+	p.mu.Lock()
+	t, ok := p.live[oldLease.Generation]
+	var hostname string
+	if ok {
+		hostname = t.hostname
+	}
+	p.mu.Unlock()
+	if hostname != "" {
+		switch kind {
+		case FailureBan:
+			p.noteUnusualActivityBan(hostname)
+		case FailureNetwork:
+			p.noteNetworkIssue(hostname)
+		}
+	}
 	p.closeLease(oldLease.Generation)
 	if emit != nil {
 		emit("Đang đổi sang server NordVPN (WireGuard) khác…")

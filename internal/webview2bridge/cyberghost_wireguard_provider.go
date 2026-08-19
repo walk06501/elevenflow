@@ -313,7 +313,7 @@ func NewCyberGhostWireGuardProvider(username, password string) (*CyberGhostWireG
 		password:  password,
 		live:      map[int64]*wgTunnel{},
 		byCountry: map[string][]cgServer{},
-		ranker:    newServerRanker(),
+		ranker:    newServerRanker("cyberghost:" + username),
 	}
 
 	jwt, err := p.login()
@@ -825,6 +825,7 @@ func (p *CyberGhostWireGuardProvider) acquireLease() (Lease, error) {
 			lastErr = fmt.Errorf("%s (%s): %w", s.name, s.countryCode, err)
 			continue
 		}
+		t.hostname = s.name
 		p.mu.Lock()
 		p.genCtr++
 		gen := p.genCtr
@@ -847,11 +848,32 @@ func (p *CyberGhostWireGuardProvider) Acquire(ctx context.Context, workerID int,
 }
 
 func (p *CyberGhostWireGuardProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error) {
+	p.mu.Lock()
+	t, ok := p.live[oldLease.Generation]
+	p.mu.Unlock()
+	if ok && t.hostname != "" {
+		switch kind {
+		case FailureBan:
+			p.ranker.noteBan(t.hostname)
+		case FailureNetwork:
+			p.ranker.noteNetworkIssue(t.hostname)
+		}
+	}
 	p.closeLease(oldLease.Generation)
 	if emit != nil {
 		emit("Đang đổi sang server CyberGhost khác…")
 	}
 	return p.acquireLease()
+}
+
+// NoteChunkOK implements networkHealthNotifier (see provider.go).
+func (p *CyberGhostWireGuardProvider) NoteChunkOK(lease Lease) {
+	p.mu.Lock()
+	t, ok := p.live[lease.Generation]
+	p.mu.Unlock()
+	if ok && t.hostname != "" {
+		p.ranker.noteChunkOK(t.hostname)
+	}
 }
 
 func (p *CyberGhostWireGuardProvider) Release(workerID int, lease Lease) {
