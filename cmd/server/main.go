@@ -133,7 +133,12 @@ func main() {
 	//     (nhiều EntryIP hơn hẳn ~140 host cố định của Surfshark) nên đặt
 	//     cao hơn Surfshark một chút.
 	const (
-		nordSOCKS5Weight = 1
+		// nordSOCKS5Weight: tạm 0 (2026-08-19, thử nghiệm) — operator muốn
+		// đo Nord-WG RIÊNG, không để traffic rơi vào SOCKS5 làm loãng tín
+		// hiệu (1 job "thành công" qua SOCKS5 không nói lên gì về việc
+		// HardCap fix có sửa được contention của WG hay không, và còn kéo
+		// bớt tải ra khỏi WG). Bật lại 1 sau khi đo xong.
+		nordSOCKS5Weight = 0
 		// nordWGWeight: bật lại thăm dò ở 1 sáng 2026-08-19 (sau khi tắt
 		// hẳn từ 2026-08-14 vì đo được 11-25% thành công), sau khi sửa MTU
 		// 1420→1280. Traffic thật cả ngày (đo riêng từng account nhờ
