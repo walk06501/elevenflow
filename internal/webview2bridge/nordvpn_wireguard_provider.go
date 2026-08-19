@@ -1059,6 +1059,17 @@ func (p *NordVPNWireGuardProvider) Name() string {
 	return fmt.Sprintf("NordVPN-WG[%s]", p.label)
 }
 
+// HardCap: true — implements multi_vpn_provider.go's hardCapped interface.
+// nordWGWeight (main.go) is already a measured real ceiling ("1 account
+// sustains exactly 1 WireGuard data path", nordWGDefaultMaxConcurrentConns),
+// not a rough guess like most other providers' weights — MultiVPNProvider's
+// generic ×vpnCapSlack(3) slack would let it keep routing new attempts to
+// an account that's already holding its one real connection, guaranteeing
+// the contention failures measured 2026-08-19 (both accounts ~0-20% Acquire
+// success under concurrent load, not one bad account — see main.go's
+// nordWGWeight doc comment for the full evidence).
+func (p *NordVPNWireGuardProvider) HardCap() bool { return true }
+
 func (p *NordVPNWireGuardProvider) Acquire(ctx context.Context, workerID int, emit func(string)) (Lease, error) {
 	if emit != nil {
 		emit("Đang tìm server NordVPN (WireGuard) khả dụng…")

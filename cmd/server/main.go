@@ -134,21 +134,28 @@ func main() {
 	//     cao hơn Surfshark một chút.
 	const (
 		nordSOCKS5Weight = 1
-		// nordWGWeight: bật lại thăm dò ở 1 (2026-08-19), sau khi tắt hẳn từ
-		// 2026-08-14 vì đo được 11-25% thành công liên tục nhiều ngày. Lý do
-		// thử lại: nordvpn_wireguard_provider.go's tryOne vừa sửa MTU
-		// 1420→1280 (khớp giá trị app NordVPN chính thức dùng thật, đối
-		// chiếu qua nhiều repo GitHub) — con số 11-25% cũ đo được TRƯỚC khi
-        // sửa MTU, nên chưa chắc phản ánh đúng khả năng thật của nguồn này,
-		// có thể lẫn cả lỗi phân mảnh gói tin (PMTUD blackhole) vào chung
-		// với giới hạn "1 đường dữ liệu/account" đã biết. Đặt 1 (không phải
-		// số lớn hơn) để khớp đúng thực tế đo được — 2 tài khoản hiện có =
-		// 2 key riêng = tối đa 2 đường thật, không phải "N kết nối/account".
-		// Theo dõi vpn_provider_stats ở /health sau deploy — từ 2026-08-19
-		// mỗi account có key riêng, dạng "NordVPN-WG[<label>]" (vd
-		// "NordVPN-WG[NordVPN #1]"), không còn gộp chung 1 dòng "NordVPN-WG"
-		// như trước (xem NordVPNWireGuardProvider.Name()); nếu
-		// success_rate không cải thiện rõ so với 11-25% cũ, trả về 0.
+		// nordWGWeight: bật lại thăm dò ở 1 sáng 2026-08-19 (sau khi tắt
+		// hẳn từ 2026-08-14 vì đo được 11-25% thành công), sau khi sửa MTU
+		// 1420→1280. Traffic thật cả ngày (đo riêng từng account nhờ
+		// NordVPNWireGuardProvider.Name() giờ có label) cho kết quả VẪN TỆ
+		// ở bước Acquire(): NordVPN-WG[#1] 0/3, NordVPN-WG[#2] 1/5 — tổng
+		// 1/8 = 12.5%, gần như y hệt mức cũ. QUAN TRỌNG: cả 2 account tệ
+		// NHƯ NHAU, không phải 1 account bị hỏng riêng — bác bỏ MTU là
+		// nguyên nhân chính, xác nhận lại giả thuyết cũ (2026-08-03):
+		// contention/giới hạn 1-đường-dữ-liệu-mỗi-account.
+		//
+		// Thay vì tắt lại (đã thử, không giải quyết gốc rễ), sửa TẬN GỐC:
+		// MultiVPNProvider trước đây cho phép tới weight×vpnCapSlack(3)=3
+		// request cùng lúc nhắm vào 1 account chỉ chịu được 1 kết nối —
+		// nghĩa là tự tạo ra collision thay vì tránh nó. Nord-WG giờ
+		// implement hardCapped (xem NordVPNWireGuardProvider.HardCap),
+		// nên cap thực tế = đúng weight = 1/account, không nhân slack:
+		// request thứ 2 nhắm cùng account sẽ được xếp SAU các nguồn khác
+		// còn rảnh (SOCKS5, account Nord kia) thay vì cứ dí vào chỗ đã bận.
+		// Giữ weight=1 (đúng số đường thật), theo dõi vpn_provider_stats
+		// per-account ở /health sau deploy để xác nhận cap fix có thực sự
+		// nâng được success_rate lên gần mức lý thuyết (2 account = tối đa
+		// 2 request đồng thời không collide) hay chưa.
 		nordWGWeight = 1
 		piaWGWeight  = 6
 		// surfsharkWeight: nâng lại 2 (2026-08-12) — nguyên nhân 0% hôm

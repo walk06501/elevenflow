@@ -36,6 +36,32 @@ func newTestMultiVPN(names ...string) (*MultiVPNProvider, []ProxyProvider) {
 	return &MultiVPNProvider{providers: providers, stats: map[string]*ProviderStat{}, runtime: runtime}, providers
 }
 
+// fakeHardCappedProvider: like fakeVPNProvider but declares HardCap()=true,
+// so NewMultiVPNProvider must use its raw weight as cap instead of
+// weight×vpnCapSlack. Added 2026-08-19 alongside NordVPNWireGuardProvider's
+// real HardCap() implementation.
+type fakeHardCappedProvider struct{ fakeVPNProvider }
+
+func (f *fakeHardCappedProvider) HardCap() bool { return true }
+
+func TestNewMultiVPNProvider_HardCappedSourceSkipsSlack(t *testing.T) {
+	hard := &fakeHardCappedProvider{fakeVPNProvider{name: "hard-source"}}
+	soft := &fakeVPNProvider{name: "soft-source"}
+	m := NewMultiVPNProvider(hard, soft)
+
+	m.mu.Lock()
+	hardCap := m.runtime["hard-source"].cap
+	softCap := m.runtime["soft-source"].cap
+	m.mu.Unlock()
+
+	if hardCap != 1 {
+		t.Errorf("hard-source cap = %d, want 1 (weight 1, no ×vpnCapSlack)", hardCap)
+	}
+	if softCap != vpnCapSlack {
+		t.Errorf("soft-source cap = %d, want %d (weight 1 × vpnCapSlack)", softCap, vpnCapSlack)
+	}
+}
+
 func TestQualityRankLocked_GoodFirstBadLast(t *testing.T) {
 	m, providers := newTestMultiVPN("good", "mid", "bad", "unknown")
 

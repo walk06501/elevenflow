@@ -169,6 +169,8 @@ type MultiVPNProvider struct {
 // tài nguyên" thay vì khoá cứng đúng bằng trọng số gốc: 1 nguồn đang chạy
 // tốt được phép gánh nhiều hơn tỉ trọng gốc của nó khi các nguồn khác đang
 // tệ, chỉ bị chặn khi thực sự vượt xa mức đó.
+//
+// KHÔNG áp dụng cho nguồn triển khai hardCapped (2026-08-19) — xem đó.
 func newProviderCap(weight int) int {
 	if weight < 1 {
 		weight = 1
@@ -176,14 +178,38 @@ func newProviderCap(weight int) int {
 	return weight * vpnCapSlack
 }
 
+// hardCapped: implement bởi 1 nguồn khi trọng số của nó (main.go) đã LÀ số
+// đo thật, không phải ước lượng — vd NordVPN-WG's weight=1/account đến từ
+// "1 account chỉ giữ được đúng 1 đường dữ liệu WireGuard cùng lúc" (đo thật
+// 2026-08-03, xem nordWGDefaultMaxConcurrentConns). Với nguồn này,
+// vpnCapSlack(×3) là SAI: nó cho phép layer-1 (rankedProviders' under-cap
+// check) tiếp tục coi nguồn "còn chỗ" khi đã có 1-2 request khác đang dùng
+// CHÍNH account đó, dẫn thẳng tới đúng kiểu va chạm đã đo được (2026-08-19:
+// NordVPN-WG[#1] 0/3, NordVPN-WG[#2] 1/5 ở bước Acquire() — cả 2 account
+// tệ như nhau, khớp lý thuyết va chạm chứ không phải 1 account bị hỏng
+// riêng). Cap = đúng weight, không nhân slack — 1 request khác nhắm cùng
+// account này sẽ bị xếp SAU các nguồn còn dưới trần khác (SOCKS5, hoặc
+// chính account Nord-WG kia đang rảnh) thay vì cứ dí thêm vào 1 account đã
+// bận, gần như chắc chắn fail.
+type hardCapped interface{ HardCap() bool }
+
 func NewMultiVPNProvider(providers ...ProxyProvider) *MultiVPNProvider {
 	weight := map[string]int{}
+	hard := map[string]bool{}
 	for _, p := range providers {
-		weight[providerName(p)]++
+		name := providerName(p)
+		weight[name]++
+		if hc, ok := p.(hardCapped); ok && hc.HardCap() {
+			hard[name] = true
+		}
 	}
 	runtime := make(map[string]*providerRuntime, len(weight))
 	for name, w := range weight {
-		runtime[name] = &providerRuntime{cap: newProviderCap(w)}
+		cap := newProviderCap(w)
+		if hard[name] {
+			cap = w
+		}
+		runtime[name] = &providerRuntime{cap: cap}
 	}
 	m := &MultiVPNProvider{
 		providers: providers,
