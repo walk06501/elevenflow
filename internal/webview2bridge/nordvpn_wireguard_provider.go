@@ -304,6 +304,19 @@ type keyStat struct {
 
 type NordVPNWireGuardProvider struct {
 	privHex string
+	// label: which account this instance belongs to (e.g. "NordVPN #1"),
+	// from the portal's eleven_vpn_accounts.label — folded into Name() so
+	// MultiVPNProvider.Stats()/statsLogger key each account separately.
+	// Added 2026-08-19: with 2+ accounts each building their own provider
+	// instance (main.go's per-account loop), Name() previously returned
+	// the same constant "NordVPN-WG" for both, so MultiVPNProvider.stats
+	// (keyed by Name()) silently summed both accounts into one bucket — a
+	// dead account would just look like the live one's rate had halved,
+	// and there was no way to tell "1 attempt landed on account A, next on
+	// account B" from "2 attempts both landed on the same account", which
+	// is exactly the distinction needed to test the 1-data-path-per-account
+	// contention theory against real production traffic.
+	label string
 
 	mu      sync.Mutex
 	servers []wgServer
@@ -414,7 +427,10 @@ func (p *NordVPNWireGuardProvider) tryAcquireSlotLocked(pubHex string) (chan str
 // NewNordVPNWireGuardProvider fetches the WireGuard private key and the
 // current online server list once. Returns an error if either fails — a
 // provider with no key or no servers can never build a working lease.
-func NewNordVPNWireGuardProvider(token string) (*NordVPNWireGuardProvider, error) {
+// label identifies which account this instance is (see the struct field's
+// doc comment) — pass "" if unknown (Name() falls back to the bare source
+// name, matching pre-2026-08-19 behavior).
+func NewNordVPNWireGuardProvider(token string, label string) (*NordVPNWireGuardProvider, error) {
 	privKeyB64, err := wgFetchPrivateKey(token)
 	if err != nil {
 		return nil, fmt.Errorf("nordvpn wireguard private key: %w", err)
@@ -425,6 +441,7 @@ func NewNordVPNWireGuardProvider(token string) (*NordVPNWireGuardProvider, error
 	}
 	p := &NordVPNWireGuardProvider{
 		privHex:                privHex,
+		label:                  label,
 		live:                   map[int64]*wgTunnel{},
 		failedUntil:            map[string]time.Time{},
 		keyStats:               map[string]*keyStat{},
@@ -1032,8 +1049,15 @@ func (p *NordVPNWireGuardProvider) probeRound(ctx context.Context) (*wgTunnel, e
 }
 
 // Name identifies this source in MultiVPNProvider's per-provider stats
-// (see multi_vpn_provider.go).
-func (p *NordVPNWireGuardProvider) Name() string { return "NordVPN-WG" }
+// (see multi_vpn_provider.go). Includes the account label (2026-08-19) so
+// stats no longer sum multiple accounts into one bucket — see the label
+// field's doc comment.
+func (p *NordVPNWireGuardProvider) Name() string {
+	if p.label == "" {
+		return "NordVPN-WG"
+	}
+	return fmt.Sprintf("NordVPN-WG[%s]", p.label)
+}
 
 func (p *NordVPNWireGuardProvider) Acquire(ctx context.Context, workerID int, emit func(string)) (Lease, error) {
 	if emit != nil {

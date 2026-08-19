@@ -144,8 +144,11 @@ func main() {
 		// với giới hạn "1 đường dữ liệu/account" đã biết. Đặt 1 (không phải
 		// số lớn hơn) để khớp đúng thực tế đo được — 2 tài khoản hiện có =
 		// 2 key riêng = tối đa 2 đường thật, không phải "N kết nối/account".
-		// Theo dõi vpn_provider_stats ("NordVPN-WG") ở /health sau deploy;
-		// nếu success_rate không cải thiện rõ so với 11-25% cũ, trả về 0.
+		// Theo dõi vpn_provider_stats ở /health sau deploy — từ 2026-08-19
+		// mỗi account có key riêng, dạng "NordVPN-WG[<label>]" (vd
+		// "NordVPN-WG[NordVPN #1]"), không còn gộp chung 1 dòng "NordVPN-WG"
+		// như trước (xem NordVPNWireGuardProvider.Name()); nếu
+		// success_rate không cải thiện rõ so với 11-25% cũ, trả về 0.
 		nordWGWeight = 1
 		piaWGWeight  = 6
 		// surfsharkWeight: nâng lại 2 (2026-08-12) — nguyên nhân 0% hôm
@@ -234,7 +237,7 @@ func main() {
 		// reason to add more than one.
 		nordWGInit := 0
 		for _, a := range nordAccounts {
-			nordWG, err := webview2bridge.NewNordVPNWireGuardProvider(a.Secret)
+			nordWG, err := webview2bridge.NewNordVPNWireGuardProvider(a.Secret, a.Label)
 			if err != nil {
 				log.Printf("NordVPN WireGuard provider init failed for %s...: %v", safePrefix(a.Secret, 8), err)
 				continue
