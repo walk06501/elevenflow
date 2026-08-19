@@ -60,16 +60,26 @@ const (
 	wgMaxAcquireAttempts    = 6
 	wgServerRefreshInterval = 30 * time.Minute
 
-	// nordWGHandshakeTimeout/nordWGMaxAcquireAttempts: NordVPN-WireGuard's
-	// own pool (thousands of servers) is an order of magnitude bigger than
-	// PIA's (hundreds) or Surfshark's (~140 fixed hosts), so the same
-	// 6-attempt ceiling under-uses the one thing it actually has going for
-	// it — sheer candidate count. A tighter per-attempt timeout (2s
-	// instead of 3s) keeps the worst case from actually getting slower
-	// while trying more candidates: 10×2s=20s worst case vs. the shared
-	// 6×3s=18s, for roughly 65% better odds of finding a working server
-	// instead of exhausting attempts and forcing the caller to fall back
-	// to a whole different provider (which starts the process over).
+	// nordWGHandshakeTimeout: a tighter per-attempt timeout (2s instead of
+	// the shared 3s) than the other providers, on the reasoning that
+	// NordVPN-WG's own pool (thousands of servers) is an order of magnitude
+	// bigger than PIA's (hundreds) or Surfshark's (~140 fixed hosts), so
+	// trying candidates faster matters more here.
+	//
+	// nordWGMaxAcquireAttempts: CORRECTED 2026-08-19 — this comment
+	// previously argued FOR trying MORE candidates than the shared
+	// wgMaxAcquireAttempts=6 (citing a since-changed value of 10), but the
+	// constant below is 5, i.e. FEWER attempts than every other provider,
+	// which argues the opposite of what this comment used to claim. Git
+	// history: 735d92b introduced 10, 6fd800e ("Treat NordVPN WireGuard as
+	// a single-connection source") dropped it to 5 without updating this
+	// comment. Real worst case at 5 attempts is nordWGHandshakeTimeout (2s)
+	// + wgProbeTimeout (3s) = 5s/attempt × 5 ≈ 25s, not the 20s this
+	// comment used to claim (which also omitted the probe timeout). Left as
+	// 5 for now since 6fd800e's actual motivation isn't reconstructable
+	// from history alone — re-derive fresh from data before changing it
+	// again, don't restore the old "try more" reasoning without new
+	// evidence.
 	nordWGHandshakeTimeout   = 2 * time.Second
 	nordWGMaxAcquireAttempts = 5
 
@@ -215,8 +225,24 @@ func (p *NordVPNWireGuardProvider) capacityForKeyLocked(pubHex string) int {
 	}
 	const minAttempts = 5
 	const minSuccessRate = 0.7
-	if st, ok := p.keyStats[pubHex]; ok && st.attempts >= minAttempts {
-		if rate := float64(st.successes) / float64(st.attempts); rate < minSuccessRate {
+	// Degrade check reads BOTH keyStats (real traffic) and discoveryStats
+	// (probe results) combined — unlike rankedGoodKeysLocked's promotion
+	// path, which deliberately reads keyStats only (see noteKeyResult's doc
+	// comment for why the two need different evidence). Demoting a
+	// capacity claim is reasonable evidence from either source: if
+	// discovery itself re-tested this key and it failed to hold capacity,
+	// that's just as informative as real traffic failing the same way.
+	attempts, successes := 0, 0
+	if st, ok := p.keyStats[pubHex]; ok {
+		attempts += st.attempts
+		successes += st.successes
+	}
+	if st, ok := p.discoveryStats[pubHex]; ok {
+		attempts += st.attempts
+		successes += st.successes
+	}
+	if attempts >= minAttempts {
+		if rate := float64(successes) / float64(attempts); rate < minSuccessRate {
 			return nordWGDefaultMaxConcurrentConns
 		}
 	}
@@ -241,8 +267,16 @@ func (p *NordVPNWireGuardProvider) capacityForKeyLocked(pubHex string) int {
 // only reliable signal is trying a real handshake AND a real HTTP round
 // trip. So Acquire tries candidates one at a time (round-robin over the
 // full list), verifying each for real before handing it out, and moves on
-// immediately if one doesn't pan out rather than trying to remember which
-// servers are "good" ahead of time.
+// immediately if one doesn't pan out.
+//
+// CORRECTED 2026-08-19: this paragraph used to end "...rather than trying
+// to remember which servers are 'good' ahead of time" — that stopped being
+// true when nextCandidate started consulting rankedGoodKeysLocked (a
+// persistent-for-the-process memory of keys with enough proven attempts and
+// success rate), which takes priority over plain round-robin. What's still
+// accurate: no server is EVER assumed good without having actually been
+// tried — the memory is earned from real attempts, not inferred from
+// metadata.
 //
 // Each live tunnel exposes itself as a tiny local no-auth SOCKS5 server
 // (see socks5_local_server.go) bound to 127.0.0.1 — the tunnel itself has
@@ -295,10 +329,28 @@ type NordVPNWireGuardProvider struct {
 	// nordWGPoolKeyCapacity chứ không thay thế — quét thủ công 1 lần
 	// (cmd/scanwgpools) chỉ bắt được ảnh chụp tại thời điểm chạy, không tự
 	// phát hiện pool MỚI NordVPN thêm sau này; discoveryLoop lấp đúng chỗ
-	// đó, chạy nền suốt vòng đời tiến trình. KHÔNG lưu đĩa, giống keyStats —
-	// quán tính trong 1 lần chạy dài là đủ, và mất đi sau restart chỉ khiến
-	// nó dò lại chứ không mất an toàn (bảng tay vẫn còn nguyên).
+	// đó, chạy nền suốt vòng đời tiến trình.
+	//
+	// Lưu đĩa cùng discoveryStats từ 2026-08-19 (nordWGDiscoveryPath) —
+	// SỬA LẠI quyết định ban đầu (từng cố tình không lưu, lý do cũ: "quán
+	// tính 1 lần chạy dài là đủ"). Lý do đổi: restart xoá sạch tiến độ dò
+	// (~224 nhóm key, ~1 nhóm/20 phút — vài ngày mới quét hết), và VPS này
+	// restart đủ thường xuyên (2 lần trong 1 ngày, chính phiên hôm nay) để
+	// việc đó thành lãng phí thật. QUAN TRỌNG: lưu SỐ capacity mà không lưu
+	// BẰNG CHỨNG (discoveryStats) từng là 1 lỗi thật đã xảy ra (fix trong
+	// cùng ngày) — capacityForKeyLocked's cam kết "chỉ có thể trở nên thận
+	// trọng hơn theo thời gian, không bao giờ âm thầm tin lại số liệu đã
+	// lỗi thời" chỉ đúng nếu số liệu VÀ bằng chứng cùng sống hoặc cùng chết
+	// qua restart — không thể lưu cái này mà bỏ cái kia.
 	discoveredPoolCapacity map[string]int
+	// discoveryStats: public key → thống kê THẬT từ discovery probe (KHÁC
+	// keyStats — xem noteDiscoveryResult's doc comment để biết vì sao 2 map
+	// này phải tách nhau: discovery cố tình test ở mức đồng thời cao,
+	// keyStats chỉ nên phản ánh traffic thật). Lưu đĩa cùng
+	// discoveredPoolCapacity (cùng file, cùng lúc) — đây chính là "bằng
+	// chứng" mà capacityForKeyLocked cần để biết 1 capacity đã lưu còn đáng
+	// tin hay không sau restart.
+	discoveryStats map[string]*keyStat
 	// discoveryCursor: con trỏ xoay vòng qua các nhóm key chưa được phân
 	// loại (xem nextDiscoveryCandidateLocked), để discoveryLoop rải đều việc
 	// dò qua nhiều lần chạy thay vì cứ thử đi thử lại đúng 1 nhóm.
@@ -376,6 +428,7 @@ func NewNordVPNWireGuardProvider(token string) (*NordVPNWireGuardProvider, error
 		live:                   map[int64]*wgTunnel{},
 		failedUntil:            map[string]time.Time{},
 		keyStats:               map[string]*keyStat{},
+		discoveryStats:         map[string]*keyStat{},
 		keyHostIdx:             map[string]int{},
 		discoveredPoolCapacity: map[string]int{},
 		slotsByKey:             map[string]chan struct{}{},
@@ -384,11 +437,12 @@ func NewNordVPNWireGuardProvider(token string) (*NordVPNWireGuardProvider, error
 		return nil, fmt.Errorf("nordvpn wireguard server list: %w", err)
 	}
 
-	if discovered, err := loadNordWGDiscovered(privHex); err != nil {
+	if capacity, stats, err := loadNordWGDiscovered(privHex); err != nil {
 		log.Printf("[NordVPN-WG] Warning: failed to load discovered pool cache: %v", err)
-	} else if len(discovered) > 0 {
-		p.discoveredPoolCapacity = discovered
-		log.Printf("[NordVPN-WG] Loaded %d previously-discovered pool key(s) from cache", len(discovered))
+	} else if len(capacity) > 0 {
+		p.discoveredPoolCapacity = capacity
+		p.discoveryStats = stats
+		log.Printf("[NordVPN-WG] Loaded %d previously-discovered pool key(s) from cache", len(capacity))
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -551,7 +605,10 @@ func (p *NordVPNWireGuardProvider) rankedGoodKeysLocked() []string {
 		}
 		rate := float64(st.successes) / float64(st.attempts)
 		if rate >= minSuccessRate {
-			good = append(good, scored{key, rate})
+			// Sort key is the Wilson lower bound, not the raw rate — see
+			// rank_confidence.go. Eligibility (the >= minSuccessRate gate
+			// above) still uses the raw rate, unchanged.
+			good = append(good, scored{key, wilsonLowerBound(st.successes, st.attempts)})
 		}
 	}
 	sort.Slice(good, func(i, j int) bool { return good[i].rate > good[j].rate })
@@ -657,10 +714,24 @@ func (p *NordVPNWireGuardProvider) noteFailure(hostname string) {
 	p.mu.Unlock()
 }
 
-// noteKeyResult tích luỹ 1 kết quả thật (thành công hay thất bại) vào thống
-// kê của public key đó — đây là dữ liệu bestKeyLocked dùng để quyết định key
-// nào đáng ưu tiên. Chỉ cộng dồn trong bộ nhớ suốt vòng đời tiến trình, cố
-// tình KHÔNG lưu đĩa (xem doc comment của keyStat).
+// noteKeyResult tích luỹ 1 kết quả THẬT (từ 1 lease phục vụ traffic thật,
+// gọi trong probeRound) vào thống kê của public key đó — đây là dữ liệu
+// rankedGoodKeysLocked dùng để quyết định key nào đáng ưu tiên (tên hàm cũ
+// trong comment, bestKeyLocked, đã đổi thành rankedGoodKeysLocked từ lâu).
+// Chỉ cộng dồn trong bộ nhớ suốt vòng đời tiến trình, cố tình KHÔNG lưu đĩa
+// (xem doc comment của keyStat).
+//
+// Discovery ticks (nordvpn_wireguard_discovery.go's runDiscoveryTick) do
+// NOT call this — see noteDiscoveryResult below. Trước 2026-08-19 cả 2
+// nguồn cùng ghi vào chung map này, và discovery cố tình test ở mức đồng
+// thời 10 (nordWGDiscoveryPerGroup) trong khi 1 key thường chỉ chịu được 1
+// kết nối (nordWGDefaultMaxConcurrentConns) — nghĩa là MỌI lượt discovery
+// trên 1 key thường tự ghi ra ~9 lỗi/10, cần 22+ lần thành công thật LIÊN
+// TIẾP mới gỡ được, rồi bị "đầu độc" lại ở lượt discovery kế tiếp (key
+// thường không có cơ chế "đã xác nhận bình thường, thôi test" — xem
+// nextDiscoveryCandidateLocked). Hậu quả: rankedGoodKeysLocked trên thực tế
+// chỉ có thể chứa 2 key đã hard-code sẵn (chúng được loại trừ khỏi
+// discovery), traffic thật không bao giờ tự "học" thêm được key mới nào.
 func (p *NordVPNWireGuardProvider) noteKeyResult(pubHex string, ok bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -668,6 +739,28 @@ func (p *NordVPNWireGuardProvider) noteKeyResult(pubHex string, ok bool) {
 	if !exists {
 		st = &keyStat{}
 		p.keyStats[pubHex] = st
+	}
+	st.attempts++
+	if ok {
+		st.successes++
+	}
+}
+
+// noteDiscoveryResult tích luỹ 1 kết quả từ discovery probe (không phải
+// traffic thật) vào discoveryStats — map RIÊNG, tách khỏi keyStats để
+// discovery's tự-thiết-kế "test ở mức đồng thời 10" không đầu độc thống kê
+// quyết định key nào vào rankedGoodKeysLocked (xem noteKeyResult's doc
+// comment). capacityForKeyLocked vẫn đọc CẢ 2 map — degrade check của nó
+// (hạ trust nếu traffic thật/discovery cho thấy key không còn chịu nổi
+// capacity đã biết) hợp lý ở cả 2 nguồn, chỉ có promotion (rankedGoodKeysLocked)
+// mới cần tách riêng.
+func (p *NordVPNWireGuardProvider) noteDiscoveryResult(pubHex string, ok bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	st, exists := p.discoveryStats[pubHex]
+	if !exists {
+		st = &keyStat{}
+		p.discoveryStats[pubHex] = st
 	}
 	st.attempts++
 	if ok {
@@ -753,21 +846,21 @@ func (p *NordVPNWireGuardProvider) tryOne(s wgServer) (*wgTunnel, error) {
 	return &wgTunnel{dev: dev, socks: socksSrv}, nil
 }
 
-// acquireLease tìm 1 server dùng được, thử SONG SONG nhiều ứng viên mỗi
-// vòng (nordWGProbeFanOut) và lấy cái bắt tay xong TRƯỚC TIÊN, các ứng
-// viên còn lại bị đóng ngay khi xong.
+// acquireLease tìm 1 server dùng được qua probeRound.
 //
-// Lý do đổi từ tuần tự sang song song (2026-08-04, đo trên VPS thật): tỉ lệ
-// 1 server bất kỳ dùng được khá thấp, nên thử lần lượt mỗi cái chờ tới 2s
-// khiến việc lấy 1 kết nối mất 60-80s (quan sát thật: 30-40 lượt thử liên
-// tiếp). Cùng tỉ lệ thành công đó, thử 6 cái cùng lúc cho kết quả trong
-// ~2-4s, vì thời gian mỗi vòng bị chặn bởi 1 lần timeout chứ không phải
-// cộng dồn. Đây thuần là chuyện chờ mạng (I/O), không phải tính toán, nên
-// chạy song song gần như không tốn thêm CPU — đúng ràng buộc "không được
-// chậm, ít tốn CPU".
+// CORRECTED 2026-08-19 — 2 đoạn dưới đây đã SAI so với code hiện tại, giữ
+// lại nguyên văn kèm đính chính thay vì xoá, vì lý do lịch sử vẫn hữu ích:
 //
-// Vẫn KHÔNG nhớ "server nào tốt" — xem doc của type để biết vì sao điều đó
-// không đáng tin ở NordVPN.
+//  1. "Thử SONG SONG nhiều ứng viên mỗi vòng" — ĐÚNG khi viết (2026-08-04,
+//     nordWGProbeFanOut=4 lúc đó), nhưng SAI từ 6fd800e ("Treat NordVPN
+//     WireGuard as a single-connection source"): nordWGProbeFanOut đã đổi
+//     về 1 (xem const doc — probe song song tự giết nhau trên NordVPn,
+//     đo được kết quả TỆ hơn khi tăng fan-out, ngược hẳn lý do đổi sang
+//     song song lúc đầu). acquireLease/probeRound hiện chạy TUẦN TỰ từng
+//     ứng viên 1. Đừng bật song song lại cho Nord nếu không có bằng chứng
+//     mới — đã thử, đã đo, đã revert.
+//  2. "Vẫn KHÔNG nhớ 'server nào tốt'" — cũng sai, xem đính chính ở doc
+//     comment của type (nextCandidate ưu tiên rankedGoodKeysLocked).
 func (p *NordVPNWireGuardProvider) acquireLease(ctx context.Context, emit func(string)) (Lease, error) {
 	// The old upfront "any slot free at all?" fast-fail is gone: capacity is
 	// per-key now (see nordWGPoolKeyCapacity), so "no room" can only be
@@ -815,7 +908,11 @@ func (p *NordVPNWireGuardProvider) acquireLease(ctx context.Context, emit func(s
 }
 
 // probeRound thử nordWGProbeFanOut ứng viên CÙNG LÚC và trả về tunnel đầu
-// tiên dùng được. Mọi tunnel thắng-sau bị đóng ngay lập tức — bỏ sót 1 cái
+// tiên dùng được. nordWGProbeFanOut = 1 hiện tại (xem const doc — song song
+// tự giết nhau trên Nord), nên trên thực tế đây là tuần tự từng ứng viên 1;
+// máy móc goroutine/channel dưới đây vẫn giữ nguyên để dễ bật lại fan-out >
+// 1 nếu sau này có bằng chứng ngược lại, không phải vì đang chạy song song
+// thật. Mọi tunnel thắng-sau bị đóng ngay lập tức — bỏ sót 1 cái
 // nghĩa là rò rỉ đúng kiểu đã làm hỏng cả nguồn NordVPN hôm nay (xem
 // MultiVPNProvider.Release), nên hàm này luôn dọn hết phần thừa, kể cả khi
 // tunnel về muộn sau khi đã có người thắng.
@@ -945,7 +1042,7 @@ func (p *NordVPNWireGuardProvider) Acquire(ctx context.Context, workerID int, em
 	return p.acquireLease(ctx, emit)
 }
 
-func (p *NordVPNWireGuardProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, emit func(string)) (Lease, error) {
+func (p *NordVPNWireGuardProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error) {
 	p.closeLease(oldLease.Generation)
 	if emit != nil {
 		emit("Đang đổi sang server NordVPN (WireGuard) khác…")

@@ -36,7 +36,7 @@ func (p *fixedProvider) Acquire(ctx context.Context, workerID int, emit func(str
 	return webview2bridge.Lease{URL: p.url, AcquiredAt: time.Now(), Generation: 1}, nil
 }
 
-func (p *fixedProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease webview2bridge.Lease, emit func(string)) (webview2bridge.Lease, error) {
+func (p *fixedProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease webview2bridge.Lease, kind webview2bridge.FailureKind, emit func(string)) (webview2bridge.Lease, error) {
 	if emit != nil {
 		emit("fixedProvider: cannot rotate (no server) — sleep 5s rồi reuse cùng IP")
 	}

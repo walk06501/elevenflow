@@ -50,6 +50,20 @@ type ProviderStat struct {
 	// printed elsewhere, not folded in here.
 	TotalMs int64
 	MaxMs   int64
+	// BanFailures/NetworkFailures split (Attempts-Successes) by WHY it
+	// failed — added 2026-08-19. worker.go already classifies every
+	// rotate as errUnusualActivity (ElevenLabs flagged the exit IP — not
+	// this VPN source's fault, just needs a different IP) or errTransient
+	// (dead tunnel/timeout — plausibly this source's own fault), but
+	// before this both collapsed into the same Successes/Attempts pair.
+	// During an IP-reputation event every source's rate drops together for
+	// the SAME underlying reason, which used to look identical to every
+	// source's connection quality degrading at once. Observational only —
+	// does not change qualityRankLocked's ranking math (see FailureKind's
+	// doc comment); read these two fields to tell the two apart before
+	// concluding a source itself is unhealthy.
+	BanFailures     int64
+	NetworkFailures int64
 }
 
 // providerRuntime holds the live, decision-relevant state ProviderStat
@@ -100,6 +114,20 @@ func (pr *providerRuntime) recentRate() (rate float64, n int) {
 		}
 	}
 	return float64(ok) / float64(n), n
+}
+
+// recentSuccesses counts the true values in the same window recentRate
+// reads — split out so callers that need the raw success/attempt pair (for
+// wilsonLowerBound, see rank_confidence.go) don't have to re-derive it from
+// a float rate.
+func (pr *providerRuntime) recentSuccesses() int {
+	ok := 0
+	for _, v := range pr.recent {
+		if v {
+			ok++
+		}
+	}
+	return ok
 }
 
 // MultiVPNProvider round-robins across several VPN-backed ProxyProviders
@@ -228,7 +256,7 @@ func (m *MultiVPNProvider) releaseActive(name string) {
 // recordAttempt ghi 1 kết quả thật vào cả 2 nơi: ProviderStat (cộng dồn cả
 // đời, dùng cho /health) và providerRuntime.recent (cửa sổ trượt, dùng để
 // xếp hạng — xem doc comment providerRuntime).
-func (m *MultiVPNProvider) recordAttempt(name string, ok bool, dur time.Duration) {
+func (m *MultiVPNProvider) recordAttempt(name string, ok bool, dur time.Duration, kind FailureKind) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	st, exists := m.stats[name]
@@ -243,6 +271,13 @@ func (m *MultiVPNProvider) recordAttempt(name string, ok bool, dur time.Duration
 		st.TotalMs += ms
 		if ms > st.MaxMs {
 			st.MaxMs = ms
+		}
+	} else {
+		switch kind {
+		case FailureBan:
+			st.BanFailures++
+		case FailureNetwork:
+			st.NetworkFailures++
 		}
 	}
 	m.runtimeFor(name).pushRecent(ok)
@@ -307,9 +342,10 @@ func (m *MultiVPNProvider) statsLogger() {
 				avgMs = r.st.TotalMs / r.st.Successes
 			}
 			parts = append(parts, fmt.Sprintf(
-				"%s: recent=%.0f%%(%d) lifetime=%d/%d(%.0f%%) active=%d/%d tb=%.1fs max=%.1fs",
+				"%s: recent=%.0f%%(%d) lifetime=%d/%d(%.0f%%) ban=%d net=%d active=%d/%d tb=%.1fs max=%.1fs",
 				r.name, r.recentRate*100, r.recentN,
 				r.st.Successes, r.st.Attempts, r.lifetimeRate*100,
+				r.st.BanFailures, r.st.NetworkFailures,
 				r.active, r.cap,
 				float64(avgMs)/1000, float64(r.st.MaxMs)/1000,
 			))
@@ -382,9 +418,13 @@ func (m *MultiVPNProvider) qualityRankLocked(group []ProxyProvider, explore bool
 		case n < vpnRankMinRecentSamples:
 			mid = append(mid, p)
 		case rate >= vpnRankGoodRate:
-			good = append(good, scored{p, rate})
+			// Sort key is the Wilson lower bound over the same recent
+			// window, not the raw rate — see rank_confidence.go. Bucket
+			// membership (the >= vpnRankGoodRate gate) still uses the raw
+			// rate, unchanged.
+			good = append(good, scored{p, wilsonLowerBound(rt.recentSuccesses(), n)})
 		case rate < vpnRankBadRate:
-			bad = append(bad, scored{p, rate})
+			bad = append(bad, scored{p, wilsonLowerBound(rt.recentSuccesses(), n)})
 		default:
 			mid = append(mid, p)
 		}
@@ -463,7 +503,11 @@ func (m *MultiVPNProvider) acquireFrom(ctx context.Context, workerID int, emit f
 		// ranking (rankedProviders) for a provider whose actual per-server
 		// picking is fine.
 		if !errors.Is(err, errNordWGNoSlots) {
-			m.recordAttempt(name, err == nil, time.Since(t0))
+			// FailureUnknown: a fresh Acquire() failing isn't yet classified
+			// as ban-vs-network — that distinction only exists once a lease
+			// has actually been tried against a real page load (worker.go),
+			// which is what MarkUnhealthyAndRotate below reports.
+			m.recordAttempt(name, err == nil, time.Since(t0), FailureUnknown)
 		}
 		if err != nil {
 			m.releaseActive(name)
@@ -501,10 +545,10 @@ func (m *MultiVPNProvider) Acquire(ctx context.Context, workerID int, emit func(
 // phiên TTS thật qua nó hay rớt vẫn tiếp tục được xếp "tốt" và ưu tiên
 // chọn lại — ranking hoàn toàn mù trước đúng loại thất bại mà cơ chế này
 // được dựng ra để tránh.
-func (m *MultiVPNProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, emit func(string)) (Lease, error) {
+func (m *MultiVPNProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error) {
 	if oldLease.owner != nil {
 		name := providerName(oldLease.owner)
-		m.recordAttempt(name, false, 0)
+		m.recordAttempt(name, false, 0, kind)
 		oldLease.owner.Release(workerID, oldLease)
 		m.releaseActive(name)
 	}

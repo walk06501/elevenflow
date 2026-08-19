@@ -13,7 +13,7 @@ func (f *fakeVPNProvider) Name() string { return f.name }
 func (f *fakeVPNProvider) Acquire(ctx context.Context, workerID int, emit func(string)) (Lease, error) {
 	return Lease{}, nil
 }
-func (f *fakeVPNProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, emit func(string)) (Lease, error) {
+func (f *fakeVPNProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error) {
 	return Lease{}, nil
 }
 func (f *fakeVPNProvider) Release(workerID int, lease Lease) {}
@@ -235,7 +235,7 @@ func TestMarkUnhealthyAndRotate_RecordsFailureAgainstOldProvider(t *testing.T) {
 	// provider "flaky" cấu hình, acquireFrom() sẽ acquire lại đúng "flaky"
 	// và ghi thêm 1 THÀNH CÔNG. Nên sau lệnh gọi đầy đủ: 2 attempts (1 thất
 	// bại từ chính rotate đang test + 1 thành công từ acquire kế tiếp).
-	if _, err := m.MarkUnhealthyAndRotate(context.Background(), 0, oldLease, nil); err != nil {
+	if _, err := m.MarkUnhealthyAndRotate(context.Background(), 0, oldLease, FailureNetwork, nil); err != nil {
 		t.Fatalf("MarkUnhealthyAndRotate returned unexpected error: %v", err)
 	}
 
@@ -245,6 +245,9 @@ func TestMarkUnhealthyAndRotate_RecordsFailureAgainstOldProvider(t *testing.T) {
 	}
 	if st.Attempts != 2 || st.Successes != 1 {
 		t.Fatalf("Stats()[\"flaky\"] = %+v, want 2 attempts / 1 success (1 failure recorded for the rotate itself, 1 success from the follow-up acquire)", st)
+	}
+	if st.NetworkFailures != 1 || st.BanFailures != 0 {
+		t.Fatalf("Stats()[\"flaky\"] = %+v, want the rotate's failure classified as NetworkFailures=1/BanFailures=0 (passed FailureNetwork)", st)
 	}
 
 	m.mu.Lock()

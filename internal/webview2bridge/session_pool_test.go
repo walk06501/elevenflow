@@ -15,7 +15,7 @@ type fakeProxyProvider struct{}
 func (fakeProxyProvider) Acquire(ctx context.Context, workerID int, emit func(string)) (Lease, error) {
 	return Lease{}, nil
 }
-func (fakeProxyProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, emit func(string)) (Lease, error) {
+func (fakeProxyProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error) {
 	return Lease{}, nil
 }
 func (fakeProxyProvider) Release(workerID int, lease Lease) {}

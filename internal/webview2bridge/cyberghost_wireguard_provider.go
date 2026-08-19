@@ -846,7 +846,7 @@ func (p *CyberGhostWireGuardProvider) Acquire(ctx context.Context, workerID int,
 	return p.acquireLease()
 }
 
-func (p *CyberGhostWireGuardProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, emit func(string)) (Lease, error) {
+func (p *CyberGhostWireGuardProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error) {
 	p.closeLease(oldLease.Generation)
 	if emit != nil {
 		emit("Đang đổi sang server CyberGhost khác…")

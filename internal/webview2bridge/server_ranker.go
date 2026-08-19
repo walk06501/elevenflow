@@ -101,7 +101,11 @@ func (r *serverRanker) rankedGood() []string {
 		}
 		rate := float64(st.successes) / float64(st.attempts)
 		if rate >= serverRankGoodRate {
-			good = append(good, scored{id, rate})
+			// Sort key is the Wilson lower bound, not the raw rate, so a
+			// lucky 5/5 doesn't permanently outrank a proven 190/200 — see
+			// rank_confidence.go. Eligibility (the >= serverRankGoodRate
+			// gate above) still uses the raw rate, unchanged.
+			good = append(good, scored{id, wilsonLowerBound(st.successes, st.attempts)})
 		}
 	}
 	sort.Slice(good, func(i, j int) bool { return good[i].rate > good[j].rate })

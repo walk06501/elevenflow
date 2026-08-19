@@ -333,7 +333,7 @@ func (p *ProxyxoayKeyProvider) Acquire(ctx context.Context, workerID int, emit f
 // falls back to the still-valid current lease instead of propagating it,
 // same as VPN providers do not fail a lease just because rotation itself
 // is temporarily unavailable.
-func (p *ProxyxoayKeyProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, emit func(string)) (Lease, error) {
+func (p *ProxyxoayKeyProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error) {
 	if emit == nil {
 		emit = func(string) {}
 	}

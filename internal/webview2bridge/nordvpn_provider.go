@@ -176,7 +176,7 @@ func (p *NordVPNProvider) Acquire(ctx context.Context, workerID int, emit func(s
 // MarkUnhealthyAndRotate hands back a different endpoint. oldLease isn't
 // consulted (no shared state to coalesce against — see the type doc);
 // every call simply advances to the next round-robin slot.
-func (p *NordVPNProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, emit func(string)) (Lease, error) {
+func (p *NordVPNProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error) {
 	p.mu.Lock()
 	lease, err := p.nextLease()
 	p.mu.Unlock()

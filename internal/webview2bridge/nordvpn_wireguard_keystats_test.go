@@ -39,12 +39,19 @@ func TestRankedGoodKeysLocked(t *testing.T) {
 			want: []string{"a"},
 		},
 		{
-			name: "ranks by success rate, not attempt count, highest first",
+			// Changed 2026-08-19: ranking moved from the raw ratio to the
+			// Wilson lower bound (rank_confidence.go) specifically so a
+			// large well-proven sample outranks a small lucky one. "b" has
+			// the higher raw rate (90% vs 75%) but only 10 attempts vs
+			// "a"'s 100 — Wilson's lower bound for b (~0.60) sits below a's
+			// (~0.66), so a now ranks first. Eligibility is unaffected:
+			// both still clear the 5-attempt/70% gate on their raw rate.
+			name: "ranks by confidence-adjusted rate, not raw rate — a large proven sample beats a small lucky one",
 			stats: map[string]*keyStat{
-				"a": {attempts: 100, successes: 75}, // 75%
-				"b": {attempts: 10, successes: 9},   // 90%
+				"a": {attempts: 100, successes: 75}, // 75% raw, but well-established
+				"b": {attempts: 10, successes: 9},   // 90% raw, but a small sample
 			},
-			want: []string{"b", "a"},
+			want: []string{"a", "b"},
 		},
 		{
 			name: "a key below the bar is excluded even if another qualifies",

@@ -175,7 +175,7 @@ func (p *PIAProvider) Acquire(ctx context.Context, workerID int, emit func(strin
 	return lease, nil
 }
 
-func (p *PIAProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, emit func(string)) (Lease, error) {
+func (p *PIAProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error) {
 	p.mu.Lock()
 	lease, err := p.nextLease()
 	p.mu.Unlock()

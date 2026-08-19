@@ -492,7 +492,7 @@ func (p *PIAWireGuardProvider) Acquire(ctx context.Context, workerID int, emit f
 	return p.acquireLease()
 }
 
-func (p *PIAWireGuardProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, emit func(string)) (Lease, error) {
+func (p *PIAWireGuardProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error) {
 	p.closeLease(oldLease.Generation)
 	if emit != nil {
 		emit("Đang đổi sang server PIA (WireGuard) khác…")

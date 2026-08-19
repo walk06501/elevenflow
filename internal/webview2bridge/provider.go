@@ -23,14 +23,46 @@ type ProxyProvider interface {
 	Acquire(ctx context.Context, workerID int, emit func(string)) (Lease, error)
 
 	// MarkUnhealthyAndRotate báo proxy hiện tại đã bị ElevenLabs flag
-	// (401 unusual_activity). Trả về lease mới sau khi server rotate IP.
-	// Coalesce: nhiều worker gọi gần như đồng thời chỉ trigger 1 rotation
-	// duy nhất, các worker khác nhận lease mới khi rotation xong.
-	MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, emit func(string)) (Lease, error)
+	// (401 unusual_activity) HOẶC gặp lỗi mạng/tunnel — kind phân biệt 2
+	// trường hợp đó (xem FailureKind). Trả về lease mới sau khi server
+	// rotate IP. Coalesce: nhiều worker gọi gần như đồng thời chỉ trigger 1
+	// rotation duy nhất, các worker khác nhận lease mới khi rotation xong.
+	//
+	// kind được thêm 2026-08-19: worker.go đã tự phân loại 2 loại lỗi này
+	// từ trước (BanRotates/NetworkRotates), nhưng cả 2 đều gọi
+	// MarkUnhealthyAndRotate giống hệt nhau nên phân loại đó bị vứt bỏ
+	// ngay khi qua khỏi worker.go — MultiVPNProvider.recordAttempt ghi
+	// nhận 1 "thất bại" chung, không biết là IP bị cấm (đổi IP là đủ, nguồn
+	// VPN không có lỗi) hay tunnel/mạng thật sự tệ (nên giảm ưu tiên
+	// nguồn). Chỉ MultiVPNProvider thực sự DÙNG tham số này (tách riêng 2
+	// bộ đếm trong ProviderStat, xem recordAttempt) — mọi provider khác chỉ
+	// nhận rồi bỏ qua, không đổi hành vi rotate/chọn server nội bộ của
+	// chúng.
+	MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error)
 
 	// Release báo worker không còn dùng lease (kết thúc batch / shutdown).
 	Release(workerID int, lease Lease)
 }
+
+// FailureKind phân biệt lý do MarkUnhealthyAndRotate được gọi — xem doc
+// comment của MarkUnhealthyAndRotate. Chỉ dùng cho việc GHI NHẬN/quan sát
+// (thêm 2026-08-19, S2 trong audit VPN); KHÔNG đổi cách bất kỳ provider nào
+// chọn/rotate server nội bộ — đó là quyết định tách riêng, có thể làm sau
+// khi đã có đủ số liệu ban=x/net=y thật để biết nên đổi gì.
+type FailureKind int
+
+const (
+	// FailureUnknown: caller không phân loại được (hoặc gọi từ chỗ không
+	// có ngữ cảnh lỗi cụ thể, vd cleanup/shutdown) — vẫn đếm là 1 thất bại
+	// chung như hành vi TRƯỚC 2026-08-19, không rơi vào ban hay network.
+	FailureUnknown FailureKind = iota
+	// FailureBan: ElevenLabs tự flag IP hiện tại (401 detected_unusual_activity)
+	// — không phải lỗi của nguồn VPN, chỉ cần đổi sang IP khác.
+	FailureBan
+	// FailureNetwork: tunnel chết/timeout/nav lỗi — có thể là lỗi thật của
+	// nguồn VPN đó.
+	FailureNetwork
+)
 
 // Lease là handle proxy đang gán cho 1 worker. Provider có thể attach
 // metadata (slot ID, expire time…) ngoài URL.
@@ -87,7 +119,7 @@ func (p *SharedCurrentProvider) Acquire(ctx context.Context, workerID int, emit 
 	return p.current, nil
 }
 
-func (p *SharedCurrentProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, emit func(string)) (Lease, error) {
+func (p *SharedCurrentProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error) {
 	if emit == nil {
 		emit = func(string) {}
 	}

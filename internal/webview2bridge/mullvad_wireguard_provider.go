@@ -597,7 +597,7 @@ func (p *MullvadWireGuardProvider) Acquire(ctx context.Context, workerID int, em
 	return p.acquireLease()
 }
 
-func (p *MullvadWireGuardProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, emit func(string)) (Lease, error) {
+func (p *MullvadWireGuardProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error) {
 	p.closeLease(oldLease.Generation)
 	if emit != nil {
 		emit("Đang đổi sang server Mullvad khác…")

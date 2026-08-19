@@ -274,13 +274,15 @@ func (w *worker) processChunkWithRetry(ctx context.Context, chunk Chunk) ChunkRe
 		}
 
 		reason := "kết nối bị chặn"
+		kind := FailureBan
 		if errors.Is(err, errUnusualActivity) {
 			res.BanRotates++
 		} else {
 			reason = "mạng không ổn"
+			kind = FailureNetwork
 			res.NetworkRotates++
 		}
-		if rotateErr := w.rotateAndRespawn(ctx, chunk.ID, reason); rotateErr != nil {
+		if rotateErr := w.rotateAndRespawn(ctx, chunk.ID, reason, kind); rotateErr != nil {
 			res.Message = rotateErr.Error()
 			res.DurationMs = time.Since(chunkStart).Milliseconds()
 			return res
@@ -294,13 +296,13 @@ func (w *worker) processChunkWithRetry(ctx context.Context, chunk Chunk) ChunkRe
 // rotateAndRespawn: teardown WV2 → đợi IP mới (RotateWithWait, đến 60s) →
 // respawn. Trả error khi rotate fail hoặc spawn fail (lúc đó worker.chromium
 // = nil, run() loop sẽ exit để worker khác xử lý chunks còn lại).
-func (w *worker) rotateAndRespawn(ctx context.Context, chunkID int, reason string) error {
+func (w *worker) rotateAndRespawn(ctx context.Context, chunkID int, reason string, kind FailureKind) error {
 	w.emit(w.id, chunkID, "rotate",
 		fmt.Sprintf("Đang đổi kết nối (%s)…", reason),
 		-1, w.total())
 	w.teardownWebView2()
 	oldLease := w.currentLease
-	newLease, rotErr := w.pool.proxyProvider.MarkUnhealthyAndRotate(ctx, w.id, oldLease, func(msg string) {
+	newLease, rotErr := w.pool.proxyProvider.MarkUnhealthyAndRotate(ctx, w.id, oldLease, kind, func(msg string) {
 		w.emit(w.id, chunkID, "rotate",
 			msg, -1, w.total())
 	})

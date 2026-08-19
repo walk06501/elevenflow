@@ -194,7 +194,7 @@ func (p *PoolProvider) acquireSharedLuna(ctx context.Context, workerID int, emit
 // MarkUnhealthyAndRotate: release lease cũ (banned=true → key vào cooldown
 // server-side) + lease key khác (excludeURL = oldLease.URL → server không
 // cấp lại cùng key cho đến khi pool xoay vòng đến nó).
-func (p *PoolProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, emit func(string)) (Lease, error) {
+func (p *PoolProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error) {
 	if emit == nil {
 		emit = func(string) {}
 	}

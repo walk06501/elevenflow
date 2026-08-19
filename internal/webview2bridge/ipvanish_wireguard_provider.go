@@ -224,7 +224,7 @@ func (p *IPVanishWireGuardProvider) Acquire(ctx context.Context, workerID int, e
 	return p.acquireLease()
 }
 
-func (p *IPVanishWireGuardProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, emit func(string)) (Lease, error) {
+func (p *IPVanishWireGuardProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error) {
 	p.closeLease(oldLease.Generation)
 	if emit != nil {
 		emit("Đang đổi sang server IPVanish khác…")

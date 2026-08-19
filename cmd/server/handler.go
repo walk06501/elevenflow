@@ -494,11 +494,13 @@ func (h *Handler) HandleHealth(w http.ResponseWriter, r *http.Request) {
 				avgMs = st.TotalMs / st.Successes
 			}
 			vpnStats[name] = map[string]any{
-				"attempts":     st.Attempts,
-				"successes":    st.Successes,
-				"success_rate": rate,
-				"avg_ms":       avgMs,
-				"max_ms":       st.MaxMs,
+				"attempts":         st.Attempts,
+				"successes":        st.Successes,
+				"success_rate":     rate,
+				"avg_ms":           avgMs,
+				"max_ms":           st.MaxMs,
+				"ban_failures":     st.BanFailures,
+				"network_failures": st.NetworkFailures,
 			}
 		}
 		resp["vpn_provider_stats"] = vpnStats

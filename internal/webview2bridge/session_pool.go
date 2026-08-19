@@ -677,7 +677,7 @@ func (sp *SessionPool) sessionLoop(id int, bigOnly bool) {
 					spawnErr = job.ctx.Err()
 				}
 			case probeLeaseAlive(w.currentLease, 6*time.Second) != nil:
-				spawnErr = w.rotateAndRespawn(job.ctx, job.chunk.ID, "kết nối rảnh lâu đã hết hạn")
+				spawnErr = w.rotateAndRespawn(job.ctx, job.chunk.ID, "kết nối rảnh lâu đã hết hạn", FailureUnknown)
 			default:
 				spawnErr = w.spawnWebView2WithRetry(job.ctx, 3)
 			}

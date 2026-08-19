@@ -46,18 +46,19 @@ const (
 	// nordWGDiscoveryPromoteBar: deliberately STRICTER than cmd/scanwgpools's
 	// own ">=5/10" bar (the one au569 was hand-accepted at) — not a style
 	// choice, a correctness requirement. Every discovery test result also
-	// feeds THIS process's own keyStats via noteKeyResult, the same stats
-	// capacityForKeyLocked checks to decide whether to keep trusting a
-	// promotion (>=5 attempts and >=70% success, see that function). A
-	// batch promoted at exactly 5 or 6 out of 10 (50-60%) would satisfy the
-	// promotion bar but immediately FAIL the 70% trust bar on the very next
-	// capacityForKeyLocked call — using those same 10 attempts — silently
-	// demoting itself back to the default a moment after being promoted.
-	// Requiring >=7/10 here means a promotion can never immediately
-	// self-invalidate this way. cmd/scanwgpools itself has no such
-	// constraint (a separate one-off process, its results never touch any
-	// running server's keyStats), which is why its own bar can afford to be
-	// looser and why au569 (5/10) was still fine to accept there by hand.
+	// feeds THIS process's own discoveryStats via noteDiscoveryResult, which
+	// capacityForKeyLocked reads (combined with keyStats) to decide whether
+	// to keep trusting a promotion (>=5 combined attempts and >=70% success,
+	// see that function). A batch promoted at exactly 5 or 6 out of 10
+	// (50-60%) would satisfy the promotion bar but immediately FAIL the 70%
+	// trust bar on the very next capacityForKeyLocked call — using those
+	// same 10 attempts — silently demoting itself back to the default a
+	// moment after being promoted. Requiring >=7/10 here means a promotion
+	// can never immediately self-invalidate this way. cmd/scanwgpools itself
+	// has no such constraint (a separate one-off process, its results never
+	// touch any running server's stats), which is why its own bar can
+	// afford to be looser and why au569 (5/10) was still fine to accept
+	// there by hand.
 	nordWGDiscoveryPromoteBar = 7
 )
 
@@ -80,45 +81,84 @@ func nordWGDiscoveryPath(privHex string) string {
 	return filepath.Join(".", fmt.Sprintf("nordvpn_discovered_pools_%x.json", sum[:6]))
 }
 
+// nordWGDiscoveredEntry carries a capacity claim TOGETHER WITH the evidence
+// behind it (Attempts/Successes, from discoveryStats). Added 2026-08-19,
+// same day as the original persistence fix: the first version of this
+// struct only had Key/Capacity — persisting the claim without the evidence
+// broke capacityForKeyLocked's own documented guarantee ("can only get more
+// conservative, never silently keep trusting a stale number"), because a
+// key demoted by live traffic between saves would reload at full capacity
+// with an empty stats map on the next restart. Mirrors the lesson from
+// mullvad_wireguard_provider.go's key persistence: persist a claim and the
+// evidence for it together, or persist neither.
 type nordWGDiscoveredEntry struct {
-	Key      string `json:"key"`
-	Capacity int    `json:"capacity"`
+	Key       string `json:"key"`
+	Capacity  int    `json:"capacity"`
+	Attempts  int    `json:"attempts"`
+	Successes int    `json:"successes"`
 }
 
-// loadNordWGDiscovered reads a previously-saved discovery cache. A missing
-// file (first run, or an account never scanned before) is not an error —
-// returns nil, nil so the caller starts from an empty map exactly like
-// before this fix existed.
-func loadNordWGDiscovered(privHex string) (map[string]int, error) {
+// loadNordWGDiscovered reads a previously-saved discovery cache, returning
+// the capacity map (for discoveredPoolCapacity) and the evidence map (for
+// discoveryStats) together — always load both or neither, never one without
+// the other. A missing file (first run, or an account never scanned before)
+// is not an error — returns nil, nil, nil so the caller starts from empty
+// maps exactly like before this fix existed.
+func loadNordWGDiscovered(privHex string) (map[string]int, map[string]*keyStat, error) {
 	path := nordWGDiscoveryPath(privHex)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, err
+		return nil, nil, err
 	}
 	var saved []nordWGDiscoveredEntry
 	if err := json.Unmarshal(data, &saved); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
+		return nil, nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	out := make(map[string]int, len(saved))
+	capacity := make(map[string]int, len(saved))
+	stats := make(map[string]*keyStat, len(saved))
 	for _, s := range saved {
-		if s.Key != "" && s.Capacity > 0 {
-			out[s.Key] = s.Capacity
+		if s.Key == "" || s.Capacity <= 0 {
+			continue
 		}
+		if s.Attempts <= 0 {
+			// No evidence backs this claim — either a leftover file from
+			// the OLD version of this fix (2026-08-19, same day: shipped
+			// once with Key/Capacity only, before Attempts/Successes were
+			// added a few hours later) or a hand-edited/corrupted entry.
+			// Skip it entirely rather than loading a capacity with nothing
+			// to degrade-check against — capacityForKeyLocked's guard only
+			// fires at attempts>=5, so an Attempts=0 entry would otherwise
+			// be trusted unconditionally, silently reproducing the exact
+			// bug this persistence format was just changed to prevent.
+			// Discovery will naturally re-test this key group later.
+			continue
+		}
+		capacity[s.Key] = s.Capacity
+		stats[s.Key] = &keyStat{attempts: s.Attempts, successes: s.Successes}
 	}
-	return out, nil
+	return capacity, stats, nil
 }
 
-// saveNordWGDiscovered persists the full current discovery map, overwriting
-// whatever was there before — called after every new promotion so the next
-// restart resumes with everything found so far instead of only the latest
-// single result.
-func saveNordWGDiscovered(privHex string, m map[string]int) error {
-	saved := make([]nordWGDiscoveredEntry, 0, len(m))
-	for k, v := range m {
-		saved = append(saved, nordWGDiscoveredEntry{Key: k, Capacity: v})
+// saveNordWGDiscovered persists the full current discovery map — capacity
+// AND its backing evidence, zipped together by key — overwriting whatever
+// was there before. Called after every new promotion so the next restart
+// resumes with everything found so far instead of only the latest single
+// result. Entries with no matching stats (should not normally happen, since
+// a promotion always writes both maps under the same lock) are written with
+// Attempts=0 rather than dropped, so a load-then-immediately-degrade is the
+// fail-safe direction, not a load-then-trust-forever one.
+func saveNordWGDiscovered(privHex string, capacity map[string]int, stats map[string]*keyStat) error {
+	saved := make([]nordWGDiscoveredEntry, 0, len(capacity))
+	for k, v := range capacity {
+		entry := nordWGDiscoveredEntry{Key: k, Capacity: v}
+		if st, ok := stats[k]; ok {
+			entry.Attempts = st.attempts
+			entry.Successes = st.successes
+		}
+		saved = append(saved, entry)
 	}
 	data, err := json.MarshalIndent(saved, "", "  ")
 	if err != nil {
@@ -197,7 +237,22 @@ func (p *NordVPNWireGuardProvider) runDiscoveryTick() {
 	}
 	for i := 0; i < len(candidates); i++ {
 		ok := <-results
-		p.noteKeyResult(key, ok) // same live stats normal traffic feeds — capacityForKeyLocked's degrade check applies to discovered keys too, not just the hand-curated ones
+		// noteDiscoveryResult, NOT noteKeyResult — this batch deliberately
+		// tests at concurrency nordWGDiscoveryPerGroup (10) to see if the
+		// key is secretly a pool, but an ORDINARY key (the common case) can
+		// only sustain nordWGDefaultMaxConcurrentConns (1) by design. Ten
+		// results from one tick would bank ~9 failures against an ordinary
+		// key in the SAME map rankedGoodKeysLocked reads for promotion —
+		// see noteKeyResult's doc comment for the full incident this caused
+		// (fixed 2026-08-19): real traffic could then never promote that
+		// key, needing 22+ consecutive real successes to outweigh one
+		// discovery tick, which itself re-runs periodically. discoveryStats
+		// is a separate map so this test's own by-design overload never
+		// contaminates the statistics real single-connection traffic relies
+		// on — capacityForKeyLocked still reads both (combined) for its
+		// degrade check, which is the one place discovery evidence SHOULD
+		// count.
+		p.noteDiscoveryResult(key, ok)
 		if ok {
 			okCount++
 		}
@@ -212,13 +267,18 @@ func (p *NordVPNWireGuardProvider) runDiscoveryTick() {
 	if okCount > p.discoveredPoolCapacity[key] {
 		p.discoveredPoolCapacity[key] = okCount
 	}
-	snapshot := make(map[string]int, len(p.discoveredPoolCapacity))
+	capSnapshot := make(map[string]int, len(p.discoveredPoolCapacity))
 	for k, v := range p.discoveredPoolCapacity {
-		snapshot[k] = v
+		capSnapshot[k] = v
+	}
+	statsSnapshot := make(map[string]*keyStat, len(p.discoveryStats))
+	for k, st := range p.discoveryStats {
+		cp := *st
+		statsSnapshot[k] = &cp
 	}
 	p.mu.Unlock()
 	log.Printf("[NordVPN-WG] Discovery: key %s... (%d hosts, vd %s) — %d/%d concurrent — NEW POOL FOUND, capacity promoted to %d", key[:12], len(hosts), candidates[0].hostname, okCount, len(candidates), okCount)
-	if err := saveNordWGDiscovered(p.privHex, snapshot); err != nil {
+	if err := saveNordWGDiscovered(p.privHex, capSnapshot, statsSnapshot); err != nil {
 		log.Printf("[NordVPN-WG] Warning: failed to persist discovered pool cache: %v", err)
 	}
 }
