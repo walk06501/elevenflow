@@ -169,10 +169,13 @@ type serverPick struct {
 func runTunnel(idx int, privHex string, s serverPick, hold time.Duration) tunnelResult {
 	res := tunnelResult{idx: idx, hostname: s.hostname}
 
+	// MTU/DNS kept in sync by hand with nordvpn_wireguard_provider.go's
+	// tryOne — see that file's 2026-08-19 comment for why 1280 (not the
+	// WireGuard-generic 1420) and the second DNS server.
 	tun, tnet, err := netstack.CreateNetTUN(
 		[]netip.Addr{netip.MustParseAddr("10.5.0.2")},
-		[]netip.Addr{netip.MustParseAddr("103.86.96.100")},
-		1420,
+		[]netip.Addr{netip.MustParseAddr("103.86.96.100"), netip.MustParseAddr("103.86.99.100")},
+		1280,
 	)
 	if err != nil {
 		res.err = fmt.Errorf("create tun: %w", err)
