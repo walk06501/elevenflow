@@ -402,6 +402,24 @@ func main() {
 		if numSessions <= 0 {
 			numSessions = cfg.MaxConcurrent * cfg.MaxWorkers
 		}
+		// Cap sessions to the number of proxyxoay keys actually available —
+		// operator's call, 2026-08-18: each key backs roughly 1 real
+		// concurrent identity (see proxyxoay_provider.go's doc comment), so
+		// opening more WebView2 windows than that just piles multiple
+		// windows onto the SAME underlying IP, which is exactly what caused
+		// the ban-rotate storms that got ElevenLabs pulled offline earlier
+		// today. cfg.MaxConcurrent (ELEVEN_MAX_CONCURRENT) stays the hard
+		// ceiling (15 today) — this only ever SHRINKS numSessions when
+		// fewer keys than that are configured, never raises it. Only
+		// meaningful while proxyxoay is the dominant/only source; if VPN
+		// accounts (NordVPN/PIA/...) are re-enabled alongside it, this cap
+		// should be revisited since those round-robin across many more
+		// real IPs than 1-per-key.
+		if len(proxyxoayAccounts) > 0 && len(proxyxoayAccounts) < numSessions {
+			log.Printf("SessionPool: capping %d -> %d sessions to match %d active proxyxoay key(s)",
+				numSessions, len(proxyxoayAccounts), len(proxyxoayAccounts))
+			numSessions = len(proxyxoayAccounts)
+		}
 		sp, err := webview2bridge.NewSessionPool(webview2bridge.SessionPoolConfig{
 			NumSessions:    numSessions,
 			Provider:       vpnProvider,
