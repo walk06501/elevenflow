@@ -673,10 +673,27 @@ func (p *NordVPNWireGuardProvider) noteKeyResult(pubHex string, ok bool) {
 // one real HTTP round trip. The handshake alone isn't proof enough — see
 // the type doc for why a completed handshake can still be a dead end.
 func (p *NordVPNWireGuardProvider) tryOne(s wgServer) (*wgTunnel, error) {
+	// MTU 1420 (WireGuard's generic default) → 1280, and a second DNS
+	// server, 2026-08-19: cross-checked against several public NordVPN
+	// WireGuard client implementations on GitHub. tis24dev/NordVPN-Easy-
+	// OpenWrt (has real CI) documents that the official NordVPN app itself
+	// pins NordLynx's MTU to 1280 specifically to avoid "PMTUD blackholes"
+	// on paths with extra encapsulation (PPPoE/IPv6/double-NAT) — routers
+	// silently drop oversized packets instead of returning the ICMP
+	// "fragmentation needed" that would let the OS negotiate down. Since
+	// this provider is a raw netstack.CreateNetTUN with no OS-level PMTUD,
+	// a too-high MTU here fails exactly the way this file's own doc
+	// comment already describes: handshake completes and a small HTTP GET
+	// succeeds (fits under any MTU), but WebView2's real page loads
+	// (larger TLS/JS payloads) hang — previously attributed entirely to
+	// the "1 data path per account" limit, but the two symptoms are not
+	// mutually exclusive and this one is cheap to rule out. DNS pair
+	// 103.86.96.100/103.86.99.100 confirmed by two independent repos
+	// (wgnord and NordVPN-Easy-OpenWrt) as NordVPN's own resolvers.
 	tun, tnet, err := netstack.CreateNetTUN(
 		[]netip.Addr{netip.MustParseAddr("10.5.0.2")},
-		[]netip.Addr{netip.MustParseAddr("103.86.96.100")},
-		1420,
+		[]netip.Addr{netip.MustParseAddr("103.86.96.100"), netip.MustParseAddr("103.86.99.100")},
+		1280,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create tun: %w", err)
