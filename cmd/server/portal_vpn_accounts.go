@@ -119,6 +119,11 @@ func envVPNAccounts(cfg *Config) map[string][]portalVPNAccount {
 			Provider: "cyberghost", Label: "cyberghost (.env)", Username: cfg.CyberGhostUsername, Secret: cfg.CyberGhostPassword,
 		})
 	}
+	if cfg.IPVanishSocksUsername != "" && cfg.IPVanishSocksPassword != "" {
+		grouped["ipvanish_socks5"] = append(grouped["ipvanish_socks5"], portalVPNAccount{
+			Provider: "ipvanish_socks5", Label: "ipvanish socks5 (.env)", Username: cfg.IPVanishSocksUsername, Secret: cfg.IPVanishSocksPassword,
+		})
+	}
 	return grouped
 }
 

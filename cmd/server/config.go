@@ -93,6 +93,33 @@ type Config struct {
 	CyberGhostPassword  string // ELEVEN_CYBERGHOST_PASSWORD
 	CyberGhostWireGuard bool   // ELEVEN_CYBERGHOST_WIREGUARD
 
+	// IPVanishSocksUsername/IPVanishSocksPassword: the SOCKS5 proxy
+	// credentials from the account dashboard's "SOCKS5 Proxy" page (a
+	// "Reset Credentials" button, NOT the account login) — see
+	// ipvanish_socks5_provider.go's doc comment. Always-on once set (no
+	// *WireGuard-style opt-in flag): unlike the WireGuard sources this is a
+	// plain SOCKS5 client, not a heavy tunnel, and was confirmed working
+	// live before being wired in.
+	IPVanishSocksUsername string // ELEVEN_IPVANISH_SOCKS_USERNAME
+	IPVanishSocksPassword string // ELEVEN_IPVANISH_SOCKS_PASSWORD
+
+	// FakeFingerprint: kill-switch cho webview2bridge.FakeFingerprintEnabled
+	// (per-window random UA/window-size/lang + wiring stealthScript's
+	// AddScriptToExecuteOnDocumentCreated, xem fingerprint.go's doc comment
+	// cho lý do). Default true (bật). Set false trong .env + restart (KHÔNG
+	// cần rebuild exe) nếu tỉ lệ pass hCaptcha tụt sau khi lên bản có đổi
+	// này — quay lại đúng hành vi cũ trước 2026-08-21 (UA thật của máy, cửa
+	// sổ cố định 1280x800, stealthScript im lặng như từ trước giờ).
+	FakeFingerprint bool // ELEVEN_FAKE_FINGERPRINT (default true)
+
+	// ExtraVPNSessions: khi proxyxoay VÀ ít nhất 1 nguồn VPN khác (NordVPN/
+	// PIA/...) cùng active, cộng thêm bấy nhiêu session vào cap (xem
+	// main.go's SessionPool sizing — trước đây cap CHỈ tính theo số key
+	// proxyxoay, bỏ qua hoàn toàn sức chứa của các nguồn VPN khác đang bật
+	// cùng lúc). Operator's call 2026-08-22: 5 (tổng 5 proxyxoay + 5 phần
+	// còn lại = 10 cửa sổ khi có ít nhất 1 nguồn VPN khác bật cùng).
+	ExtraVPNSessions int // ELEVEN_EXTRA_VPN_SESSIONS (default 5)
+
 	// UsePersistentPool switches HandleSynthesize from the old per-request
 	// spawn-then-teardown Run() to webview2bridge.SessionPool — a fixed set
 	// of WebView2 sessions kept warm and reused ACROSS requests, only
@@ -141,6 +168,20 @@ type Config struct {
 	// flag; stop the task and run the .exe directly from an interactive
 	// PowerShell/terminal to actually see windows.
 	PersistentPoolVisible bool // ELEVEN_PERSISTENT_POOL_VISIBLE
+
+	// PersistentPoolPrewarm: chủ động acquire VPN + mở WebView2 cho mỗi
+	// session NGAY lúc server khởi động, thay vì đợi job thật đầu tiên của
+	// session đó (xem webview2bridge.SessionPoolConfig.PrewarmOnStart doc
+	// comment). Bật vì lý do thật quan sát được 2026-08-22: log VPS cho thấy
+	// việc tìm server NordVPN khả dụng xảy ra giữa chừng job đầu tiên của
+	// khách, nhìn "chậm" dù chỉ là 1 lần cold-start bình thường — dời chi phí
+	// đó sang lúc khởi động (không ai đang chờ) thay vì loại bỏ được nó.
+	// Default true: đổi lấy CPU/RAM cao hơn lúc server vừa khởi động (tới
+	// NumSessions tunnel/cửa sổ mở song song, xếp hàng qua coldStartSem) để
+	// job thật không bao giờ phải trả giá cold-start nữa sau khi server đã
+	// chạy ổn định. Set "false" trong .env + restart để quay lại hành vi lazy
+	// cũ nếu chi phí CPU/RAM lúc khởi động trở thành vấn đề thật.
+	PersistentPoolPrewarm bool // ELEVEN_PERSISTENT_POOL_PREWARM (default true)
 }
 
 func loadEnvFile(path string) {
@@ -168,39 +209,44 @@ func loadEnvFile(path string) {
 func LoadConfig() *Config {
 	loadEnvFile(".env")
 	return &Config{
-		Port:                 getEnv("ELEVEN_SERVER_PORT", "8080"),
-		Secret:               getEnv("ELEVEN_SERVER_SECRET", ""),
-		MaxWorkers:           getEnvInt("ELEVEN_MAX_WORKERS", 1),
-		MaxConcurrent:        getEnvInt("ELEVEN_MAX_CONCURRENT", 50),
-		OutputDir:            getEnv("ELEVEN_OUTPUT_DIR", "./output"),
-		ChunkMaxChars:        getEnvInt("ELEVEN_CHUNK_MAX_CHARS", 600),
-		ServerURL:            getEnv("ELEVENFLOW_SERVER_URL", proxyserver.DefaultServerURL),
-		AppSecret:            getEnv("ELEVENFLOW_APP_SECRET", proxyserver.DefaultAppSecret),
-		UserEmail:            getEnv("ELEVEN_USER_EMAIL", ""),
-		UserPassword:         getEnv("ELEVEN_USER_PASSWORD", ""),
-		PortalAPIURL:         getEnv("ELEVEN_PORTAL_API_URL", ""),
-		NordVPNToken:         getEnv("ELEVEN_NORDVPN_TOKEN", ""),
-		NordVPNTokens:        getEnvTokenList("ELEVEN_NORDVPN_TOKENS", getEnv("ELEVEN_NORDVPN_TOKEN", "")),
-		PIAUsername:          getEnv("ELEVEN_PIA_USERNAME", ""),
-		PIAPassword:          getEnv("ELEVEN_PIA_PASSWORD", ""),
-		NordVPNWireGuard:     getEnv("ELEVEN_NORDVPN_WIREGUARD", "") == "true",
-		PIAWireGuard:         getEnv("ELEVEN_PIA_WIREGUARD", "") == "true",
-		SurfsharkKey:         getEnv("ELEVEN_SURFSHARK_PRIVATE_KEY", ""),
-		ProtonUsername:       getEnv("ELEVEN_PROTON_USERNAME", ""),
-		ProtonPassword:       getEnv("ELEVEN_PROTON_PASSWORD", ""),
-		ProtonWireGuard:      getEnv("ELEVEN_PROTON_WIREGUARD", "") == "true",
-		MullvadAccountNumber: getEnv("ELEVEN_MULLVAD_ACCOUNT", ""),
-		MullvadWireGuard:     getEnv("ELEVEN_MULLVAD_WIREGUARD", "") == "true",
-		IPVanishWireGuard:    getEnv("ELEVEN_IPVANISH_WIREGUARD", "") == "true",
-		CyberGhostUsername:   getEnv("ELEVEN_CYBERGHOST_USERNAME", ""),
-		CyberGhostPassword:   getEnv("ELEVEN_CYBERGHOST_PASSWORD", ""),
-		CyberGhostWireGuard:  getEnv("ELEVEN_CYBERGHOST_WIREGUARD", "") == "true",
+		Port:                  getEnv("ELEVEN_SERVER_PORT", "8080"),
+		Secret:                getEnv("ELEVEN_SERVER_SECRET", ""),
+		MaxWorkers:            getEnvInt("ELEVEN_MAX_WORKERS", 1),
+		MaxConcurrent:         getEnvInt("ELEVEN_MAX_CONCURRENT", 50),
+		OutputDir:             getEnv("ELEVEN_OUTPUT_DIR", "./output"),
+		ChunkMaxChars:         getEnvInt("ELEVEN_CHUNK_MAX_CHARS", 600),
+		ServerURL:             getEnv("ELEVENFLOW_SERVER_URL", proxyserver.DefaultServerURL),
+		AppSecret:             getEnv("ELEVENFLOW_APP_SECRET", proxyserver.DefaultAppSecret),
+		UserEmail:             getEnv("ELEVEN_USER_EMAIL", ""),
+		UserPassword:          getEnv("ELEVEN_USER_PASSWORD", ""),
+		PortalAPIURL:          getEnv("ELEVEN_PORTAL_API_URL", ""),
+		NordVPNToken:          getEnv("ELEVEN_NORDVPN_TOKEN", ""),
+		NordVPNTokens:         getEnvTokenList("ELEVEN_NORDVPN_TOKENS", getEnv("ELEVEN_NORDVPN_TOKEN", "")),
+		PIAUsername:           getEnv("ELEVEN_PIA_USERNAME", ""),
+		PIAPassword:           getEnv("ELEVEN_PIA_PASSWORD", ""),
+		NordVPNWireGuard:      getEnv("ELEVEN_NORDVPN_WIREGUARD", "") == "true",
+		PIAWireGuard:          getEnv("ELEVEN_PIA_WIREGUARD", "") == "true",
+		SurfsharkKey:          getEnv("ELEVEN_SURFSHARK_PRIVATE_KEY", ""),
+		ProtonUsername:        getEnv("ELEVEN_PROTON_USERNAME", ""),
+		ProtonPassword:        getEnv("ELEVEN_PROTON_PASSWORD", ""),
+		ProtonWireGuard:       getEnv("ELEVEN_PROTON_WIREGUARD", "") == "true",
+		MullvadAccountNumber:  getEnv("ELEVEN_MULLVAD_ACCOUNT", ""),
+		IPVanishSocksUsername: getEnv("ELEVEN_IPVANISH_SOCKS_USERNAME", ""),
+		IPVanishSocksPassword: getEnv("ELEVEN_IPVANISH_SOCKS_PASSWORD", ""),
+		FakeFingerprint:       getEnv("ELEVEN_FAKE_FINGERPRINT", "true") != "false",
+		ExtraVPNSessions:      getEnvInt("ELEVEN_EXTRA_VPN_SESSIONS", 5),
+		MullvadWireGuard:      getEnv("ELEVEN_MULLVAD_WIREGUARD", "") == "true",
+		IPVanishWireGuard:     getEnv("ELEVEN_IPVANISH_WIREGUARD", "") == "true",
+		CyberGhostUsername:    getEnv("ELEVEN_CYBERGHOST_USERNAME", ""),
+		CyberGhostPassword:    getEnv("ELEVEN_CYBERGHOST_PASSWORD", ""),
+		CyberGhostWireGuard:   getEnv("ELEVEN_CYBERGHOST_WIREGUARD", "") == "true",
 
 		UsePersistentPool:              getEnv("ELEVEN_PERSISTENT_POOL", "") == "true",
 		PersistentPoolSessions:         getEnvInt("ELEVEN_PERSISTENT_POOL_SESSIONS", 0),
 		PersistentPoolIdleCloseSeconds: getEnvInt("ELEVEN_PERSISTENT_POOL_IDLE_CLOSE_SECONDS", 180),
 		PersistentPoolDataRoot:         getEnv("ELEVEN_PERSISTENT_POOL_DATA_ROOT", defaultPersistentPoolDataRoot()),
 		PersistentPoolVisible:          getEnv("ELEVEN_PERSISTENT_POOL_VISIBLE", "") == "true",
+		PersistentPoolPrewarm:          getEnv("ELEVEN_PERSISTENT_POOL_PREWARM", "true") != "false",
 	}
 }
 

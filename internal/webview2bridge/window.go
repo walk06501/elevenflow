@@ -140,9 +140,12 @@ func ensureWindowClass() error {
 	return classErr
 }
 
-// createHiddenWindow tạo 1 popup window 1280x800. visible=true để debug
-// (xem hCaptcha challenge nếu Cloudflare bật challenge thực tế).
-func createHiddenWindow(visible bool) (windows.Handle, error) {
+// createHiddenWindow tạo 1 popup window kích thước width x height (xem
+// fingerprint.go's randomFingerprint — trước đây cố định 1280x800 cho MỌI
+// cửa sổ, nay đổi theo từng lần spawn để tránh mọi phiên trông giống hệt
+// nhau bất kể IP/proxy khác nhau). visible=true để debug (xem hCaptcha
+// challenge nếu Cloudflare bật challenge thực tế).
+func createHiddenWindow(visible bool, width, height int) (windows.Handle, error) {
 	if err := ensureWindowClass(); err != nil {
 		return 0, err
 	}
@@ -156,7 +159,7 @@ func createHiddenWindow(visible bool) (windows.Handle, error) {
 		uintptr(unsafe.Pointer(classNamePtr)),
 		uintptr(unsafe.Pointer(titlePtr)),
 		uintptr(wsPopup),
-		0, 0, 1280, 800,
+		0, 0, uintptr(width), uintptr(height),
 		0, 0, hInstance, 0,
 	)
 	if hwnd == 0 {

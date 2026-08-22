@@ -616,7 +616,9 @@ func (w *worker) spawnWebView2() error {
 	}
 	w.localProxy = lp
 
-	hwnd, err := createHiddenWindow(w.visible)
+	fp := randomFingerprint()
+
+	hwnd, err := createHiddenWindow(w.visible, fp.width, fp.height)
 	if err != nil {
 		_ = lp.Close()
 		w.localProxy = nil
@@ -642,6 +644,15 @@ func (w *worker) spawnWebView2() error {
 		"--disable-renderer-backgrounding",
 		"--disable-background-timer-throttling",
 	}
+	// fp (fingerprint.go): mỗi cửa sổ 1 UA/ngôn ngữ khác nhau trong 1 dải
+	// hợp lý — trước đây mọi cửa sổ (dù bao nhiêu IP khác nhau) dùng chung
+	// đúng 1 UA thật của máy, dễ bị soi tương quan. Rỗng khi
+	// ELEVEN_FAKE_FINGERPRINT=false (staticFingerprint) → giữ nguyên UA
+	// thật của máy như hành vi gốc, không thêm flag.
+	if fp.userAgent != "" {
+		chromium.AdditionalBrowserArgs = append(chromium.AdditionalBrowserArgs,
+			"--user-agent="+fp.userAgent, "--lang="+fp.lang)
+	}
 	chromium.SetErrorCallback(func(e error) {
 		_ = e
 		w.emit(w.id, -1, "error",
@@ -661,6 +672,21 @@ func (w *worker) spawnWebView2() error {
 		return fmt.Errorf("Embed failed")
 	}
 	chromium.Resize()
+	// stealthScript (stealth.go) was defined but never wired up anywhere in
+	// this codebase — AddScriptToExecuteOnDocumentCreated had never been
+	// called, so every one of its patches (webdriver flag, WebGL
+	// vendor/renderer, plugins, chrome.runtime, hardwareConcurrency,
+	// deviceMemory, languages, outerWidth/Height, permissions) was dead code
+	// this whole time. Init() registers it to run before every future
+	// document (including hCaptcha's iframe and any SPA navigation inside
+	// this session), same as how a real extension's content script would
+	// run — must come after Embed() since e.webview is nil until then
+	// (unlike Eval, Init has no nil guard). Gated behind the same kill
+	// switch as the rest of fingerprint.go (see FakeFingerprintEnabled's
+	// doc comment) — untested against real hCaptcha until watched live.
+	if FakeFingerprintEnabled {
+		chromium.Init(stealthScript)
+	}
 
 	// Pin cấu trúc Chromium để Go GC không move/free các COM event handler
 	// đã pass sang native (Go 1.26 cgo callback + WV2 IPC nhiều iframe →

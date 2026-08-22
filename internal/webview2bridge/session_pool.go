@@ -146,6 +146,32 @@ type SessionPoolConfig struct {
 	// đây là dải sàn tối thiểu đảm bảo job lớn luôn có chỗ, dù job nhỏ có
 	// dồn tới đâu. 0 → mặc định defaultBigJobReservedSessions.
 	BigJobReservedSessions int
+
+	// PrewarmOnStart: nếu true, mỗi session chủ động acquireProxyAndSpawn
+	// (VPN handshake mới + mở WebView2) ngay khi sessionLoop khởi động, thay
+	// vì đợi job THẬT đầu tiên (hành vi mặc định trước đây — xem doc comment
+	// NewSessionPool). Đánh đổi: có thể tới NumSessions VPN tunnel + cửa sổ
+	// Chromium mở sẵn dù chưa có traffic (tốn CPU/RAM liên tục), đổi lấy
+	// việc dời chi phí cold-start (~45-90s, quan sát thật 2026-08-22 qua log
+	// VPS — tìm server NordVPN khả dụng giữa chừng 1 job) từ "ngay trong job
+	// đầu tiên của 1 khách hàng thật đang chờ" sang "lúc server khởi động,
+	// không ai đang đợi". Dùng chung coldStartSem nên không tái tạo đúng cú
+	// dồn tải (thundering herd) mà semaphore đó vốn dựng để chặn — ngược
+	// lại, đây CHÍNH LÀ 1 trong 2 kịch bản gốc coldStartSem's doc comment đã
+	// nêu ("job lớn đầu tiên sau khi server khởi động"). Lỗi prewarm ở 1
+	// session không fatal, không log ồn ào ở mức server — session đó chỉ đơn
+	// giản rơi về đúng đường cold-start cũ trong handleJob, tự thử lại khi
+	// có job thật đầu tiên tới, y hệt hành vi trước khi có prewarm.
+	PrewarmOnStart bool
+
+	// PrewarmTimeout: giới hạn thời gian tối đa cho 1 lần prewarm. Khác job
+	// thật (có ctx từ HTTP request, tự huỷ khi client bỏ cuộc), prewarm
+	// không có ai chờ nên cần tự đặt trần để không treo vô thời hạn nếu 1
+	// provider VPN bị treo hoàn toàn lúc server vừa khởi động. 0 → mặc định
+	// 3 phút (rộng hơn hẳn navTimeout/stallTimeout 45-75s của bước
+	// navigate/TTS thật, vì acquireProxyAndSpawn còn gồm cả VPN handshake —
+	// có thể chậm hơn 1 lần navigate đơn thuần).
+	PrewarmTimeout time.Duration
 }
 
 // defaultSmallJobChunkThreshold: hầu hết job kind=single/batch chỉ 1-4 chunk
@@ -174,15 +200,18 @@ type sessionJob struct {
 }
 
 // NewSessionPool khởi tạo NumSessions goroutine session ngay (nhẹ — mỗi
-// goroutine chỉ chờ ở channel, CHƯA mở WebView2/proxy nào). Việc mở
-// WebView2 + acquire proxy chỉ xảy ra LAZY, khi session đó nhận job ĐẦU
-// TIÊN — cố tình không "làm ấm" toàn bộ pool ngay lúc server khởi động, vì
-// nếu chưa có traffic thì NumSessions cửa sổ Chromium + tunnel mở sẵn chỉ
-// tổ tốn CPU/RAM liên tục cho không, đi ngược yêu cầu "ít mất CPU nhất".
-// Cái giá đánh đổi: request ĐẦU TIÊN sau khi server khởi động (hoặc sau khi
-// 1 session bị idle-close) phải chịu đúng 1 lần cold-spawn — các request
-// sau đó, khi pool đã "ấm" nhờ được dùng liên tục, không còn trả giá này
-// nữa (khác hẳn mô hình Run/RunChunks cũ trả giá cold-spawn ở MỌI request).
+// goroutine chỉ chờ ở channel, CHƯA mở WebView2/proxy nào). Mặc định
+// (PrewarmOnStart=false), việc mở WebView2 + acquire proxy xảy ra LAZY, khi
+// session đó nhận job ĐẦU TIÊN — cái giá đánh đổi: request ĐẦU TIÊN sau khi
+// server khởi động (hoặc sau khi 1 session bị idle-close) phải chịu đúng 1
+// lần cold-spawn — các request sau đó, khi pool đã "ấm" nhờ được dùng liên
+// tục, không còn trả giá này nữa (khác hẳn mô hình Run/RunChunks cũ trả giá
+// cold-spawn ở MỌI request).
+//
+// Khi PrewarmOnStart=true (xem doc comment field đó), mỗi session tự
+// cold-spawn ngay tại đây thay vì đợi job đầu tiên — đổi "tốn CPU/RAM cho
+// tới NumSessions cửa sổ dù chưa có traffic" lấy "khách hàng đầu tiên không
+// còn phải chờ VPN handshake giữa chừng job của họ".
 func NewSessionPool(cfg SessionPoolConfig) (*SessionPool, error) {
 	if cfg.Provider == nil {
 		return nil, fmt.Errorf("SessionPool: Provider bắt buộc")
@@ -216,6 +245,9 @@ func NewSessionPool(cfg SessionPoolConfig) (*SessionPool, error) {
 	}
 	if cfg.BigJobReservedSessions < 0 {
 		cfg.BigJobReservedSessions = 0
+	}
+	if cfg.PrewarmTimeout <= 0 {
+		cfg.PrewarmTimeout = 3 * time.Minute
 	}
 	if cfg.DataRoot == "" {
 		cfg.DataRoot = filepath.Join(os.TempDir(), "elevenflow-session-pool-profiles")
@@ -589,6 +621,33 @@ func (sp *SessionPool) sessionLoop(id int, bigOnly bool) {
 
 	w := newWorker(id, sp.pool, nil, nil, sp.cfg.DataRoot, sp.cfg.Visible)
 	spawned := false
+
+	// Prewarm (xem SessionPoolConfig.PrewarmOnStart doc comment): chủ động
+	// cold-start NGAY tại đây, trước khi vào vòng lặp nhận job — gọi đúng
+	// hàm acquireProxyAndSpawn mà job thật đầu tiên (handleJob bên dưới,
+	// case w.currentLease.URL == "") sẽ gọi, không viết logic riêng cho
+	// prewarm. Vẫn xếp hàng qua coldStartSem như bình thường nên NumSessions
+	// session không cùng mở tunnel trong 1 khoảnh khắc (đúng lý do
+	// coldStartSem tồn tại). context.Background() (không phải job.ctx — chưa
+	// có job nào) + PrewarmTimeout tự đặt trần riêng vì không có HTTP client
+	// nào để tự huỷ context khi bỏ cuộc như job thật.
+	if sp.cfg.PrewarmOnStart {
+		select {
+		case sp.coldStartSem <- struct{}{}:
+			prewarmCtx, cancel := context.WithTimeout(context.Background(), sp.cfg.PrewarmTimeout)
+			if err := w.acquireProxyAndSpawn(prewarmCtx); err != nil {
+				diaglog.Append("session_prewarm_failed", map[string]any{"session": id, "err": err.Error()})
+			} else {
+				spawned = true
+				sp.activeSessions.Add(1)
+			}
+			cancel()
+			<-sp.coldStartSem
+		case <-sp.closed:
+			// Pool bị Close() trước khi tới lượt session này prewarm — bỏ
+			// qua, không cold-start vào 1 pool đang đóng.
+		}
+	}
 
 	teardown := func() {
 		if !spawned {

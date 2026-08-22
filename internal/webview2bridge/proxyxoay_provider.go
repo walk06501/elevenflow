@@ -328,11 +328,21 @@ func (p *ProxyxoayKeyProvider) Acquire(ctx context.Context, workerID int, emit f
 // mechanism (calling get.php again is how the vendor hands back a fresh
 // exit IP), so a caller-detected failure (ElevenLabs 401 flag) gets a new
 // identity right away rather than waiting up to the next scheduled refresh.
-// A cooldown rejection here just means the vendor will not hand back a
-// DIFFERENT IP yet — not an error worth failing the caller over — so this
-// falls back to the still-valid current lease instead of propagating it,
-// same as VPN providers do not fail a lease just because rotation itself
-// is temporarily unavailable.
+//
+// A cooldown rejection means the vendor will not hand back a DIFFERENT IP
+// yet — retrying the TTS attempt immediately against the SAME (already
+// banned) lease at that point is pointless, it can only fail again (real
+// production log, 2026-08-21: a caller burned several of its 10 retry
+// attempts this way before a genuinely fresh IP showed up). So instead of
+// handing back the stale lease straight away, wait out the vendor's own
+// countdown (ctx-cancellable) and ask again — that second call almost
+// always succeeds since we waited exactly as long as the vendor said to.
+// Only if THAT retry also hits a cooldown (vendor countdown was longer than
+// reported, or another worker on this same key rotated in between) do we
+// fall back to the stale lease as a last resort, logged clearly since it
+// means the caller's next TTS attempt is knowingly going out on a
+// still-banned IP — same "bounded, self-healing" trade-off already accepted
+// elsewhere in this file rather than looping indefinitely.
 func (p *ProxyxoayKeyProvider) MarkUnhealthyAndRotate(ctx context.Context, workerID int, oldLease Lease, kind FailureKind, emit func(string)) (Lease, error) {
 	if emit == nil {
 		emit = func(string) {}
@@ -349,8 +359,26 @@ func (p *ProxyxoayKeyProvider) MarkUnhealthyAndRotate(ctx context.Context, worke
 
 	emit("Đang đổi địa chỉ mạng…")
 	res, err := p.callAPI(ctx)
+
+	var cooldown *proxyxoayCooldownError
+	if errors.As(err, &cooldown) {
+		wait := time.Duration(cooldown.seconds+1) * time.Second
+		p.mu.Lock()
+		p.lastErr = err.Error()
+		p.mu.Unlock()
+		emit(fmt.Sprintf("Đang đợi %ds trước khi đổi địa chỉ mạng mới…", cooldown.seconds+1))
+		select {
+		case <-ctx.Done():
+			p.mu.Lock()
+			cur := p.current
+			p.mu.Unlock()
+			return cur, ctx.Err()
+		case <-time.After(wait):
+		}
+		res, err = p.callAPI(ctx) // waited out the vendor's own countdown — should be a fresh IP now
+	}
+
 	if err != nil {
-		var cooldown *proxyxoayCooldownError
 		var deadErr *proxyxoayDeadError
 		p.mu.Lock()
 		p.lastErr = err.Error()
@@ -358,6 +386,10 @@ func (p *ProxyxoayKeyProvider) MarkUnhealthyAndRotate(ctx context.Context, worke
 		cur := p.current
 		p.mu.Unlock()
 		if errors.As(err, &cooldown) && cur.URL != "" {
+			// Still in cooldown after waiting once — unusual (see doc
+			// comment). Last resort: hand back the stale (possibly still
+			// banned) lease rather than fail the caller outright.
+			log.Printf("[proxyxoay] %s: still cooling down after waiting — reusing stale lease as last resort: %v", p.name, err)
 			return cur, nil
 		}
 		return Lease{}, err

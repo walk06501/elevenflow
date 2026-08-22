@@ -28,6 +28,15 @@ import (
 func main() {
 	cfg := LoadConfig()
 
+	// See Config.FakeFingerprint's doc comment — instant kill switch (.env +
+	// restart, no rebuild) for the 2026-08-21 per-window UA/window-size/lang
+	// randomization + stealthScript wiring, in case it turns out to hurt
+	// hCaptcha pass rate once watched against real traffic.
+	webview2bridge.FakeFingerprintEnabled = cfg.FakeFingerprint
+	if !cfg.FakeFingerprint {
+		log.Println("ELEVEN_FAKE_FINGERPRINT=false — using real UA/1280x800/no stealth script (pre-2026-08-21 behavior)")
+	}
+
 	// Ensure output directory exists for temp files
 	if err := os.MkdirAll(cfg.OutputDir, 0o700); err != nil {
 		log.Fatalf("Failed to create output directory %s: %v", cfg.OutputDir, err)
@@ -163,13 +172,15 @@ func main() {
 		// 2 request đồng thời không collide) hay chưa.
 		nordWGWeight = 1
 		piaWGWeight  = 6
-		// surfsharkWeight: nâng lại 2 (2026-08-12) — nguyên nhân 0% hôm
-		// 2026-08-10 đã xác định: private key cũ hết hạn đăng ký, không
-		// phải lỗi hệ thống. Đã thay key mới, xác nhận qua stress test
-		// thật weight=30: 14/26 = 54% (xem commit "Revert Surfshark-WG to
-		// a human-provided private key") — quay lại đúng giá trị trước
-		// regression.
-		surfsharkWeight = 2
+		// surfsharkWeight: tắt lại 0 (2026-08-21) — stress test thật hôm nay
+		// (test_eleven_battery.py, tải đồng thời qua nhiều giờ): 237 lần
+		// thử, 0 thành công, ban_failures=0 luôn (không phải bị chặn như
+		// các hãng khác đang ~35-50%, mà fail ngay tức khắc, avg_ms=0) —
+		// khác hẳn kiểu lỗi 0% hồi 2026-08-10 (key hết hạn, ít nhất còn
+		// connect được rồi mới bị từ chối). Giữ 0 cho tới khi điều tra lại
+		// bằng cmd/testsurfshark, đừng nâng lại theo phản xạ như lần trước
+		// nếu chưa xác nhận nguyên nhân.
+		surfsharkWeight = 0
 		protonWGWeight  = 3
 		// cyberghostWGWeight: hạ từ 6 xuống 1 tạm thời (2026-08-10) — dữ
 		// liệu cũ bên dưới (25/25, 2026-08-09) vẫn đúng lúc đo, nhưng
@@ -197,6 +208,21 @@ func main() {
 		// "mỗi cửa sổ 1 key xoay" intent without hard-blocking a second
 		// concurrent attempt on the same key if everything else is busy.
 		proxyxoayWeight = 1
+		// ipvanishSocksWeight: SOCKS5 source, same shape as NordVPN-SOCKS5 —
+		// fixed shared hosts (18, see ipvanish_socks5_provider.go) behind one
+		// shared username/password, not per-account connection-limited like
+		// the WireGuard sources. Confirmed live 2026-08-20 (4/4 sampled hosts
+		// completed a real HTTP round-trip with 4 distinct exit IPs) but
+		// unmeasured under real concurrency — start conservative like the
+		// other freshly-added sources, raise once vpn_provider_stats shows a
+		// healthy success rate under actual traffic.
+		ipvanishSocksWeight = 1
+		// homeproxyWeight: same shape as proxyxoay — 1 real identity per
+		// key, weight 1 means each key's soft concurrent cap is
+		// 1×vpnCapSlack. Candidate vendor under stress-test evaluation
+		// 2026-08-22 (operator's call) — see homeproxy_provider.go's doc
+		// comment for the vendor contract confirmed live with 5 real keys.
+		homeproxyWeight = 1
 	)
 
 	// See loadVPNAccounts (portal_vpn_accounts.go): web-portal's admin
@@ -214,6 +240,8 @@ func main() {
 	mullvadAccounts := vpnAccounts["mullvad"]
 	cyberghostAccounts := vpnAccounts["cyberghost"]
 	proxyxoayAccounts := vpnAccounts["proxyxoay"]
+	ipvanishSocksAccounts := vpnAccounts["ipvanish_socks5"]
+	homeproxyAccounts := vpnAccounts["homeproxy"]
 
 	var vpnProviders []webview2bridge.ProxyProvider
 	if len(nordAccounts) > 0 {
@@ -229,6 +257,22 @@ func main() {
 				vpnProviders = append(vpnProviders, nord)
 			}
 			log.Printf("NordVPN Proxy active with Token: %s... (weight %d)", safePrefix(nordToken, 8), nordSOCKS5Weight)
+		}
+	}
+	if len(ipvanishSocksAccounts) > 0 {
+		// SOCKS5 source: fixed shared hosts, not per-account connection-
+		// limited like WireGuard, so it gets no benefit from multiple
+		// accounts — first account only, same reasoning as NordVPN-SOCKS5
+		// above.
+		a := ipvanishSocksAccounts[0]
+		ipvanishSocks, err := webview2bridge.NewIPVanishSocksProvider(a.Username, a.Secret)
+		if err != nil {
+			log.Printf("IPVanish SOCKS5 provider init failed, skipping: %v", err)
+		} else {
+			for i := 0; i < ipvanishSocksWeight; i++ {
+				vpnProviders = append(vpnProviders, ipvanishSocks)
+			}
+			log.Printf("IPVanish SOCKS5 proxy source active: user %s... (weight %d)", safePrefix(a.Username, 4), ipvanishSocksWeight)
 		}
 	}
 	// PIA's plain HTTPS-proxy source (PIAProvider, the 44 fixed
@@ -385,6 +429,18 @@ func main() {
 		}
 		log.Printf("proxyxoay proxy source active: %d key(s) (weight %d each, direct — no Vercel relay)", len(proxyxoayAccounts), proxyxoayWeight)
 	}
+	if len(homeproxyAccounts) > 0 {
+		// Same shape as proxyxoay above — 1 provider instance per key, no
+		// background refresh loop needed (see homeproxy_provider.go's doc
+		// comment: sticky IP, nothing to keep re-fetching before expiry).
+		for _, a := range homeproxyAccounts {
+			hp := webview2bridge.NewHomeproxyKeyProvider(a.Label, a.Secret)
+			for i := 0; i < homeproxyWeight; i++ {
+				vpnProviders = append(vpnProviders, hp)
+			}
+		}
+		log.Printf("homeproxy.vn proxy source active: %d key(s) (weight %d each, direct — candidate under stress-test evaluation)", len(homeproxyAccounts), homeproxyWeight)
+	}
 	// Combined round-robin when more than one VPN source is configured —
 	// every configured source contributes leases instead of only the
 	// first one ever being used. A single provider is used directly
@@ -429,15 +485,43 @@ func main() {
 		// the ban-rotate storms that got ElevenLabs pulled offline earlier
 		// today. cfg.MaxConcurrent (ELEVEN_MAX_CONCURRENT) stays the hard
 		// ceiling (15 today) — this only ever SHRINKS numSessions when
-		// fewer keys than that are configured, never raises it. Only
-		// meaningful while proxyxoay is the dominant/only source; if VPN
-		// accounts (NordVPN/PIA/...) are re-enabled alongside it, this cap
-		// should be revisited since those round-robin across many more
-		// real IPs than 1-per-key.
-		if len(proxyxoayAccounts) > 0 && len(proxyxoayAccounts) < numSessions {
-			log.Printf("SessionPool: capping %d -> %d sessions to match %d active proxyxoay key(s)",
-				numSessions, len(proxyxoayAccounts), len(proxyxoayAccounts))
-			numSessions = len(proxyxoayAccounts)
+		// fewer keys than that are configured, never raises it.
+		//
+		// 2026-08-22: the cap USED to only count proxyxoay keys, ignoring
+		// any other VPN source re-enabled alongside it entirely (operator
+		// re-enabled 3 NordVPN-WG accounts as a backup source — this cap
+		// kept sessions at 5, so those 3 accounts only ever got used as an
+		// occasional mid-session rotate target inside the SAME 5 windows,
+		// never opened a window of their own). Now: when proxyxoay AND at
+		// least one other VPN source are both active, add
+		// cfg.ExtraVPNSessions (ELEVEN_EXTRA_VPN_SESSIONS, default 5) extra
+		// slots on top of the proxyxoay-key count — operator's call
+		// 2026-08-22: 5 proxyxoay + 5 extra = 10 total when a backup VPN
+		// source is present. The extra sessions round-robin across
+		// whichever other sources are configured via the same MultiVPNProvider
+		// as before (no new plumbing) — each source's own HardCap/cooldown
+		// mechanism still governs real concurrency per account, this only
+		// controls how many WebView2 windows exist to make lease requests
+		// from in the first place.
+		// homeproxy (2026-08-22) is the same "1 key = 1 identity" shape as
+		// proxyxoay — counts the same way toward the cap.
+		identityKeyCount := len(proxyxoayAccounts) + len(homeproxyAccounts)
+		otherVPNActive := len(nordAccounts) > 0 || len(piaAccounts) > 0 ||
+			len(surfsharkAccounts) > 0 || len(protonAccounts) > 0 ||
+			len(mullvadAccounts) > 0 || len(cyberghostAccounts) > 0 ||
+			len(ipvanishSocksAccounts) > 0 || cfg.IPVanishWireGuard
+		if identityKeyCount > 0 {
+			capSessions := identityKeyCount
+			extra := 0
+			if otherVPNActive {
+				extra = cfg.ExtraVPNSessions
+				capSessions += extra
+			}
+			if capSessions < numSessions {
+				log.Printf("SessionPool: capping %d -> %d sessions (%d proxyxoay/homeproxy key(s) + %d extra from other active VPN source(s))",
+					numSessions, capSessions, identityKeyCount, extra)
+				numSessions = capSessions
+			}
 		}
 		sp, err := webview2bridge.NewSessionPool(webview2bridge.SessionPoolConfig{
 			NumSessions:    numSessions,
@@ -445,6 +529,7 @@ func main() {
 			IdleCloseAfter: time.Duration(cfg.PersistentPoolIdleCloseSeconds) * time.Second,
 			DataRoot:       cfg.PersistentPoolDataRoot,
 			Visible:        cfg.PersistentPoolVisible,
+			PrewarmOnStart: cfg.PersistentPoolPrewarm,
 		})
 		if err != nil {
 			log.Fatalf("SessionPool init failed: %v", err)
@@ -454,8 +539,12 @@ func main() {
 		if cfg.PersistentPoolVisible {
 			visibleNote = "VISIBLE windows (only actually shows if running interactively, not as a SYSTEM scheduled task)"
 		}
-		log.Printf("Persistent session pool active: %d sessions, idle-close after %ds, data root %s, %s",
-			numSessions, cfg.PersistentPoolIdleCloseSeconds, cfg.PersistentPoolDataRoot, visibleNote)
+		prewarmNote := "prewarm off (lazy cold-start on first job, old behavior)"
+		if cfg.PersistentPoolPrewarm {
+			prewarmNote = "prewarm ON (cold-starting all sessions now, in the background)"
+		}
+		log.Printf("Persistent session pool active: %d sessions, idle-close after %ds, data root %s, %s, %s",
+			numSessions, cfg.PersistentPoolIdleCloseSeconds, cfg.PersistentPoolDataRoot, visibleNote, prewarmNote)
 	}
 
 	// Register routes
